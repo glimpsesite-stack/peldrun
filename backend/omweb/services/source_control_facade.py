@@ -36,6 +36,7 @@ REPOSITORY ID RESOLUTION:
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 import os
@@ -85,7 +86,9 @@ try:
         validate_branch_name,
     )
     from integrations.source_control.errors import (
+        AuthDisabledError,
         AuthRequiredError,
+        AuthSourceDisabledError,
         NotFoundError,
         PermissionDeniedError,
         RemoteStateChangedError,
@@ -184,7 +187,9 @@ except ImportError:
         validate_branch_name,
     )
     from backend.integrations.source_control.errors import (
+        AuthDisabledError,
         AuthRequiredError,
+        AuthSourceDisabledError,
         NotFoundError,
         PermissionDeniedError,
         RemoteStateChangedError,
@@ -561,6 +566,22 @@ class _ConnectionRecord:
     contains tokens, refresh tokens, or any other secret. Tokens are
     stored in the OS credential vault and addressed via
     `(provider, account_id, base_url)`.
+
+    `auth_source` identifies which authentication strategy created
+    the connection. Values:
+
+        - "managed"        : PELDRUN GitHub App via Device Flow.
+        - "byoa"           : User-provided OAuth App.
+        - "legacy_unknown" : A connection that predates the
+                             introduction of `auth_source`. It is
+                             preserved as-is and never converted
+                             automatically; the user must
+                             explicitly re-authorize to move it to
+                             managed or byoa.
+
+    The field is always present on new records; `from_dict` defaults
+    it to "legacy_unknown" for records written by an older version,
+    so no destructive migration is required.
     """
 
     provider: str
@@ -569,6 +590,7 @@ class _ConnectionRecord:
     username: str
     connected_at: datetime
     last_validated_at: Optional[datetime] = None
+    auth_source: str = "legacy_unknown"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -582,10 +604,16 @@ class _ConnectionRecord:
                 if self.last_validated_at
                 else None
             ),
+            "auth_source": self.auth_source,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "_ConnectionRecord":
+        raw_source = data.get("auth_source")
+        if isinstance(raw_source, str) and raw_source.strip():
+            auth_source = raw_source.strip().lower()
+        else:
+            auth_source = "legacy_unknown"
         return cls(
             provider=str(data["provider"]),
             account_id=str(data["account_id"]),
@@ -597,6 +625,7 @@ class _ConnectionRecord:
                 if data.get("last_validated_at")
                 else None
             ),
+            auth_source=auth_source,
         )
 
 
@@ -662,17 +691,38 @@ class SourceControlFacade:
         self._data_root.mkdir(parents=True, exist_ok=True)
 
         # Operation service (deferred import to avoid circular import)
+        #
+        # The import is wrapped in a try/except so the module loads
+        # correctly under BOTH package layouts:
+        #
+        #   - `integrations.source_control.*`  (backend/ on sys.path)
+        #   - `backend.integrations.source_control.*`  (project root)
+        #
+        # Every other module in this subsystem follows the same
+        # pattern. A direct top-level import here would fail with
+        # ModuleNotFoundError in one of the two layouts and prevent
+        # the facade from loading at all.
         if operation_service is not None:
             self.operation_service = operation_service
         else:
-            from integrations.source_control.operations.journal import (
-                FileOperationJournal,
-                get_default_operation_journal,
-                set_default_operation_journal,
-            )
-            from integrations.source_control.operations.service import (
-                get_default_operation_service,
-            )
+            try:
+                from integrations.source_control.operations.journal import (
+                    FileOperationJournal,
+                    get_default_operation_journal,
+                    set_default_operation_journal,
+                )
+                from integrations.source_control.operations.service import (
+                    get_default_operation_service,
+                )
+            except ImportError:
+                from backend.integrations.source_control.operations.journal import (  # type: ignore[no-redef]
+                    FileOperationJournal,
+                    get_default_operation_journal,
+                    set_default_operation_journal,
+                )
+                from backend.integrations.source_control.operations.service import (  # type: ignore[no-redef]
+                    get_default_operation_service,
+                )
             journal_path = self._data_root / "journal"
             journal_path.mkdir(parents=True, exist_ok=True)
             journal = get_default_operation_journal()
@@ -690,9 +740,14 @@ class SourceControlFacade:
         resolved_base.mkdir(parents=True, exist_ok=True)
         self._workspace_root = resolved_base
 
-        from integrations.source_control.git.path_policy import (
-            WorkspacePathPolicy,
-        )
+        try:
+            from integrations.source_control.git.path_policy import (
+                WorkspacePathPolicy,
+            )
+        except ImportError:
+            from backend.integrations.source_control.git.path_policy import (  # type: ignore[no-redef]
+                WorkspacePathPolicy,
+            )
         self._path_policy = WorkspacePathPolicy(root=resolved_base)
 
         # Git services MUST use the process-wide default managers
@@ -709,25 +764,40 @@ class SourceControlFacade:
         if workspace_manager is not None:
             self.workspace_manager = workspace_manager
         else:
-            from integrations.source_control.git.workspace import (
-                get_default_workspace_manager,
-            )
+            try:
+                from integrations.source_control.git.workspace import (
+                    get_default_workspace_manager,
+                )
+            except ImportError:
+                from backend.integrations.source_control.git.workspace import (  # type: ignore[no-redef]
+                    get_default_workspace_manager,
+                )
             self.workspace_manager = get_default_workspace_manager()
 
         if diff_engine is not None:
             self.diff_engine = diff_engine
         else:
-            from integrations.source_control.git.diff import (
-                get_default_diff_engine,
-            )
+            try:
+                from integrations.source_control.git.diff import (
+                    get_default_diff_engine,
+                )
+            except ImportError:
+                from backend.integrations.source_control.git.diff import (  # type: ignore[no-redef]
+                    get_default_diff_engine,
+                )
             self.diff_engine = get_default_diff_engine()
 
         if push_manager is not None:
             self.push_manager = push_manager
         else:
-            from integrations.source_control.git.push import (
-                get_default_push_manager,
-            )
+            try:
+                from integrations.source_control.git.push import (
+                    get_default_push_manager,
+                )
+            except ImportError:
+                from backend.integrations.source_control.git.push import (  # type: ignore[no-redef]
+                    get_default_push_manager,
+                )
             self.push_manager = get_default_push_manager()
 
         # Git history reader. Used by the read-only browser endpoints
@@ -792,9 +862,38 @@ class SourceControlFacade:
         # Register OAuth providers for all available adapters
         self._register_default_oauth_providers()
 
+        # Optional reference to the Managed GitHub App + Device Flow
+        # orchestrator (`SourceControlAuthService`). When present, the
+        # facade uses it to:
+        #
+        #   - Compute `managed_ready` / `byoa_ready` for
+        #     `list_providers`.
+        #   - Reject `begin_connection` when the auth subsystem or
+        #     the BYOA source is disabled in settings.
+        #   - Expose the service to the HTTP router through
+        #     `get_auth_service()` so the auth endpoints do not
+        #     need a second dependency.
+        #
+        # It is set explicitly after construction via
+        # `set_auth_service(...)` because the auth service itself
+        # requires a facade reference (to read/write connections),
+        # so a constructor parameter would create an unavoidable
+        # cycle. When None, the facade degrades to its historical
+        # behavior: `list_providers` reports `managed_ready=False`
+        # and `byoa_ready=False`, and `begin_connection` performs
+        # only the historical credential check.
+        self._auth_service: Optional[Any] = None
+
         # Facade-private connection registry. This is NOT a secret
         # store: only identifiers and timestamps are kept here.
         self._connections: Dict[str, _ConnectionRecord] = {}
+        # Track the file mtime of the on-disk connections index so
+        # that `_get_connection` can detect changes written by
+        # another process (multi-worker deployment) or by a
+        # reloaded module instance (double import). Without this
+        # the in-memory dict would silently diverge from disk and
+        # the API would report stale connection state forever.
+        self._connections_mtime_ns: int = 0
         # Track provider-set combinations already warned about, so
         # that `_default_provider_id` emits its "multiple
         # providers are connected" warning at most once per
@@ -816,7 +915,22 @@ class SourceControlFacade:
         self._load_connections()
 
     def _register_default_oauth_providers(self) -> None:
-        """Register OAuth callbacks for built-in providers."""
+        """
+        Register OAuth callbacks for built-in providers.
+
+        The import is wrapped in a try/except so the module loads
+        correctly under BOTH package layouts:
+
+            - `integrations.source_control.*`
+            - `backend.integrations.source_control.*`
+
+        The previous version of this block duplicated the SAME import
+        path in both branches, so it never actually fell back and
+        raised `ModuleNotFoundError: No module named 'integrations'`
+        whenever the facade was constructed from the project root
+        (which is the layout used by the test suite and by the
+        FastAPI app when launched as `python -m backend.omweb`).
+        """
         try:
             from integrations.source_control.security.oauth_flow import (
                 OAuthProviderCallbacks,
@@ -825,10 +939,10 @@ class SourceControlFacade:
                 TokenRefreshResult,
             )
         except ImportError:
-            from integrations.source_control.security.oauth_flow import (
+            from backend.integrations.source_control.security.oauth_flow import (  # type: ignore[no-redef]
                 OAuthProviderCallbacks,
             )
-            from integrations.source_control.security.token_service import (
+            from backend.integrations.source_control.security.token_service import (  # type: ignore[no-redef]
                 TokenRefreshResult,
             )
 
@@ -907,20 +1021,51 @@ class SourceControlFacade:
         return self._data_root / _CONNECTIONS_FILE_NAME
 
     def _load_connections(self) -> None:
-        """Load the persisted connection index, if present and readable."""
+        """Load the persisted connection index, if present and readable.
+
+        Also records the file's ``st_mtime_ns`` so that
+        ``_maybe_reload_connections`` can detect subsequent external
+        writes (another worker, or a different module instance) and
+        keep the in-memory dict fresh.
+
+        The load builds a NEW dict and swaps it into place only after
+        parsing completes successfully. This is safe against readers
+        that hold a reference to the old ``_connections`` dict while
+        the reload happens.
+        """
         path = self._connections_path()
         if not path.exists():
+            self._connections = {}
+            self._connections_mtime_ns = 0
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            # Capture mtime BEFORE reading so that a concurrent
+            # writer cannot leave us with "new content, old mtime".
+            pre_stat = path.stat()
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
             logger.warning(
-                "Failed to load connections index: %s",
+                "Failed to read connections index %s: %s",
+                path,
+                type(exc).__name__,
+            )
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Connections index %s is not valid JSON: %s",
+                path,
                 type(exc).__name__,
             )
             return
         if not isinstance(data, dict):
+            logger.warning(
+                "Connections index %s is not a JSON object.", path
+            )
             return
+
+        new_connections: Dict[str, _ConnectionRecord] = {}
         for item in data.get("connections", []):
             if not isinstance(item, dict):
                 continue
@@ -928,14 +1073,38 @@ class SourceControlFacade:
                 record = _ConnectionRecord.from_dict(item)
             except (KeyError, ValueError):
                 continue
-            self._connections[record.provider] = record
+            new_connections[record.provider] = record
+
+        # Atomic swap: concurrent readers see either the old dict
+        # or the new one, never a partially-populated one.
+        self._connections = new_connections
+        self._connections_mtime_ns = pre_stat.st_mtime_ns
+
+        logger.info(
+            "Loaded %d connection(s) from %s "
+            "(pid=%d, module=%s, facade_id=%x)",
+            len(new_connections),
+            path,
+            os.getpid(),
+            __name__,
+            id(self),
+        )
 
     def _save_connections(self) -> None:
-        """Persist the connection index atomically."""
+        """
+        Persist the connection index atomically.
+
+        Schema version 2 adds the `auth_source` field to every
+        connection record. The migration from version 1 is purely
+        additive: `_load_connections` accepts records without the
+        field and defaults them to "legacy_unknown", so a version 1
+        file is read correctly and upgraded in place on the next
+        write without any data loss.
+        """
         path = self._connections_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "connections": [
                 record.to_dict() for record in self._connections.values()
             ],
@@ -946,12 +1115,70 @@ class SourceControlFacade:
             encoding="utf-8",
         )
         tmp.replace(path)
+        # Refresh the tracked mtime after our own write so that the
+        # next `_maybe_reload_connections` call does NOT treat our
+        # own write as an external change. If the stat fails, leave
+        # the previous value in place; the next call will reload on
+        # the next mtime change, which is harmless.
+        try:
+            self._connections_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            pass
 
     def _get_connection(self, provider: ProviderId | str) -> Optional[_ConnectionRecord]:
+        self._maybe_reload_connections()
         key = provider.value if isinstance(provider, ProviderId) else str(provider)
         return self._connections.get(key)
 
+    def _maybe_reload_connections(self) -> None:
+        """Reload the connection index from disk if it has changed.
+
+        Multi-worker deployments and double-import scenarios give
+        each process (or each module instance) its own
+        ``_connections`` dict. When the device flow completes in
+        one process, it writes ``connections.json``; other
+        processes would otherwise keep serving the stale in-memory
+        state forever. This method detects the file change (via
+        ``st_mtime_ns``) and reloads the dict on the next access.
+
+        The cost is a single ``stat()`` per ``_get_connection``
+        call -- negligible next to the HTTP round-trip that
+        triggered it. No file read happens unless the mtime has
+        actually changed, so the steady-state "no disk I/O per
+        request" requirement is preserved.
+        """
+        try:
+            path = self._connections_path()
+            if not path.exists():
+                return
+            current_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return
+        if current_mtime_ns == self._connections_mtime_ns:
+            return
+        logger.info(
+            "Connections index changed on disk "
+            "(mtime_ns: %d -> %d); reloading "
+            "(pid=%d, module=%s, facade_id=%x).",
+            self._connections_mtime_ns,
+            current_mtime_ns,
+            os.getpid(),
+            __name__,
+            id(self),
+        )
+        self._load_connections()
+
     def _set_connection(self, record: _ConnectionRecord) -> None:
+        logger.info(
+            "Setting connection for '%s' "
+            "(pid=%d, module=%s, facade_id=%x); "
+            "total connections after set: %d",
+            record.provider,
+            os.getpid(),
+            __name__,
+            id(self),
+            len(self._connections) + 1,
+        )
         self._connections[record.provider] = record
         self._save_connections()
 
@@ -1124,6 +1351,65 @@ class SourceControlFacade:
                 )
                 return None
 
+        return None
+
+    def set_auth_service(self, auth_service: Any) -> None:
+        """
+        Attach the `SourceControlAuthService` to this facade.
+
+        This is the wiring step that enables:
+            - Managed Device Flow readiness computation in
+              `list_providers`.
+            - BYOA-gate enforcement in `begin_connection`.
+            - Exposure of the service to the HTTP router via
+              `get_auth_service()`.
+
+        The auth service MUST be constructed with a reference to
+        THIS facade instance so that connections written by the
+        service are visible here. Callers SHOULD construct the
+        service with `facade=this_facade`.
+
+        Idempotent: calling this method with a new service replaces
+        the previous one. Calling with `None` detaches it and
+        restores the historical (unaware) behavior.
+        """
+        self._auth_service = auth_service
+
+    def get_auth_service(self) -> Optional[Any]:
+        """
+        Return the attached auth service, or None when not wired.
+
+        The return type is `Optional[Any]` because the facade cannot
+        import `SourceControlAuthService` at module scope (that
+        module imports the facade, creating a cycle). Callers that
+        need to call service methods SHOULD use duck typing: the
+        service exposes `is_managed_ready`, `is_byoa_ready`,
+        `begin_managed`, `get_device_status`, `cancel_device`,
+        `get_auth_status`, and an `_settings_store` attribute for
+        advanced use.
+        """
+        return self._auth_service
+
+    def _on_auth_settings_changed(self, new_settings: Any) -> None:
+        """
+        Hook invoked by `AuthSettingsStore.update()` and `.reset()`
+        after a successful settings change.
+
+        The default implementation invalidates any derived caches the
+        facade may hold. In this phase, there are none — every read
+        of settings goes to the store — so the method is a no-op.
+        It exists as a well-known extension point so a future cache
+        (e.g. a memoized `is_managed_ready`) can be invalidated
+        without touching the store.
+
+        The signature uses `Any` for `new_settings` to avoid importing
+        `AuthSettings` in the facade module (which would create a
+        dependency from the facade to the settings dataclass even
+        though the facade does not need it). The caller always
+        passes an `AuthSettings` instance; the facade simply does not
+        need to read it here.
+        """
+        # No derived state yet. Documented extension point.
         return None
 
     def _default_provider_id(self) -> ProviderId:
@@ -1570,6 +1856,37 @@ class SourceControlFacade:
                 self_managed_instance=caps.self_managed_instance,
             )
 
+            # Compute managed/byoa readiness from the auth service
+            # when it is wired. Both values are FALSE when the auth
+            # service is not attached, so a facade constructed for a
+            # test or an embedding application that does not use the
+            # managed path still produces a valid response.
+            #
+            # `is_configured` retains its historical meaning (BYOA
+            # credentials present in the vault/JSON). It is
+            # ORTHOGONAL to `managed_ready`: a provider with
+            # `is_configured=False` and `managed_ready=True` is
+            # perfectly usable via the managed path, and the UI
+            # MUST enable the "Connect" button when either
+            # readiness flag is True.
+            managed_ready = False
+            byoa_ready = False
+            if self._auth_service is not None:
+                try:
+                    managed_ready = bool(
+                        self._auth_service.is_managed_ready(pid_str)
+                    )
+                    byoa_ready = bool(
+                        self._auth_service.is_byoa_ready(pid_str)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "list_providers: could not compute readiness "
+                        "for '%s': %s",
+                        pid_str,
+                        type(exc).__name__,
+                    )
+
             manifest = getattr(adapter, "manifest", None)
             web_url = (
                 getattr(manifest, "web_base_url", "https://github.com")
@@ -1588,6 +1905,8 @@ class SourceControlFacade:
                     display_name=pid_str.title() + " Cloud",
                     is_connected=self._get_connection(pid_str) is not None,
                     is_configured=self._is_provider_configured(pid_str),
+                    managed_ready=managed_ready,
+                    byoa_ready=byoa_ready,
                     capabilities=caps_resp,
                     web_base_url=web_url,
                     api_base_url=api_url,
@@ -1619,6 +1938,7 @@ class SourceControlFacade:
                     username=record.username,
                     base_url=record.base_url,
                     last_validated_at=record.last_validated_at,
+                    auth_source=record.auth_source,
                 )
             )
         return connections
@@ -1721,9 +2041,71 @@ class SourceControlFacade:
     async def begin_connection(
         self, provider: str, payload: ConnectBeginRequest
     ) -> ConnectBeginResponse:
-        """Start an OAuth 2.0 PKCE handshake and return the authorization URL."""
+        """Start an OAuth 2.0 PKCE handshake and return the authorization URL.
+
+        This endpoint drives the BYOA path. The managed path is
+        driven by `SourceControlAuthService.begin_managed`, which
+        does NOT share this method: managed uses Device Flow and
+        does not accept a client_secret.
+
+        When the auth service is wired, this method checks that the
+        BYOA source is enabled for `provider` BEFORE validating
+        credentials. This produces a precise "BYOA is disabled"
+        error when the user disabled the source, instead of the
+        historical "credentials not configured" message which is
+        technically correct but misleading in that state.
+
+        The historical behavior (credential check only) is
+        preserved when the auth service is not wired, so custom
+        facades and existing tests continue to work unchanged.
+        """
         provider_id = ProviderId(provider.strip().lower())
         self.registry.get(provider_id.value)
+
+        # Gate 1: BYOA source must be enabled. The check is
+        # performed BEFORE the credential check so the error
+        # message is actionable ("BYOA is disabled" instead of
+        # "credentials not configured").
+        #
+        # `settings.is_source_enabled` accepts the string form
+        # "byoa" and coerces it internally, so no `AuthSource`
+        # import is required here.
+        if self._auth_service is not None:
+            try:
+                settings = self._auth_service._settings_store.get()
+            except Exception as exc:  # noqa: BLE001
+                # If we cannot reach the settings store, fall
+                # through to the credential check. This is the
+                # historical behavior and keeps the endpoint
+                # usable even when the auth subsystem is in an
+                # unexpected state.
+                logger.warning(
+                    "begin_connection: could not read auth "
+                    "settings (%s); skipping BYOA gate.",
+                    type(exc).__name__,
+                )
+                settings = None
+
+            if settings is not None:
+                if not settings.enabled:
+                    raise AuthDisabledError(
+                        "Source Control authentication is disabled "
+                        "in settings. Enable it in Integrations to "
+                        "connect."
+                    )
+                if not settings.is_source_enabled(
+                    provider_id, "byoa"
+                ):
+                    raise AuthSourceDisabledError(
+                        f"BYOA is disabled for "
+                        f"'{provider_id.value}'. Enable it in "
+                        f"Integrations settings to connect, or use "
+                        f"the managed GitHub App instead.",
+                        details={
+                            "provider": provider_id.value,
+                            "source": "byoa",
+                        },
+                    )
 
         # BYOK: Verify that the user has configured credentials
         configs = self._load_provider_configs()
@@ -1813,6 +2195,15 @@ class SourceControlFacade:
             username=auth_result.username or "",
             connected_at=_utc_now(),
             last_validated_at=_utc_now(),
+            # BYOA is the ONLY flow that reaches this method.
+            # Managed connections are stamped with
+            # `auth_source="managed"` by
+            # `SourceControlAuthService._on_device_completed`.
+            # Stamping the source here guarantees every new
+            # connection carries an unambiguous provenance marker,
+            # which the UI uses to decide which settings dialog
+            # (if any) to show.
+            auth_source="byoa",
         )
         self._set_connection(record)
 
@@ -7728,13 +8119,57 @@ class SourceControlFacade:
         return merged_model
 
 
-# Global singleton cache for FastAPI dependency injection
-_facade_instance: Optional[SourceControlFacade] = None
+# Global singleton cache for FastAPI dependency injection.
+#
+# IMPORTANT: the singleton is stored in `builtins` rather than in a
+# plain module-level variable. Module-level globals are scoped to a
+# SPECIFIC module object, and Python creates a separate module
+# object for every distinct import path (`omweb.services.x` and
+# `backend.omweb.services.x` are two different modules even when
+# they point at the same file). If the app is started with a
+# different sys.path prefix in different entry points (terminal
+# vs. uvicorn, or two services in the same process), the module-
+# level global would be duplicated and the two code paths would
+# silently operate on two different facades -- which is exactly
+# the desync bug reported in the issue tracker. Storing the
+# singleton in `builtins` makes it truly process-global: every
+# copy of this module reads and writes the same key, so every
+# code path shares the same instance.
+_FACADE_SINGLETON_KEY = "source_control_facade"
 
 
 def get_source_control_facade() -> SourceControlFacade:
-    """Dependency injection provider yielding the SourceControlFacade singleton."""
-    global _facade_instance
-    if _facade_instance is None:
-        _facade_instance = SourceControlFacade()
-    return _facade_instance
+    """
+    Dependency injection provider yielding the SourceControlFacade singleton.
+
+    The singleton is shared across every import path of this module
+    (see the comment above ``_FACADE_SINGLETON_KEY``). Callers that
+    construct their own ``SourceControlFacade`` intentionally (e.g.
+    tests) can continue to do so; they simply will not participate
+    in the process-wide singleton, which is the expected behavior.
+    """
+    registry = getattr(builtins, "_peldrun_singletons", None)
+    if registry is None:
+        registry = {}
+        builtins._peldrun_singletons = registry
+
+    instance = registry.get(_FACADE_SINGLETON_KEY)
+    if instance is not None:
+        return instance
+
+    new_instance = SourceControlFacade()
+    # `setdefault` is atomic enough under the GIL: if another thread
+    # raced us here, the first one to store wins and the loser's
+    # instance is discarded. This only happens during startup and
+    # is preferable to holding a module-level lock that itself
+    # would need to be duplicated in builtins.
+    instance = registry.setdefault(_FACADE_SINGLETON_KEY, new_instance)
+    logger.info(
+        "SourceControlFacade singleton ready "
+        "(pid=%d, module=%s, instance_id=%x, newly_created=%s)",
+        os.getpid(),
+        __name__,
+        id(instance),
+        instance is new_instance,
+    )
+    return instance

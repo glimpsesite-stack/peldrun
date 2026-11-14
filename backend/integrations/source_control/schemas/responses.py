@@ -56,12 +56,48 @@ class ProviderCapabilitiesResponse(BaseSCResponse):
 
 
 class ProviderDescriptorResponse(BaseSCResponse):
-    """Metadata describing a registered source control provider."""
+    """Metadata describing a registered source control provider.
+
+    The three readiness/configuration flags are orthogonal and MUST
+    NOT be conflated by the UI:
+
+        - ``is_configured`` reports whether BYOA credentials
+          (Client ID + Client Secret) exist in the vault/JSON.
+          It says NOTHING about the managed path.
+        - ``managed_ready`` reports whether the managed GitHub App
+          may be used to START a new connection (settings enabled,
+          per-provider managed flag on, managed Client ID present).
+        - ``byoa_ready`` reports whether the BYOA path may be used
+          to START a new connection (settings enabled, per-provider
+          byoa flag on, BYOA credentials present).
+
+    A provider with ``is_configured=False`` and
+    ``managed_ready=True`` is perfectly usable via the managed
+    path: the UI MUST enable the "Connect" button based on the
+    OR of the two readiness flags, NOT on ``is_configured`` alone.
+    """
 
     provider_id: str = Field(..., description="Provider unique identifier (e.g. 'github').")
     display_name: str = Field(..., description="User-friendly display name (e.g. 'GitHub Cloud').")
     is_connected: bool = Field(..., description="Whether valid active credentials exist in vault.")
-    is_configured: bool = Field(default=False, description="Whether OAuth App credentials are configured.")
+    is_configured: bool = Field(
+        default=False,
+        description="Whether BYOA OAuth App credentials are configured.",
+    )
+    managed_ready: bool = Field(
+        default=False,
+        description=(
+            "Whether the managed GitHub App path may be used to "
+            "START a new connection."
+        ),
+    )
+    byoa_ready: bool = Field(
+        default=False,
+        description=(
+            "Whether the BYOA path may be used to START a new "
+            "connection."
+        ),
+    )
     capabilities: ProviderCapabilitiesResponse = Field(..., description="Declared capabilities.")
     web_base_url: str = Field(..., description="Upstream web base URL.")
     api_base_url: str = Field(..., description="Upstream API base URL.")
@@ -77,7 +113,24 @@ class ConnectBeginResponse(BaseSCResponse):
 
 
 class ConnectionStatusResponse(BaseSCResponse):
-    """Authoritative connection status and identity for a specific provider."""
+    """Authoritative connection status and identity for a specific provider.
+
+    ``auth_source`` records which authentication strategy created
+    the connection and is preserved for the lifetime of the
+    connection (it is NEVER updated by a settings change):
+
+        - ``"managed"``        : PELDRUN GitHub App via Device Flow.
+        - ``"byoa"``           : User-provided OAuth App.
+        - ``"legacy_unknown"`` : A connection that predates the
+                                 ``auth_source`` field. It is
+                                 preserved as-is; the user must
+                                 re-authorize to move it to a
+                                 known source.
+        - ``None``             : The provider is not connected.
+
+    The UI uses this field to render the "Connected via" label
+    and to decide which configuration dialog (if any) to show.
+    """
 
     provider: str = Field(..., description="Provider identifier.")
     is_connected: bool = Field(..., description="Whether authenticated session is active.")
@@ -86,6 +139,14 @@ class ConnectionStatusResponse(BaseSCResponse):
     base_url: str = Field(default="https://github.com", description="Upstream instance base URL.")
     granted_scopes: Sequence[str] = Field(default_factory=tuple, description="Scopes verified on provider.")
     last_validated_at: Optional[datetime] = Field(default=None, description="Timestamp of last check.")
+    auth_source: Optional[str] = Field(
+        default=None,
+        description=(
+            "Authentication source that created the connection: "
+            "'managed', 'byoa', 'legacy_unknown', or None when "
+            "the provider is not connected."
+        ),
+    )
 
 
 class RepositoryResponse(BaseSCResponse):
@@ -1103,6 +1164,287 @@ class ReleaseListResponse(BaseSCResponse):
     total: int = Field(
         default=0,
         description="Number of releases in this page.",
+    )
+
+
+# ----------------------------------------------------------------------
+# Source Control authentication (Managed GitHub App + Device Flow)
+# ----------------------------------------------------------------------
+#
+# These schemas describe the responses of the auth endpoints:
+#
+#     GET  /api/source-control/auth/settings
+#     PUT  /api/source-control/auth/settings
+#     GET  /api/source-control/auth/status
+#     POST /api/source-control/connections/{provider}/device/start
+#     GET  /api/source-control/connections/{provider}/device/{id}/status
+#     POST /api/source-control/connections/{provider}/device/{id}/cancel
+#
+# Design notes:
+#
+#   - `AuthStatusResponse` and `AuthSettingsResponse` are exposed as
+#     separate classes so that the frontend can subscribe to
+#     settings changes without also re-fetching the full status,
+#     and vice versa. They share a `settings` sub-object shape (a
+#     plain mapping) to keep the wire format stable when the
+#     underlying `AuthSettings` dataclass gains new fields: the
+#     nested mapping always reflects `AuthSettings.to_dict()`
+#     verbatim, and a new field surfaces automatically without a
+#     schema change.
+#
+#   - `DeviceFlowStartResponse` and `DeviceFlowStatusResponse` are
+#     deliberately distinct: the start response carries the user
+#     code and verification URL (which are public and must be
+#     shown immediately), while the status response carries the
+#     current state and, once completed, the account identity.
+#     Neither response contains a `device_code`, `access_token`,
+#     or any other secret.
+
+
+class AuthStatusResponse(BaseSCResponse):
+    """Complete authentication status snapshot.
+
+    Returned by ``GET /auth/settings`` and ``GET /auth/status``.
+    The frontend uses it to render the Integrations page: whether
+    the subsystem is enabled, which source is preferred, whether
+    each provider is ready to accept a new connection, and the
+    current connection record (including which source it was
+    created under).
+
+    All nested objects are plain mappings that reflect the
+    underlying dataclass `.to_dict()` outputs verbatim. This
+    keeps the wire format forward-compatible: adding a field to
+    `AuthSettings` (or to the vault/connection status dict) does
+    NOT require a schema change here.
+    """
+
+    settings: Mapping[str, Any] = Field(
+        ...,
+        description=(
+            "The complete `AuthSettings.to_dict()` output, "
+            "including enabled, managed, byoa, providers, and "
+            "security."
+        ),
+    )
+    managed: Mapping[str, Any] = Field(
+        ...,
+        description=(
+            "Managed-path status: whether it is enabled, its "
+            "provider/strategy, and whether a Client ID is "
+            "configured."
+        ),
+    )
+    byoa: Mapping[str, Any] = Field(
+        ...,
+        description="BYOA-path status (whether it is enabled).",
+    )
+    vault: Mapping[str, Any] = Field(
+        ...,
+        description=(
+            "Credential vault status: backend name and whether "
+            "it is currently available."
+        ),
+    )
+    providers: Mapping[str, Any] = Field(
+        ...,
+        description=(
+            "Per-provider status: managed_ready, byoa_ready, "
+            "preferred_source, and the current connection record "
+            "(when connected)."
+        ),
+    )
+
+
+class AuthSettingsUpdateResponse(BaseSCResponse):
+    """Result of a successful auth-settings update.
+
+    Returned by ``PUT /auth/settings``. The response includes the
+    merged settings so the caller can immediately reflect the new
+    state without a second round-trip; the previous settings are
+    NOT returned (they are in the audit log).
+    """
+
+    status: str = Field(
+        default="success",
+        description="'success' when the update was applied.",
+    )
+    message: str = Field(
+        default="Authentication settings updated.",
+        description="Human-readable informational summary.",
+    )
+    settings: Mapping[str, Any] = Field(
+        ...,
+        description=(
+            "The full merged settings, identical to the "
+            "`settings` field of `AuthStatusResponse`."
+        ),
+    )
+
+
+class DeviceFlowStartResponse(BaseSCResponse):
+    """Response for initiating a Managed Device Flow session.
+
+    Returned by
+    ``POST /connections/{provider}/device/start``.
+
+    Fields:
+        session_id:
+            Opaque session identifier used to poll
+            ``/device/{session_id}/status``. Not a secret by
+            itself: it is only useful to a client that already
+            holds the backend's HTTP session.
+        user_code:
+            Short human code (e.g. ``WDJB-MJHT``) that MUST be
+            shown to the user. They type it on GitHub's
+            verification page.
+        verification_uri:
+            Always ``https://github.com/login/device``. The
+            backend does NOT proxy this page: the user MUST visit
+            GitHub directly, so the device code is only ever
+            entered on GitHub's domain. This is a hard security
+            requirement of Device Flow.
+        expires_in_seconds:
+            Remaining lifetime of the user code, computed from
+            the session's ``expires_at``. The frontend SHOULD
+            stop polling and show an "expired" state when this
+            hits zero.
+        interval_seconds:
+            Current polling interval suggested by GitHub. The
+            frontend MUST NOT poll faster than this. It MAY be
+            increased by the backend if GitHub returns
+            ``slow_down``; the frontend always reads the latest
+            value from ``DeviceFlowStatusResponse``.
+        status:
+            Always ``"pending"`` on start. Present so the
+            frontend can share a single status reducer for the
+            start and status responses.
+        provider:
+            Provider identifier (``"github"``).
+    """
+
+    session_id: str = Field(
+        ..., description="Opaque Device Flow session identifier."
+    )
+    user_code: str = Field(
+        ..., description="Short human code to enter on GitHub."
+    )
+    verification_uri: str = Field(
+        ...,
+        description=(
+            "GitHub's verification URL. Always "
+            "'https://github.com/login/device'."
+        ),
+    )
+    expires_in_seconds: int = Field(
+        ...,
+        description="Remaining lifetime of the user code in seconds.",
+    )
+    interval_seconds: int = Field(
+        ...,
+        description=(
+            "Current polling interval suggested by GitHub. The "
+            "frontend MUST NOT poll faster."
+        ),
+    )
+    status: str = Field(
+        default="pending",
+        description="Session status; always 'pending' on start.",
+    )
+    provider: str = Field(
+        default="github",
+        description="Provider identifier.",
+    )
+
+
+class DeviceFlowStatusResponse(BaseSCResponse):
+    """Current state of a Managed Device Flow session.
+
+    Returned by
+    ``GET /connections/{provider}/device/{session_id}/status``
+    and by ``POST /connections/{provider}/device/{session_id}/cancel``.
+
+    The ``status`` field drives the frontend's state machine:
+
+        - ``"pending"``   : keep polling at ``interval_seconds``.
+        - ``"completed"`` : the token was stored and the
+                            connection is registered. ``account``
+                            carries the resolved identity.
+        - ``"denied"``    : the user explicitly rejected the
+                            request on GitHub. Show the
+                            ``error_message`` verbatim.
+        - ``"expired"``   : the user code expired before the
+                            user approved it. The user must
+                            click "Connect" again to obtain a
+                            fresh code.
+        - ``"cancelled"`` : the caller cancelled the session
+                            via the cancel endpoint.
+        - ``"error"``     : an unexpected failure occurred
+                            (vault unavailable, network error
+                            after retries, unknown GitHub
+                            error). Show ``error_message``.
+
+    ``user_code`` and ``verification_uri`` are included on every
+    response so the frontend can keep rendering the "enter this
+    code on GitHub" panel across polls without re-fetching the
+    start response. They are ``None`` on terminal states that
+    were reached without user interaction (e.g. an
+    ``incorrect_client_credentials`` error on the start call
+    would surface before any code was issued, but in practice
+    that failure is raised by the start endpoint and never
+    reaches the status endpoint).
+    """
+
+    session_id: str = Field(
+        ..., description="Opaque Device Flow session identifier."
+    )
+    provider: str = Field(..., description="Provider identifier.")
+    status: str = Field(
+        ...,
+        description=(
+            "One of 'pending', 'completed', 'denied', 'expired', "
+            "'cancelled', or 'error'."
+        ),
+    )
+    user_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "The user code to display, repeated for convenience "
+            "across polls."
+        ),
+    )
+    verification_uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "GitHub's verification URL, repeated for convenience."
+        ),
+    )
+    expires_in_seconds: int = Field(
+        default=0,
+        description=(
+            "Remaining lifetime of the user code in seconds "
+            "(0 for terminal states)."
+        ),
+    )
+    interval_seconds: int = Field(
+        default=5,
+        description=(
+            "Current polling interval. The frontend MUST use "
+            "this value for its next poll."
+        ),
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description=(
+            "Redacted, user-facing error description. Present "
+            "for terminal states other than 'completed'."
+        ),
+    )
+    account: Optional[Mapping[str, Any]] = Field(
+        default=None,
+        description=(
+            "Resolved account identity when status='completed'. "
+            "Shape: {provider, account_id, username, base_url}."
+        ),
     )
 
 

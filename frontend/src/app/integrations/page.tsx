@@ -8,6 +8,9 @@ import { ProviderConnectionCard } from "../../features/source-control/components
 import { ProviderConnectDialog } from "../../features/source-control/components/ProviderConnectDialog";
 import { DisconnectProviderDialog } from "../../features/source-control/components/DisconnectProviderDialog";
 import { ProviderConfigDialog } from "../../features/source-control/components/ProviderConfigDialog";
+import { AuthenticationSettingsPanel } from "../../features/source-control/components/authentication/AuthenticationSettingsPanel";
+import { useSourceControlAuth } from "../../features/source-control/hooks/useSourceControlAuth";
+import { sourceControlClient } from "../../features/source-control/api/source-control-client";
 import { ProviderDescriptorResponse } from "../../features/source-control/api/schemas";
 import { McpOAuthProvidersSection } from "../../features/mcp-oauth/McpOAuthProvidersSection";
 
@@ -31,6 +34,18 @@ export default function IntegrationsPage() {
     refresh,
   } = useProviders();
 
+  // Shared authentication state. Lifted here so both the Auth Panel
+  // and the Provider Cards can trigger the Device Flow without
+  // creating duplicate hook instances.
+  const auth = useSourceControlAuth();
+
+  // Ensure the auth status is fetched when the page loads. The
+  // Zustand store's module-level initialization is not reliable
+  // in Next.js (SSR + HMR), so we explicitly trigger a refresh.
+  React.useEffect(() => {
+    void auth.refresh();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // --- Local State for Dialogs ---
   const [providerToConnect, setProviderToConnect] = useState<ProviderDescriptorResponse | null>(null);
   const [providerToDisconnect, setProviderToDisconnect] = useState<ProviderDescriptorResponse | null>(null);
@@ -42,7 +57,14 @@ export default function IntegrationsPage() {
   // --- Handlers ---
 
   const handleOpenConnect = (provider: ProviderDescriptorResponse) => {
-    setProviderToConnect(provider);
+    // Dynamic routing based on the provider's readiness:
+    // - If the managed path is ready, use Device Flow (no dialogs).
+    // - Otherwise, fall back to the BYOA OAuth dialog.
+    if (provider.managed_ready) {
+      void auth.startManagedFlow(provider.provider_id);
+    } else {
+      setProviderToConnect(provider);
+    }
   };
 
   const handleConfirmConnect = async () => {
@@ -94,9 +116,42 @@ export default function IntegrationsPage() {
     return success;
   };
 
+  // ------------------------------------------------------------------
+  // Validate Connection
+  // ------------------------------------------------------------------
+  //
+  // Bug fix (pre-existing): the previous implementation passed
+  // `onValidate={(id) => console.log("Validate:", id)}` to the
+  // provider cards, so the "Validate Connection" button was a
+  // no-op that only wrote to the browser console. The backend has
+  // exposed `POST /connections/{provider}/validate` since the
+  // first release; this handler wires the button to it and then
+  // refreshes the provider list so the card's
+  // `last_validated_at` field updates without a page reload.
+  //
+  // Errors are surfaced through the existing `error` banner
+  // (`useProviders` populates it), so this handler only logs to
+  // the console as a last-resort diagnostic if the hook itself
+  // throws before reaching its state update.
+  const handleValidateProvider = async (providerId: string): Promise<void> => {
+    try {
+      await sourceControlClient.validateConnection(providerId);
+      // Fire-and-forget: the validation succeeded, and the next
+      // render with fresh `providers`/`connections` will show the
+      // new `last_validated_at`. Awaiting would delay the caller
+      // for no user-visible benefit.
+      await Promise.resolve(refresh());
+    } catch (err) {
+      // The `useProviders` hook owns the error state; a raw error
+      // here means the hook itself failed before it could update
+      // its own state. Logging keeps the failure visible without
+      // introducing a second error surface.
+      // eslint-disable-next-line no-console
+      console.error("Validate connection failed:", err);
+    }
+  };
 
-
-    // --- Render ---
+  // --- Render ---
 
   return (
     <div className="w-full h-full overflow-y-auto">
@@ -114,7 +169,49 @@ export default function IntegrationsPage() {
         </p>
       </div>
 
-      {/* ── Section 1: Source Control Providers ──────────────── */}
+      {/* ── Section 1: Source Control Authentication ────────── */}
+      {/*
+          The authentication section is placed BEFORE the provider
+          grid because it controls whether the grid's "Connect"
+          button is usable at all. A user who has not enabled any
+          auth path sees the reason first, then the grid.
+
+          The section owns its own auth status via
+          `useSourceControlAuth`; it only needs the parent's
+          provider/connection lists and the BYOA dialogs, which are
+          passed as callbacks below. This keeps the two data
+          sources (auth status vs connection records) decoupled:
+          each refreshes on its own schedule, and neither can
+          block the other.
+       */}
+      <section className="mb-16">
+        <div className="mb-6">
+          <h2 className="text-xl font-bold tracking-tight text-gray-900">
+            Source Control Authentication
+          </h2>
+          <p className="mt-1 text-sm text-gray-500 max-w-2xl">
+            Manage how PELDRUN authenticates to source control
+            providers. Choose the managed PELDRUN GitHub App (no
+            OAuth setup required) or your own OAuth App (BYOA).
+          </p>
+        </div>
+
+        <AuthenticationSettingsPanel
+          auth={auth}
+          providers={providers}
+          connections={connections}
+          savingConfigProvider={savingConfigProvider ?? null}
+          connectingProvider={connectingProvider ?? null}
+          onConfigureByoa={handleOpenConfigure}
+          onStartByoaConnect={(p) => setProviderToConnect(p)} // Explicit BYOA dialog
+          onDisconnectProvider={handleOpenDisconnect}
+          onRefreshProviders={async () => {
+            await Promise.resolve(refresh());
+          }}
+        />
+      </section>
+
+      {/* ── Section 2: Source Control Providers ──────────────── */}
       <section className="mb-16">
         <div className="mb-6">
           <h2 className="text-xl font-bold tracking-tight text-gray-900">
@@ -176,7 +273,7 @@ export default function IntegrationsPage() {
                   isConnecting={connectingProvider === provider.provider_id}
                   onConnect={() => handleOpenConnect(provider)}
                   onDisconnect={handleOpenDisconnect}
-                  onValidate={(id) => console.log("Validate:", id)}
+                  onValidate={handleValidateProvider}
                   onConfigure={handleOpenConfigure}
                 />
               );

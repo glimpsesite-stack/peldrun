@@ -3,6 +3,9 @@
 import {
   ActionSuccessResponse,
   ApprovalTicketResponse,
+  AuthSettingsUpdateRequest,
+  AuthSettingsUpdateResponse,
+  AuthStatusResponse,
   BranchResponse,
   CheckoutBranchRequest,
   CheckSummaryResponse,
@@ -19,6 +22,8 @@ import {
   CreatePullRequestRequest,
   CreateReleaseRequest,
   CreateTagRequest,
+  DeviceFlowStartResponse,
+  DeviceFlowStatusResponse,
   DiffSummaryResponse,
   FileContentAtRefResponse,
   IssueCommentResponse,
@@ -83,6 +88,11 @@ async function request<T>(
       Accept: "application/json",
       ...options.headers,
     },
+    // ADDED: Bypass the browser's HTTP cache. Without this,
+    // a GET request made before the connection completes
+    // would be cached, and subsequent refreshes would return
+    // the stale "disconnected" state.
+    cache: "no-store",
   });
 
   if (response.ok) {
@@ -1029,6 +1039,130 @@ export const sourceControlClient = {
         provider
       )}`,
       { method: "DELETE" }
+    );
+  },
+
+  // ----------------------------------------------------------------------
+  // 12. Source Control Authentication (Managed GitHub App + Device Flow)
+  // ----------------------------------------------------------------------
+  //
+  // These methods drive the auth endpoints added in
+  // `backend/omweb/routers/source_control.py`:
+  //
+  //     GET  /auth/settings     → getAuthStatus()
+  //     PUT  /auth/settings     → updateAuthSettings()
+  //     GET  /auth/status       → getAuthStatus()  (same payload)
+  //     POST /connections/{p}/device/start
+  //                             → startDeviceFlow()
+  //     GET  /connections/{p}/device/{id}/status
+  //                             → getDeviceFlowStatus()
+  //     POST /connections/{p}/device/{id}/cancel
+  //                             → cancelDeviceFlow()
+  //
+  // None of these methods accepts or returns secrets. The managed
+  // Client ID is exposed only as a boolean (`client_id_configured`);
+  // BYOA secrets are managed through the existing
+  // `saveProviderConfig` / `deleteProviderConfig` methods.
+
+  /**
+   * Return the full authentication status (settings, readiness,
+   * vault, and per-provider connection state).
+   *
+   * The response shape matches `AuthStatusResponse` in the
+   * backend and `AuthStatus` in `types/authentication.ts`. The
+   * two `Mapping[str, Any]` fields are typed as plain records on
+   * purpose: the UI reads specific keys, and a strict type here
+   * would force a matching Zod change every time the backend adds
+   * a field to the nested object.
+   */
+  async getAuthStatus(): Promise<AuthStatusResponse> {
+    return request<AuthStatusResponse>("/auth/settings");
+  },
+
+  /**
+   * Alias of `getAuthStatus()` that hits the `/auth/status`
+   * endpoint. The backend exposes both endpoints with identical
+   * payloads; the alias exists so callers can use whichever name
+   * reads better in context (the settings UI reads "status", the
+   * test suite reads "settings").
+   */
+  async getAuthStatusAlias(): Promise<AuthStatusResponse> {
+    return request<AuthStatusResponse>("/auth/status");
+  },
+
+  /**
+   * Partially update authentication settings.
+   *
+   * Every field is optional: the backend deep-merges `managed`,
+   * `byoa`, and `security`, and shallow-merges `providers`.
+   * Callers SHOULD send only the fields the user actually
+   * changed; sending the whole settings object is supported but
+   * produces a noisier audit log.
+   */
+  async updateAuthSettings(
+    payload: AuthSettingsUpdateRequest
+  ): Promise<AuthSettingsUpdateResponse> {
+    return request<AuthSettingsUpdateResponse>("/auth/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  /**
+   * Start a Managed GitHub App Device Flow session.
+   *
+   * The backend returns the user code and verification URL. The
+   * caller MUST display them and then poll `getDeviceFlowStatus`
+   * at the returned interval until the status becomes terminal.
+   *
+   * The endpoint has no request body: the provider is part of the
+   * URL, and every other parameter (client_id, scope) is resolved
+   * on the backend from its own configuration. The device_code
+   * never leaves the backend.
+   */
+  async startDeviceFlow(
+    provider: string = "github"
+  ): Promise<DeviceFlowStartResponse> {
+    return request<DeviceFlowStartResponse>(
+      `/connections/${encodeURIComponent(provider)}/device/start`,
+      { method: "POST" }
+    );
+  },
+
+  /**
+   * Return the current state of a Device Flow session.
+   *
+   * The status value drives the UI state machine; see the
+   * `DeviceFlowStatus` type in `types/authentication.ts` for the
+   * full semantics.
+   */
+  async getDeviceFlowStatus(
+    provider: string,
+    sessionId: string
+  ): Promise<DeviceFlowStatusResponse> {
+    return request<DeviceFlowStatusResponse>(
+      `/connections/${encodeURIComponent(
+        provider
+      )}/device/${encodeURIComponent(sessionId)}/status`
+    );
+  },
+
+  /**
+   * Cancel a PENDING Device Flow session.
+   *
+   * Idempotent: cancelling an already-terminal session returns
+   * its terminal state. Cancelling a PENDING session stops the
+   * backend polling task and marks the session as cancelled.
+   */
+  async cancelDeviceFlow(
+    provider: string,
+    sessionId: string
+  ): Promise<DeviceFlowStatusResponse> {
+    return request<DeviceFlowStatusResponse>(
+      `/connections/${encodeURIComponent(
+        provider
+      )}/device/${encodeURIComponent(sessionId)}/cancel`,
+      { method: "POST" }
     );
   },
 };

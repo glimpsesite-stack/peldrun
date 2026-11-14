@@ -273,6 +273,41 @@ class SourceControlErrorCode(str, Enum):
     PROTECTED_BRANCH = "PROTECTED_BRANCH"
     WORKFLOW_FILE_CHANGE = "WORKFLOW_FILE_CHANGE"
 
+    # ------------------------------------------------------------------
+    # Source Control authentication categories
+    #
+    # These codes are used by the Managed GitHub App + Device Flow
+    # authentication layer (and its BYOA fallback). They are kept
+    # distinct from `AUTH_REQUIRED` / `AUTH_EXPIRED` because:
+    #
+    #   - `AUTH_DISABLED` / `AUTH_SOURCE_DISABLED` are CONFIGURATION
+    #     states, not credential states. A user whose token is
+    #     perfectly valid must still see "Managed GitHub App is
+    #     disabled" instead of "Authentication required".
+    #
+    #   - `UNSUPPORTED_AUTH_SOURCE` is a programmer/caller error
+    #     (`LEGACY_UNKNOWN` cannot be used to start a new flow),
+    #     not an authentication failure.
+    #
+    #   - `DEVICE_FLOW_*` codes describe a distinct protocol with its
+    #     own RFC 8628 error vocabulary. Collapsing them into
+    #     `PROVIDER_ERROR` would force the polling loop and the
+    #     frontend to inspect `isinstance` chains instead of
+    #     switching on the stable `code` value.
+    # ------------------------------------------------------------------
+    AUTH_DISABLED = "AUTH_DISABLED"
+    AUTH_SOURCE_DISABLED = "AUTH_SOURCE_DISABLED"
+    UNSUPPORTED_AUTH_SOURCE = "UNSUPPORTED_AUTH_SOURCE"
+
+    # Device Flow protocol errors (RFC 8628 + GitHub extensions).
+    DEVICE_FLOW_ERROR = "DEVICE_FLOW_ERROR"
+    DEVICE_FLOW_DISABLED = "DEVICE_FLOW_DISABLED"
+    DEVICE_FLOW_PENDING = "DEVICE_FLOW_PENDING"
+    DEVICE_FLOW_SLOW_DOWN = "DEVICE_FLOW_SLOW_DOWN"
+    DEVICE_FLOW_DENIED = "DEVICE_FLOW_DENIED"
+    DEVICE_FLOW_EXPIRED = "DEVICE_FLOW_EXPIRED"
+    DEVICE_FLOW_SESSION_NOT_FOUND = "DEVICE_FLOW_SESSION_NOT_FOUND"
+
 
 # ---------------------------------------------------------------------------
 # Approval lifecycle

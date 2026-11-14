@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..domain.policies import is_protected_branch
@@ -1344,6 +1344,71 @@ class UpdateSourceControlSettingsRequest(BaseSCRequest):
                 )
             cleaned.append(trimmed)
         return tuple(cleaned)
+
+
+class AuthSettingsUpdateRequest(BaseSCRequest):
+    """Payload to update Source Control authentication settings.
+
+    All fields are optional. Omitted fields retain their current
+    values (partial update), matching the settings UI's pattern of
+    toggling one switch at a time.
+
+    The nested ``managed`` / ``byoa`` / ``security`` payloads are
+    DEEP-MERGED at the store level: a partial ``managed`` payload
+    updates only the fields it carries. The ``providers`` mapping
+    is SHALLOW-MERGED per provider: a payload entry for a given
+    provider replaces that provider's current entry entirely,
+    while providers absent from the payload keep their current
+    values. This asymmetry is intentional and matches what the
+    UI needs (it always sends the full provider entry when the
+    user edits it, but may send only one field of ``managed``).
+    """
+
+    enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Master switch for the authentication subsystem. When "
+            "False, neither managed nor BYOA may start a new "
+            "connection. Existing connections and tokens are "
+            "preserved."
+        ),
+    )
+    managed: Optional[Mapping[str, Any]] = Field(
+        default=None,
+        description=(
+            "Partial `managed` block. Recognized keys: "
+            "'enabled' (bool), 'provider' (string; only 'github' "
+            "is currently supported), and 'strategy' (string; only "
+            "'device_flow' is currently supported). Unknown keys "
+            "are rejected by `ManagedAuthSettings.__post_init__`."
+        ),
+    )
+    byoa: Optional[Mapping[str, Any]] = Field(
+        default=None,
+        description=(
+            "Partial `byoa` block. Currently only 'enabled' "
+            "(bool) is recognized."
+        ),
+    )
+    providers: Optional[Mapping[str, Mapping[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Per-provider overrides, keyed by provider ID. Each "
+            "value MUST be a mapping with any subset of "
+            "'preferred_source' (string: 'managed' or 'byoa'), "
+            "'managed_enabled' (bool), and 'byoa_enabled' (bool). "
+            "Values are shallow-merged with the existing entry "
+            "for the same provider."
+        ),
+    )
+    security: Optional[Mapping[str, Any]] = Field(
+        default=None,
+        description=(
+            "Partial `security` block. Recognized keys: "
+            "'automatic_fallback' (bool) and "
+            "'require_secure_vault' (bool)."
+        ),
+    )
 
 
 class CreateTagRequest(BaseSCRequest):

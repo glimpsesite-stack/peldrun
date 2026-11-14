@@ -3,6 +3,7 @@
 import React from "react";
 import { ProviderDescriptorResponse, ConnectionStatusResponse } from "../api/schemas";
 import { formatGrantedScopes } from "../utils/permission-labels";
+import { AuthSourceIndicator } from "./authentication/AuthSourceIndicator";
 
 interface ProviderConnectionCardProps {
   provider: ProviderDescriptorResponse;
@@ -29,7 +30,21 @@ export function ProviderConnectionCard({
   onConfigure,
 }: ProviderConnectionCardProps) {
   const isConnected = connection?.is_connected ?? false;
+  // `isConfigured` retains its historical meaning: BYOA credentials
+  // (Client ID + Secret) are present in the vault/JSON. It is
+  // ORTHOGONAL to the managed path, which does not require any
+  // user-configured credentials.
   const isConfigured = provider.is_configured ?? false;
+  // The managed and BYOA readiness flags are provided by the
+  // backend's `ProviderDescriptorResponse` (added when the auth
+  // layer was introduced). A provider can START a new connection
+  // if at least one path is ready. `isConfigured` alone is NOT
+  // enough: BYOA credentials may be present while the BYOA path is
+  // disabled globally, in which case `byoa_ready` is false and the
+  // backend would reject the call with `AuthSourceDisabledError`.
+  const managedReady = provider.managed_ready ?? false;
+  const byoaReady = provider.byoa_ready ?? false;
+  const canConnect = managedReady || byoaReady;
 
   return (
     <div className="flex flex-col rounded-lg border border-gray-200 bg-white shadow-sm transition-shadow hover:shadow-md">
@@ -75,7 +90,7 @@ export function ProviderConnectionCard({
 
       {/* Body */}
       <div className="flex-1 p-4">
-        {!isConfigured && !isConnected ? (
+        {!canConnect && !isConnected ? (
           <div className="rounded-md bg-yellow-50 p-3 border border-yellow-200">
             <div className="flex">
               <div className="flex-shrink-0">
@@ -86,9 +101,24 @@ export function ProviderConnectionCard({
               <div className="ml-3">
                 <h3 className="text-sm font-medium text-yellow-800">Setup Required</h3>
                 <div className="mt-2 text-sm text-yellow-700">
-                  <p>
-                    OAuth App credentials are missing. You must configure your own Client ID and Secret before connecting.
-                  </p>
+                  {/* Two distinct sub-cases. Telling them apart
+                      lets the user act correctly: "credentials
+                      missing" is a user action; "path disabled"
+                      is an operator/settings action. */}
+                  {isConfigured ? (
+                    <p>
+                      Your OAuth App credentials are saved, but neither
+                      the managed path nor the BYOA path is currently
+                      enabled in settings. Enable one of them in the
+                      authentication section above to connect.
+                    </p>
+                  ) : (
+                    <p>
+                      OAuth App credentials are missing. Configure your
+                      own Client ID and Secret here, or ask an operator
+                      to enable the managed GitHub App path.
+                    </p>
+                  )}
                 </div>
                 <div className="mt-3">
                   <button
@@ -108,6 +138,20 @@ export function ProviderConnectionCard({
               <span className="text-sm font-medium text-gray-500">Account</span>
               <p className="text-sm text-gray-900">{connection.username || connection.account_id}</p>
             </div>
+
+            {/* Authentication source badge. Shown whenever the
+                backend reports a source: managed, byoa, or
+                legacy_unknown. The indicator handles all three
+                and renders null for null/undefined, so a
+                disconnected card (which already returned through
+                the isConnected guard) never renders an empty
+                badge. */}
+            {connection.auth_source && (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-sm font-medium text-gray-500">Connected via</span>
+                <AuthSourceIndicator source={connection.auth_source} compact />
+              </div>
+            )}
 
             <div>
               <span className="text-sm font-medium text-gray-500">Granted Permissions</span>
@@ -156,7 +200,7 @@ export function ProviderConnectionCard({
           <button
             type="button"
             onClick={() => onConnect(provider.provider_id)}
-            disabled={isConnecting || !isConfigured}
+            disabled={isConnecting || !canConnect}
             className="inline-flex items-center rounded-md border border-transparent bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:bg-gray-300 disabled:text-gray-500 disabled:cursor-not-allowed"
           >
             {isConnecting ? (
@@ -167,10 +211,12 @@ export function ProviderConnectionCard({
                 </svg>
                 Connecting...
               </>
-            ) : !isConfigured ? (
+            ) : !canConnect ? (
               "Configuration Required"
+            ) : managedReady ? (
+              `Connect via Device Flow`
             ) : (
-              `Connect ${provider.display_name}`
+              `Connect via OAuth`
             )}
           </button>
         )}

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from .requests import (
     ApproveOperationRequest,
+    AuthSettingsUpdateRequest,
     BaseSCRequest,
     CheckoutBranchRequest,
     ConnectBeginRequest,
@@ -79,6 +80,8 @@ from .responses import (
     ActionSuccessResponse,
     ApprovalTicketResponse,
     AuditLogEntryResponse,
+    AuthSettingsUpdateResponse,
+    AuthStatusResponse,
     BaseSCResponse,
     BranchResponse,
     ChangeRequestResponse,
@@ -90,6 +93,8 @@ from .responses import (
     ConflictListResponse,
     ConnectBeginResponse,
     ConnectionStatusResponse,
+    DeviceFlowStartResponse,
+    DeviceFlowStatusResponse,
     DiffSummaryResponse,
     FileContentAtRefResponse,
     FileDiffResponse,
@@ -123,6 +128,7 @@ __all__ = [
     # -----------------------------------------------------------------------
     # Request schemas
     # -----------------------------------------------------------------------
+    "AuthSettingsUpdateRequest",
     "BaseSCRequest",
     "ConnectBeginRequest",
     "SaveProviderConfigRequest",
@@ -156,6 +162,8 @@ __all__ = [
     # -----------------------------------------------------------------------
     "BaseSCResponse",
     "ActionSuccessResponse",
+    "AuthSettingsUpdateResponse",
+    "AuthStatusResponse",
     "ProviderCapabilitiesResponse",
     "ProviderDescriptorResponse",
     "ConnectBeginResponse",
@@ -164,6 +172,8 @@ __all__ = [
     "BranchResponse",
     "FileReadResponse",
     "FileDiffResponse",
+    "DeviceFlowStartResponse",
+    "DeviceFlowStatusResponse",
     "DiffSummaryResponse",
     "CheckRunResponse",
     "CheckSummaryResponse",

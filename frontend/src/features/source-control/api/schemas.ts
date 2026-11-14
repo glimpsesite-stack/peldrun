@@ -128,6 +128,13 @@ export const ConnectionStatusResponseSchema = z.object({
   base_url: z.string().default("https://github.com"),
   granted_scopes: z.array(z.string()).default([]),
   last_validated_at: z.string().datetime().nullable().optional(),
+  // Which authentication source created this connection. Preserved
+  // for the lifetime of the connection:
+  //   "managed"        → PELDRUN GitHub App via Device Flow.
+  //   "byoa"           → User-provided OAuth App.
+  //   "legacy_unknown" → Predates `auth_source`; preserved as-is.
+  //   null             → Provider is not connected.
+  auth_source: z.enum(["managed", "byoa", "legacy_unknown"]).nullable().optional(),
 });
 
 export const ProviderCapabilitiesResponseSchema = z.object({
@@ -146,7 +153,14 @@ export const ProviderDescriptorResponseSchema = z.object({
   provider_id: z.string(),
   display_name: z.string(),
   is_connected: z.boolean(),
-  is_configured: z.boolean().default(false), // Added to track if OAuth keys are set
+  is_configured: z.boolean().default(false),
+  // Managed/BYOA readiness. These are ORTHOGONAL to
+  // `is_configured`: a provider with `is_configured=false` and
+  // `managed_ready=true` is usable via the managed path. The UI
+  // MUST enable the "Connect" button when either readiness flag
+  // is true, NOT only when `is_configured` is true.
+  managed_ready: z.boolean().default(false),
+  byoa_ready: z.boolean().default(false),
   capabilities: ProviderCapabilitiesResponseSchema,
   web_base_url: z.string(),
   api_base_url: z.string(),
@@ -656,6 +670,98 @@ export const CreateReleaseRequestSchema = z.object({
 });
 
 // ----------------------------------------------------------------------
+// Source Control Authentication (Managed GitHub App + Device Flow)
+// ----------------------------------------------------------------------
+//
+// These schemas describe the payloads of the auth endpoints in
+// `backend/omweb/routers/source_control.py`:
+//
+//     GET  /auth/settings
+//     PUT  /auth/settings
+//     GET  /auth/status
+//     POST /connections/{provider}/device/start
+//     GET  /connections/{provider}/device/{session_id}/status
+//     POST /connections/{provider}/device/{session_id}/cancel
+//
+// Design notes:
+//
+//   - The `AuthStatusResponse` model in the backend exposes
+//     `settings`, `managed`, `byoa`, `vault`, and `providers` as
+//     plain `Mapping[str, Any]`. Using `z.record(z.string(), z.any())`
+//     here mirrors that: the Zod schema only validates that the
+//     top-level fields are present and are objects, while each
+//     individual key is validated by the UI code that consumes it
+//     (see `types/authentication.ts` for the typed view).
+//
+//   - `DeviceFlowStartResponse` and `DeviceFlowStatusResponse` are
+//     strict on purpose: they carry the state machine that drives
+//     the Device Flow dialog, and a typo in any of their fields
+//     would silently stall the flow. Any drift is caught here at
+//     the network boundary, not deep inside a component.
+
+export const AuthSourceSchema = z.enum(["managed", "byoa", "legacy_unknown"]);
+export const SelectableAuthSourceSchema = z.enum(["managed", "byoa"]);
+export const DeviceFlowStatusSchema = z.enum([
+  "pending",
+  "completed",
+  "denied",
+  "expired",
+  "cancelled",
+  "error",
+]);
+
+export const AuthStatusResponseSchema = z.object({
+  settings: z.record(z.string(), z.any()),
+  managed: z.record(z.string(), z.any()),
+  byoa: z.record(z.string(), z.any()),
+  vault: z.record(z.string(), z.any()),
+  providers: z.record(z.string(), z.any()),
+});
+
+export const AuthSettingsUpdateResponseSchema = z.object({
+  status: z.string().default("success"),
+  message: z.string().default("Authentication settings updated."),
+  settings: z.record(z.string(), z.any()),
+});
+
+export const DeviceFlowStartResponseSchema = z.object({
+  session_id: z.string(),
+  user_code: z.string(),
+  verification_uri: z.string(),
+  expires_in_seconds: z.number().int(),
+  interval_seconds: z.number().int(),
+  status: z.literal("pending").default("pending"),
+  provider: z.string().default("github"),
+});
+
+export const DeviceFlowStatusResponseSchema = z.object({
+  session_id: z.string(),
+  provider: z.string(),
+  status: DeviceFlowStatusSchema,
+  user_code: z.string().nullable().optional(),
+  verification_uri: z.string().nullable().optional(),
+  expires_in_seconds: z.number().int().default(0),
+  interval_seconds: z.number().int().default(5),
+  error_message: z.string().nullable().optional(),
+  account: z.record(z.string(), z.any()).nullable().optional(),
+});
+
+/**
+ * Partial auth settings update payload.
+ *
+ * All fields are optional: the backend deep-merges `managed`,
+ * `byoa`, and `security`, and shallow-merges `providers`. Sending
+ * only the fields the user changed produces a cleaner audit log.
+ */
+export const AuthSettingsUpdateRequestSchema = z.object({
+  enabled: z.boolean().optional(),
+  managed: z.record(z.string(), z.any()).optional(),
+  byoa: z.record(z.string(), z.any()).optional(),
+  providers: z.record(z.string(), z.record(z.string(), z.any())).optional(),
+  security: z.record(z.string(), z.any()).optional(),
+});
+
+// ----------------------------------------------------------------------
 // Inferred TypeScript Types
 // ----------------------------------------------------------------------
 
@@ -732,3 +838,21 @@ export type ReleaseResponse = z.infer<typeof ReleaseResponseSchema>;
 export type ReleaseListResponse = z.infer<typeof ReleaseListResponseSchema>;
 export type CreateTagRequest = z.infer<typeof CreateTagRequestSchema>;
 export type CreateReleaseRequest = z.infer<typeof CreateReleaseRequestSchema>;
+
+// Source Control authentication
+export type AuthSource = z.infer<typeof AuthSourceSchema>;
+export type SelectableAuthSource = z.infer<typeof SelectableAuthSourceSchema>;
+export type DeviceFlowStatus = z.infer<typeof DeviceFlowStatusSchema>;
+export type AuthStatusResponse = z.infer<typeof AuthStatusResponseSchema>;
+export type AuthSettingsUpdateResponse = z.infer<
+  typeof AuthSettingsUpdateResponseSchema
+>;
+export type DeviceFlowStartResponse = z.infer<
+  typeof DeviceFlowStartResponseSchema
+>;
+export type DeviceFlowStatusResponse = z.infer<
+  typeof DeviceFlowStatusResponseSchema
+>;
+export type AuthSettingsUpdateRequest = z.infer<
+  typeof AuthSettingsUpdateRequestSchema
+>;

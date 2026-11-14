@@ -67,6 +67,17 @@ __all__ = [
     "PolicyDeniedError",
     "ProtectedBranchError",
     "WorkflowFileError",
+    # Source Control authentication (Managed + BYOA + Device Flow)
+    "AuthDisabledError",
+    "AuthSourceDisabledError",
+    "UnsupportedAuthSourceError",
+    "DeviceFlowError",
+    "DeviceFlowDisabledError",
+    "DeviceFlowPendingError",
+    "DeviceFlowSlowDownError",
+    "DeviceFlowDeniedError",
+    "DeviceFlowExpiredError",
+    "DeviceFlowSessionNotFoundError",
     # Helpers
     "to_source_control_error",
     "error_code_of",
@@ -456,6 +467,179 @@ class WorkflowFileError(SourceControlError):
 
 
 # ---------------------------------------------------------------------------
+# Source Control authentication (Managed GitHub App + BYOA + Device Flow)
+# ---------------------------------------------------------------------------
+#
+# These classes cover three distinct failure modes that must remain
+# distinguishable both for the UI and for the polling loop:
+#
+#   1. Configuration states (`AuthDisabledError`,
+#      `AuthSourceDisabledError`, `UnsupportedAuthSourceError`):
+#      the user's request cannot even begin because the relevant
+#      settings forbid it, or the caller requested an invalid
+#      strategy. None of these is a credential failure.
+#
+#   2. Protocol errors (`DeviceFlowError` and its subclasses): the
+#      Device Flow handshake itself failed, or returned a
+#      GitHub-defined error code that maps to a specific
+#      user-visible outcome (`access_denied`, `expired_token`,
+#      `slow_down`, `device_flow_disabled`).
+#
+#   3. Session errors (`DeviceFlowSessionNotFoundError`): the
+#      caller referenced a session that is not (or no longer) in
+#      the in-memory store. This is a caller-bookkeeping error,
+#      not a protocol failure.
+
+
+class AuthDisabledError(SourceControlError):
+    """
+    Raised when the entire Source Control authentication subsystem
+    is disabled by settings.
+
+    Distinct from `AuthSourceDisabledError`: this error means NO
+    authentication is possible at all (neither managed nor byoa),
+    while the source-specific error means only that one strategy is
+    disabled and the other may still be usable.
+    """
+
+    default_code = SourceControlErrorCode.AUTH_DISABLED
+    default_retryable = False
+    default_http_status = 403
+
+
+class AuthSourceDisabledError(SourceControlError):
+    """
+    Raised when a caller requests a specific auth source that is
+    disabled in settings.
+
+    The error message names the source so that the UI can render a
+    targeted message. No automatic fallback is performed: if the
+    user selected MANAGED and it is disabled, the flow fails here
+    rather than silently using BYOA.
+    """
+
+    default_code = SourceControlErrorCode.AUTH_SOURCE_DISABLED
+    default_retryable = False
+    default_http_status = 403
+
+
+class UnsupportedAuthSourceError(SourceControlError):
+    """
+    Raised when the requested source is not a selectable strategy.
+
+    The canonical case is `AuthSource.LEGACY_UNKNOWN`: it may appear
+    on an existing connection record, but it can NEVER be used to
+    start a new flow.
+    """
+
+    default_code = SourceControlErrorCode.UNSUPPORTED_AUTH_SOURCE
+    default_retryable = False
+    default_http_status = 400
+
+
+class DeviceFlowError(SourceControlError):
+    """
+    Base class for Device Flow protocol errors.
+
+    Subclasses cover the specific GitHub error codes. A plain
+    `DeviceFlowError` is raised only for unexpected conditions that
+    do not match any known code.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_ERROR
+    default_retryable = False
+    default_http_status = 502
+
+
+class DeviceFlowDisabledError(DeviceFlowError):
+    """
+    Raised when GitHub reports `device_flow_disabled`.
+
+    This means the GitHub App itself does not have Device Flow
+    enabled in its settings. It is a configuration error on the
+    PELDRUN operator side, NOT a transient failure: retrying does
+    not help. The UI must surface an actionable message that points
+    the operator at the GitHub App settings page.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_DISABLED
+    default_retryable = False
+    default_http_status = 503
+
+
+class DeviceFlowPendingError(DeviceFlowError):
+    """
+    Raised when GitHub returns `authorization_pending`.
+
+    This is the NORMAL response while the user has not yet approved
+    the request on GitHub. The polling loop treats it as a signal
+    to sleep and retry, not as a failure.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_PENDING
+    default_retryable = True
+    default_http_status = 202
+
+
+class DeviceFlowSlowDownError(DeviceFlowError):
+    """
+    Raised when GitHub returns `slow_down`.
+
+    Per RFC 8628 and GitHub's documentation, the polling interval
+    MUST be increased by 5 seconds before the next attempt. The
+    polling loop implements this; the error is exposed so callers
+    that implement their own loop can honor the same rule.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_SLOW_DOWN
+    default_retryable = True
+    default_http_status = 429
+
+
+class DeviceFlowDeniedError(DeviceFlowError):
+    """
+    Raised when GitHub returns `access_denied`.
+
+    The user explicitly rejected the authorization request on
+    GitHub. The session is terminal and the user code MUST NOT be
+    reused.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_DENIED
+    default_retryable = False
+    default_http_status = 403
+
+
+class DeviceFlowExpiredError(DeviceFlowError):
+    """
+    Raised when GitHub returns `expired_token`, or when the local
+    session TTL elapses before GitHub reports completion.
+
+    The user code is no longer valid. The user must restart the
+    flow to obtain a fresh code.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_EXPIRED
+    default_retryable = False
+    default_http_status = 410
+
+
+class DeviceFlowSessionNotFoundError(SourceControlError):
+    """
+    Raised when a caller references a Device Flow session ID that
+    is not (or no longer) in the in-memory store.
+
+    The canonical causes are: a frontend that polled after the
+    session was cleaned up, a backend restart (sessions are
+    deliberately not persisted), or a typo in the session ID.
+    """
+
+    default_code = SourceControlErrorCode.DEVICE_FLOW_SESSION_NOT_FOUND
+    default_retryable = False
+    default_http_status = 404
+
+
+# ---------------------------------------------------------------------------
 # Conversion helpers
 # ---------------------------------------------------------------------------
 
@@ -487,6 +671,17 @@ _CODE_TO_CLASS: dict[SourceControlErrorCode, type[SourceControlError]] = {
     SourceControlErrorCode.POLICY_DENIED: PolicyDeniedError,
     SourceControlErrorCode.PROTECTED_BRANCH: ProtectedBranchError,
     SourceControlErrorCode.WORKFLOW_FILE_CHANGE: WorkflowFileError,
+    # Source Control authentication (Managed + BYOA + Device Flow)
+    SourceControlErrorCode.AUTH_DISABLED: AuthDisabledError,
+    SourceControlErrorCode.AUTH_SOURCE_DISABLED: AuthSourceDisabledError,
+    SourceControlErrorCode.UNSUPPORTED_AUTH_SOURCE: UnsupportedAuthSourceError,
+    SourceControlErrorCode.DEVICE_FLOW_ERROR: DeviceFlowError,
+    SourceControlErrorCode.DEVICE_FLOW_DISABLED: DeviceFlowDisabledError,
+    SourceControlErrorCode.DEVICE_FLOW_PENDING: DeviceFlowPendingError,
+    SourceControlErrorCode.DEVICE_FLOW_SLOW_DOWN: DeviceFlowSlowDownError,
+    SourceControlErrorCode.DEVICE_FLOW_DENIED: DeviceFlowDeniedError,
+    SourceControlErrorCode.DEVICE_FLOW_EXPIRED: DeviceFlowExpiredError,
+    SourceControlErrorCode.DEVICE_FLOW_SESSION_NOT_FOUND: DeviceFlowSessionNotFoundError,
 }
 
 

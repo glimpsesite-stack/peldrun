@@ -278,6 +278,168 @@ except (ImportError, ValueError):
     )
 
 
+# Source Control authentication schemas — Managed GitHub App +
+# Device Flow. Self-contained try/except for the same reason every
+# other schema block in this module is: the module has two import
+# paths, and adding the names to only one would break the other.
+try:
+    from ...integrations.source_control.schemas import (
+        AuthSettingsUpdateRequest,
+        AuthSettingsUpdateResponse,
+        AuthStatusResponse,
+        DeviceFlowStartResponse,
+        DeviceFlowStatusResponse,
+    )
+except (ImportError, ValueError):
+    from backend.integrations.source_control.schemas import (
+        AuthSettingsUpdateRequest,
+        AuthSettingsUpdateResponse,
+        AuthStatusResponse,
+        DeviceFlowStartResponse,
+        DeviceFlowStatusResponse,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auth service dependency + response mappers
+# ---------------------------------------------------------------------------
+#
+# The auth service is NOT wired into the router through the facade's
+# constructor (that would create a cycle: the service needs the
+# facade). Instead, it is resolved lazily on first use and cached
+# on the facade via `set_auth_service(...)` so that:
+#
+#   - `list_providers` in subsequent requests already sees the
+#     wired service and reports `managed_ready` / `byoa_ready`.
+#   - `begin_connection` enforces the BYOA gate on subsequent
+#     requests without waiting for the auth endpoints to run first.
+#
+# The resolver prefers whatever service the facade already holds,
+# so an application that wires a custom service at startup is fully
+# honored. The fallback to `get_default_auth_service()` is for the
+# out-of-the-box path where nothing was wired explicitly.
+
+
+def _get_auth_service(
+    facade: SourceControlFacade = Depends(get_source_control_facade),
+) -> Any:
+    """
+    Return the Source Control authentication service.
+
+    Resolution order:
+
+        1. The service already wired into the facade. This is the
+           normal case after the first request; it is also the
+           case for applications that wire a custom service at
+           startup via `facade.set_auth_service(...)`.
+
+        2. The process-wide default service (lazily constructed).
+           It is auto-wired onto the facade so subsequent requests
+           take path (1).
+
+    Raises `HTTPException(503)` when the service cannot be
+    constructed at all (e.g. the settings store or the facade
+    singleton is unavailable in an unusual deployment). The caller
+    receives a stable, non-leaking error message; the real cause is
+    in the server log.
+    """
+    if hasattr(facade, "get_auth_service"):
+        wired = facade.get_auth_service()
+        if wired is not None:
+            return wired
+
+    try:
+        from ..services.source_control_auth_service import (
+            get_default_auth_service,
+        )
+    except ImportError:
+        from backend.omweb.services.source_control_auth_service import (  # type: ignore[no-redef]
+            get_default_auth_service,
+        )
+
+    try:
+        service = get_default_auth_service()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Could not construct the Source Control auth service"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Source Control auth service is unavailable. "
+                "Check the server logs for details."
+            ),
+        ) from exc
+
+    if hasattr(facade, "set_auth_service"):
+        try:
+            facade.set_auth_service(service)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Ensure the auth service uses the EXACT same facade instance
+    # as the router. We remove the `hasattr` check because if the
+    # service was built by an older version of the code (or by a
+    # factory that didn't set `_facade`), `hasattr` would return
+    # False and we'd silently skip the assignment, leaving the
+    # service with a stale or empty facade. Forcing the assignment
+    # guarantees the service sees the router's connection registry.
+    try:
+        service._facade = facade
+    except Exception:  # noqa: BLE001
+        pass
+
+    return service
+
+
+def _to_device_flow_start_response(
+    view: Any, provider: str
+) -> DeviceFlowStartResponse:
+    """Map a `DeviceFlowSessionView` to the start response."""
+    return DeviceFlowStartResponse(
+        session_id=view.session_id,
+        user_code=view.user_code,
+        verification_uri=view.verification_uri,
+        expires_in_seconds=int(view.expires_in_seconds),
+        interval_seconds=int(view.interval),
+        status=(
+            view.status.value
+            if hasattr(view.status, "value")
+            else str(view.status)
+        ),
+        provider=provider,
+    )
+
+
+def _to_device_flow_status_response(
+    view: Any, provider: str
+) -> DeviceFlowStatusResponse:
+    """Map a `DeviceFlowSessionView` to the status response."""
+    status_value = (
+        view.status.value
+        if hasattr(view.status, "value")
+        else str(view.status)
+    )
+    account = None
+    if status_value == "completed" and view.account_id:
+        account = {
+            "provider": provider,
+            "account_id": view.account_id,
+            "username": view.username,
+        }
+    return DeviceFlowStatusResponse(
+        session_id=view.session_id,
+        provider=provider,
+        status=status_value,
+        user_code=view.user_code,
+        verification_uri=view.verification_uri,
+        expires_in_seconds=int(view.expires_in_seconds),
+        interval_seconds=int(view.interval),
+        error_message=view.error_message,
+        account=account,
+    )
+
+
 def handle_source_control_error(exc: Exception) -> NoReturn:
     """
     Translate a source-control domain error into a structured FastAPI
@@ -569,6 +731,188 @@ async def disconnect_provider(
     try:
         req = payload or DisconnectRequest()
         return await facade.disconnect_provider(provider, req)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Source Control authentication (Managed GitHub App + Device Flow)
+# ---------------------------------------------------------------------------
+#
+# This section is the HTTP surface of the Managed GitHub App +
+# Device Flow authentication path (and, indirectly, of the BYOA
+# readiness state). It is deliberately kept in the same router as
+# the connection endpoints because the two share the same facade
+# and the same connection registry; splitting them into a second
+# router would require duplicating the dependency wiring and would
+# make `list_providers`' readiness flags and the auth status
+# endpoint drift apart.
+#
+# Endpoints:
+#
+#     GET    /auth/settings     — full auth status + settings.
+#     PUT    /auth/settings     — partial settings update.
+#     GET    /auth/status       — alias of /auth/settings, kept
+#                                 because the frontend's poller
+#                                 calls /auth/status by name.
+#     POST   /connections/{p}/device/start
+#     GET    /connections/{p}/device/{session_id}/status
+#     POST   /connections/{p}/device/{session_id}/cancel
+#
+# Authentication model: identical to the rest of the router (see
+# the module docstring). Domain authorization is enforced by the
+# auth service, which checks the settings gates before starting
+# any flow.
+
+
+@router.get(
+    "/auth/settings",
+    response_model=AuthStatusResponse,
+)
+async def get_auth_settings(
+    auth_service: Any = Depends(_get_auth_service),
+) -> AuthStatusResponse:
+    """Return the full Source Control authentication status.
+
+    The response includes the current settings, the managed and
+    BYOA sub-blocks, the vault backend name and availability, and
+    the per-provider readiness/connection status. It is the
+    canonical payload the Integrations page uses to render the
+    "Source Control Authentication" section.
+    """
+    try:
+        status_dict = auth_service.get_auth_status()
+        return AuthStatusResponse(**status_dict)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.put(
+    "/auth/settings",
+    response_model=AuthSettingsUpdateResponse,
+)
+async def update_auth_settings(
+    payload: AuthSettingsUpdateRequest,
+    auth_service: Any = Depends(_get_auth_service),
+) -> AuthSettingsUpdateResponse:
+    """Update Source Control authentication settings (partial).
+
+    Only the fields present in the payload are updated; omitted
+    fields keep their current values. The nested `managed`,
+    `byoa`, and `security` mappings are DEEP-MERGED (a partial
+    payload updates only the fields it carries); the `providers`
+    mapping is SHALLOW-MERGED per provider (a payload entry
+    replaces that provider's current entry entirely).
+    """
+    try:
+        # model_dump(exclude_none=True) drops fields the caller did
+        # not provide, which is exactly the merge semantics the
+        # store expects. The store validates the merged result and
+        # raises ValidationError (HTTP 422) on inconsistency, so a
+        # bad payload never lands on disk.
+        partial = payload.model_dump(exclude_none=True)
+        settings_store = auth_service._settings_store  # type: ignore[attr-defined]
+        new_settings = settings_store.update(partial)
+        return AuthSettingsUpdateResponse(
+            settings=new_settings.to_dict(),
+        )
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/auth/status",
+    response_model=AuthStatusResponse,
+)
+async def get_auth_status(
+    auth_service: Any = Depends(_get_auth_service),
+) -> AuthStatusResponse:
+    """Alias of `GET /auth/settings`.
+
+    Kept because the frontend poller and some external scripts
+    call `/auth/status` by name. The two endpoints are identical
+    on purpose: there is exactly one source of truth for the
+    status (the auth service's `get_auth_status`), so maintaining
+    two implementations would only invite drift.
+    """
+    try:
+        status_dict = auth_service.get_auth_status()
+        return AuthStatusResponse(**status_dict)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/connections/{provider}/device/start",
+    response_model=DeviceFlowStartResponse,
+)
+async def start_device_flow(
+    provider: str,
+    auth_service: Any = Depends(_get_auth_service),
+) -> DeviceFlowStartResponse:
+    """Start a Managed GitHub App Device Flow session.
+
+    The backend returns the user code and verification URL. The
+    frontend MUST display them and then poll the status endpoint
+    until the session reaches a terminal state.
+
+    The backend immediately starts an `asyncio.Task` that drives
+    the Device Flow against GitHub; no further backend action is
+    required from the caller. Cancellation is available via
+    `POST /connections/{provider}/device/{session_id}/cancel`.
+    """
+    try:
+        view = await auth_service.begin_managed(provider)
+        return _to_device_flow_start_response(view, provider)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.get(
+    "/connections/{provider}/device/{session_id}/status",
+    response_model=DeviceFlowStatusResponse,
+)
+async def get_device_flow_status(
+    provider: str,
+    session_id: str,
+    auth_service: Any = Depends(_get_auth_service),
+) -> DeviceFlowStatusResponse:
+    """Return the current state of a Device Flow session.
+
+    The frontend polls this endpoint at the interval returned in
+    the last response (initially the interval from the start
+    response). The status value drives the UI state machine; see
+    the `DeviceFlowStatusResponse` docstring for the full
+    semantics.
+    """
+    try:
+        view = auth_service.get_device_status(session_id)
+        return _to_device_flow_status_response(view, provider)
+    except Exception as exc:
+        handle_source_control_error(exc)
+
+
+@router.post(
+    "/connections/{provider}/device/{session_id}/cancel",
+    response_model=DeviceFlowStatusResponse,
+)
+async def cancel_device_flow(
+    provider: str,
+    session_id: str,
+    auth_service: Any = Depends(_get_auth_service),
+) -> DeviceFlowStatusResponse:
+    """Cancel a PENDING Device Flow session.
+
+    Idempotent: canceling an already-terminal session returns its
+    terminal state. Canceling a PENDING session stops the backend
+    polling task and marks the session as CANCELLED. The device
+    code itself expires on GitHub's side after its own TTL; it is
+    NOT actively revoked (GitHub does not provide an unapproved-
+    code revocation endpoint).
+    """
+    try:
+        view = auth_service.cancel_device(session_id)
+        return _to_device_flow_status_response(view, provider)
     except Exception as exc:
         handle_source_control_error(exc)
 
