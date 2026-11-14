@@ -3,30 +3,28 @@
 /**
  * The global memory settings form.
  *
- * Loads the current settings via `useMemorySettings`, maintains
- * a local editable copy, and PATCHes only the fields that
- * differ on save. This diff-based submission is REQUIRED by
- * the backend (empty PATCH -> 400) and prevents the
- * "changed then changed back" case from producing a misleading
- * error toast.
+ * Design aligned with the app's SearchTab:
  *
- * The form is ALWAYS editable -- including when `mode === 'disabled'`.
- * This is the app's only path to re-enabling memory (spec §1.3
- * and §6.1 rule 1).
+ *   * Each logical group (mode, provider, retrieval, budget,
+ *     extraction) is its own `<MemorySection>` with a distinct
+ *     accent color and entry animation delay. The staggered
+ *     reveal matches SearchTab's sections.
  *
- * Validation strategy
- * -------------------
+ *   * Fields are wrapped in `<MemoryField>` -- the card-as-input
+ *     pattern used by SearchTab. Labels are uppercase,
+ *     tracking-wider, and the input itself is borderless.
  *
- * `makeSettingsPatchSchema(current)` is rebuilt on every render
- * with the LATEST loaded settings. It cross-checks
- * `reserved <= max` on the merged token budget, so a user who
- * lowers `max_tokens` below the current `reserved` gets an
- * inline error the moment they tab out -- not a round-trip
- * rejection.
+ *   * The mode section's accent color tracks the current mode:
+ *     emerald for read_write, amber for read_only, rose for
+ *     disabled. This makes the state visible without reading
+ *     the labels.
  *
- * The Save button is disabled when `isNoOpPatch(current, draft)`
- * is true, which covers both "nothing changed" and "changed
- * back to the original value".
+ * Behaviour preserved from the pre-redesign version:
+ *
+ *   * Diff-based PATCH submission (only changed fields).
+ *   * `isNoOpPatch` guard against "changed then changed back".
+ *   * `makeSettingsPatchSchema` cross-checks `reserved <= max`.
+ *   * Form remains editable in `disabled` mode (spec §6.1).
  */
 
 'use client';
@@ -39,7 +37,15 @@ import {
   useState,
 } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Save } from 'lucide-react';
+import {
+  Check,
+  Database,
+  Power,
+  Save,
+  SlidersHorizontal,
+  Sparkles,
+  Wallet,
+} from 'lucide-react';
 
 import {
   MemoryMode,
@@ -60,6 +66,13 @@ import { usePatchSettings } from '../api/mutations';
 import { useMemorySettings } from '../api/queries';
 import { cn } from '../lib/cn';
 import { ModeBadge } from './ModeBadge';
+import { MemorySection } from './MemorySection';
+import { MemoryBanner } from './MemoryBanner';
+import {
+  MemoryField,
+  MEMORY_FIELD_INPUT_CLASS,
+} from './MemoryField';
+import type { MemorySectionAccent } from './MemorySection';
 
 // ---------------------------------------------------------------------------
 // Component
@@ -83,9 +96,7 @@ export function SettingsForm({ className }: { className?: string }) {
     }
   }, [settingsQuery.data, form]);
 
-  // After successful save, reset form to the server's canonical
-  // response (which may normalize some values, e.g. trim a
-  // provider_id). This also closes the "saved" pulse.
+  // Sync form after successful save (server may normalize values).
   useEffect(() => {
     if (patchMutation.isSuccess && patchMutation.data) {
       setForm(structuredClone(patchMutation.data.settings));
@@ -108,11 +119,11 @@ export function SettingsForm({ className }: { className?: string }) {
   // ---- Loading / error states ------------------------------------
   if (settingsQuery.isLoading) {
     return (
-      <div className={cn('space-y-2', className)} aria-busy="true">
-        {[0, 1, 2].map((i) => (
+      <div className={cn('space-y-4', className)} aria-busy="true">
+        {[0, 1, 2, 3].map((i) => (
           <div
             key={i}
-            className="h-16 w-full animate-pulse rounded-md bg-muted"
+            className="h-32 w-full animate-pulse rounded-md bg-muted/40"
           />
         ))}
       </div>
@@ -121,15 +132,11 @@ export function SettingsForm({ className }: { className?: string }) {
 
   if (settingsQuery.error || !form || !current) {
     return (
-      <div
-        className={cn(
-          'rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive',
-          className,
-        )}
-        role="alert"
-      >
-        {settingsQuery.error?.message ?? t('errors.generic')}
-      </div>
+      <MemoryBanner
+        tone="error"
+        message={settingsQuery.error?.message ?? t('errors.generic')}
+        className={className}
+      />
     );
   }
 
@@ -164,14 +171,22 @@ export function SettingsForm({ className }: { className?: string }) {
     try {
       await patchMutation.mutateAsync(result.data);
     } catch {
-      // error surfaced via mutation state
+      // Error surfaced via mutation state
     }
   }
 
-  // ---- Render ----------------------------------------------------
+  // ---- Derived visual state --------------------------------------
   const isPending = patchMutation.isPending;
   const canSave = isDirty && !isPending;
 
+  const modeAccent: MemorySectionAccent =
+    form.mode === 'read_write'
+      ? 'emerald'
+      : form.mode === 'read_only'
+        ? 'amber'
+        : 'rose';
+
+  // ---- Render ----------------------------------------------------
   return (
     <form
       onSubmit={handleSubmit}
@@ -183,178 +198,250 @@ export function SettingsForm({ className }: { className?: string }) {
       </h2>
 
       {/* ============ Mode ============ */}
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {t('settings.sections.mode')}
-        </h3>
-        <div className="space-y-1.5">
-          {ALL_MEMORY_MODES.map((mode) => (
-            <label
-              key={mode}
-              className={cn(
-                'flex items-start gap-2 rounded-md border bg-card p-2.5 text-xs transition-colors',
-                form.mode === mode
-                  ? 'border-primary/60 bg-primary/5'
-                  : 'border-border hover:bg-muted/40',
-                isPending && 'cursor-not-allowed opacity-60',
-              )}
-            >
-              <input
-                type="radio"
-                name="memory-mode"
-                value={mode}
-                checked={form.mode === mode}
-                onChange={() => updateField('mode', mode)}
-                disabled={isPending}
-                className="mt-0.5 h-3.5 w-3.5 border-border text-primary focus:ring-2 focus:ring-primary focus:ring-offset-0"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="font-medium text-foreground">
-                    {t(`mode.${mode}.name`)}
-                  </span>
-                  {form.mode === mode && <ModeBadge mode={mode} size="xs" />}
+      <MemorySection
+        icon={Power}
+        title={t('settings.sections.mode')}
+        subtitle={t('mode.label')}
+        accent={modeAccent}
+        delay={0}
+      >
+        <div className="space-y-2">
+          {ALL_MEMORY_MODES.map((mode) => {
+            const selected = form.mode === mode;
+            return (
+              <label
+                key={mode}
+                className={cn(
+                  'flex items-start gap-2.5 rounded-sm border p-3 text-xs transition-colors cursor-pointer',
+                  selected
+                    ? 'border-primary/60 bg-primary/5'
+                    : 'border-border/60 bg-card hover:bg-muted/40',
+                  isPending && 'cursor-not-allowed opacity-60',
+                )}
+              >
+                <input
+                  type="radio"
+                  name="memory-mode"
+                  value={mode}
+                  checked={selected}
+                  onChange={() => updateField('mode', mode)}
+                  disabled={isPending}
+                  className="mt-0.5 h-3.5 w-3.5 border-border text-primary focus:ring-2 focus:ring-primary focus:ring-offset-0 cursor-pointer"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="font-semibold text-foreground">
+                      {t(`mode.${mode}.name`)}
+                    </span>
+                    {selected && <ModeBadge mode={mode} size="xs" />}
+                  </div>
+                  <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                    {t(`mode.${mode}.description`)}
+                  </p>
                 </div>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  {t(`mode.${mode}.description`)}
-                </p>
-              </div>
-            </label>
-          ))}
+              </label>
+            );
+          })}
         </div>
         {form.mode === 'disabled' && (
-          <p className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
-            {t('settings.modeWarningDisabled')}
-          </p>
+          <MemoryBanner
+            tone="warning"
+            message={t('settings.modeWarningDisabled')}
+          />
         )}
-      </section>
+      </MemorySection>
 
       {/* ============ Provider ============ */}
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {t('settings.sections.provider')}
-        </h3>
-        <div>
-          <label
-            htmlFor={`${formId}-provider`}
-            className="mb-1 block text-[11px] font-medium text-foreground"
-          >
-            {t('settings.fields.provider')}
-          </label>
+      <MemorySection
+        icon={Database}
+        title={t('settings.sections.provider')}
+        subtitle={t('settings.fields.provider')}
+        accent="purple"
+        delay={0.05}
+      >
+        <MemoryField
+          label={t('settings.fields.provider')}
+          htmlFor={`${formId}-provider`}
+          help="Storage backend used by the memory subsystem."
+        >
           <select
             id={`${formId}-provider`}
             value={form.provider_id}
             onChange={(e) => updateField('provider_id', e.target.value)}
             disabled={isPending}
-            className="h-8 w-full max-w-xs rounded-md border border-border bg-background px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            className={cn(MEMORY_FIELD_INPUT_CLASS, 'cursor-pointer')}
           >
             <option value="sqlite_fts">sqlite_fts</option>
             {form.provider_id !== 'sqlite_fts' && (
               <option value={form.provider_id}>{form.provider_id}</option>
             )}
           </select>
-        </div>
-      </section>
+        </MemoryField>
+      </MemorySection>
 
-      {/* ============ Retrieval ============ */}
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {t('settings.sections.retrieval')}
-        </h3>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <NumberField
-            id={`${formId}-default-limit`}
+      {/* ============ Retrieval tuning ============ */}
+      <MemorySection
+        icon={SlidersHorizontal}
+        title={t('settings.sections.retrieval')}
+        subtitle={t('settings.help.minRelevance')}
+        accent="primary"
+        delay={0.1}
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <MemoryField
             label={t('settings.fields.defaultLimit')}
+            htmlFor={`${formId}-default-limit`}
             help={t('settings.help.defaultLimit')}
-            value={form.default_limit}
-            min={MemorySettingsBounds.default_limit.min}
-            max={MemorySettingsBounds.default_limit.max}
-            step={1}
-            onChange={(v) => updateField('default_limit', v)}
-            disabled={isPending}
             error={errors.default_limit}
-          />
-          <NumberField
-            id={`${formId}-min-relevance`}
+          >
+            <input
+              id={`${formId}-default-limit`}
+              type="number"
+              value={form.default_limit}
+              min={MemorySettingsBounds.default_limit.min}
+              max={MemorySettingsBounds.default_limit.max}
+              step={1}
+              onChange={(e) =>
+                updateField('default_limit', Number(e.target.value))
+              }
+              disabled={isPending}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
+          <MemoryField
             label={t('settings.fields.minRelevance')}
+            htmlFor={`${formId}-min-relevance`}
             help={t('settings.help.minRelevance')}
-            value={form.min_relevance_score}
-            min={MemorySettingsBounds.min_relevance_score.min}
-            max={MemorySettingsBounds.min_relevance_score.max}
-            step={0.05}
-            onChange={(v) => updateField('min_relevance_score', v)}
-            disabled={isPending}
             error={errors.min_relevance_score}
-          />
-          <NumberField
-            id={`${formId}-boost-pinned`}
+          >
+            <input
+              id={`${formId}-min-relevance`}
+              type="number"
+              value={form.min_relevance_score}
+              min={MemorySettingsBounds.min_relevance_score.min}
+              max={MemorySettingsBounds.min_relevance_score.max}
+              step={0.05}
+              onChange={(e) =>
+                updateField('min_relevance_score', Number(e.target.value))
+              }
+              disabled={isPending}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
+          <MemoryField
             label={t('settings.fields.boostPinned')}
+            htmlFor={`${formId}-boost-pinned`}
             help={t('settings.help.boostPinned')}
-            value={form.boost_pinned}
-            min={MemorySettingsBounds.boost_pinned.min}
-            max={MemorySettingsBounds.boost_pinned.max}
-            step={0.1}
-            onChange={(v) => updateField('boost_pinned', v)}
-            disabled={isPending}
             error={errors.boost_pinned}
-          />
+          >
+            <input
+              id={`${formId}-boost-pinned`}
+              type="number"
+              value={form.boost_pinned}
+              min={MemorySettingsBounds.boost_pinned.min}
+              max={MemorySettingsBounds.boost_pinned.max}
+              step={0.1}
+              onChange={(e) =>
+                updateField('boost_pinned', Number(e.target.value))
+              }
+              disabled={isPending}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
         </div>
-      </section>
+      </MemorySection>
 
       {/* ============ Token budget ============ */}
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {t('settings.sections.tokenBudget')}
-        </h3>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <NumberField
-            id={`${formId}-max-tokens`}
+      <MemorySection
+        icon={Wallet}
+        title={t('settings.sections.tokenBudget')}
+        subtitle={t('settings.help.maxTokens')}
+        accent="cyan"
+        delay={0.15}
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <MemoryField
             label={t('settings.fields.maxTokens')}
+            htmlFor={`${formId}-max-tokens`}
             help={t('settings.help.maxTokens')}
-            value={form.token_budget.max_tokens}
-            min={MemorySettingsBounds.token_budget_max_tokens.min}
-            max={MemorySettingsBounds.token_budget_max_tokens.max}
-            step={64}
-            onChange={(v) => updateBudgetField('max_tokens', v)}
-            disabled={isPending}
             error={errors['token_budget.max_tokens']}
-          />
-          <NumberField
-            id={`${formId}-reserved`}
+          >
+            <input
+              id={`${formId}-max-tokens`}
+              type="number"
+              value={form.token_budget.max_tokens}
+              min={MemorySettingsBounds.token_budget_max_tokens.min}
+              max={MemorySettingsBounds.token_budget_max_tokens.max}
+              step={64}
+              onChange={(e) =>
+                updateBudgetField('max_tokens', Number(e.target.value))
+              }
+              disabled={isPending}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
+          <MemoryField
             label={t('settings.fields.reservedForUserScope')}
+            htmlFor={`${formId}-reserved`}
             help={t('settings.help.reservedForUserScope')}
-            value={form.token_budget.reserved_for_user_scope}
-            min={0}
-            max={form.token_budget.max_tokens}
-            step={64}
-            onChange={(v) =>
-              updateBudgetField('reserved_for_user_scope', v)
-            }
-            disabled={isPending}
             error={errors['token_budget.reserved_for_user_scope']}
-          />
-          <NumberField
-            id={`${formId}-warn-threshold`}
+          >
+            <input
+              id={`${formId}-reserved`}
+              type="number"
+              value={form.token_budget.reserved_for_user_scope}
+              min={0}
+              max={form.token_budget.max_tokens}
+              step={64}
+              onChange={(e) =>
+                updateBudgetField(
+                  'reserved_for_user_scope',
+                  Number(e.target.value),
+                )
+              }
+              disabled={isPending}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
+          <MemoryField
             label={t('settings.fields.warnThreshold')}
+            htmlFor={`${formId}-warn-threshold`}
             help={t('settings.help.warnThreshold')}
-            value={form.token_budget.warn_threshold}
-            min={MemorySettingsBounds.token_budget_warn_threshold.min}
-            max={MemorySettingsBounds.token_budget_warn_threshold.max}
-            step={0.05}
-            onChange={(v) => updateBudgetField('warn_threshold', v)}
-            disabled={isPending}
             error={errors['token_budget.warn_threshold']}
-          />
+          >
+            <input
+              id={`${formId}-warn-threshold`}
+              type="number"
+              value={form.token_budget.warn_threshold}
+              min={MemorySettingsBounds.token_budget_warn_threshold.min}
+              max={MemorySettingsBounds.token_budget_warn_threshold.max}
+              step={0.05}
+              onChange={(e) =>
+                updateBudgetField('warn_threshold', Number(e.target.value))
+              }
+              disabled={isPending}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
         </div>
-      </section>
+      </MemorySection>
 
       {/* ============ Auto extraction ============ */}
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {t('settings.sections.autoExtraction')}
-        </h3>
+      <MemorySection
+        icon={Sparkles}
+        title={t('settings.sections.autoExtraction')}
+        subtitle={t('settings.fields.autoExtractionEnabled')}
+        accent="amber"
+        delay={0.2}
+      >
         <div className="space-y-3">
-          <label className="inline-flex items-center gap-1.5 text-xs text-foreground">
+          <label
+            className={cn(
+              'inline-flex items-center gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-xs cursor-pointer',
+              'hover:bg-muted/40 transition-colors',
+              isPending && 'cursor-not-allowed opacity-60',
+            )}
+          >
             <input
               type="checkbox"
               checked={form.auto_extraction_enabled}
@@ -362,36 +449,49 @@ export function SettingsForm({ className }: { className?: string }) {
                 updateField('auto_extraction_enabled', e.target.checked)
               }
               disabled={isPending}
-              className="h-3.5 w-3.5 rounded border-border text-primary focus:ring-2 focus:ring-primary focus:ring-offset-0"
+              className="h-3.5 w-3.5 rounded border-border text-primary focus:ring-2 focus:ring-primary focus:ring-offset-0 cursor-pointer"
             />
-            {t('settings.fields.autoExtractionEnabled')}
+            <span className="font-medium text-foreground">
+              {t('settings.fields.autoExtractionEnabled')}
+            </span>
           </label>
-          <NumberField
-            id={`${formId}-min-turns`}
+          <MemoryField
             label={t('settings.fields.autoExtractionMinTurns')}
+            htmlFor={`${formId}-min-turns`}
             help={t('settings.help.autoExtractionMinTurns')}
-            value={form.auto_extraction_min_turns}
-            min={MemorySettingsBounds.auto_extraction_min_turns.min}
-            max={MemorySettingsBounds.auto_extraction_min_turns.max}
-            step={1}
-            onChange={(v) => updateField('auto_extraction_min_turns', v)}
-            disabled={isPending || !form.auto_extraction_enabled}
             error={errors.auto_extraction_min_turns}
-            width="sm"
-          />
+            disabled={!form.auto_extraction_enabled}
+          >
+            <input
+              id={`${formId}-min-turns`}
+              type="number"
+              value={form.auto_extraction_min_turns}
+              min={MemorySettingsBounds.auto_extraction_min_turns.min}
+              max={MemorySettingsBounds.auto_extraction_min_turns.max}
+              step={1}
+              onChange={(e) =>
+                updateField(
+                  'auto_extraction_min_turns',
+                  Number(e.target.value),
+                )
+              }
+              disabled={isPending || !form.auto_extraction_enabled}
+              className={MEMORY_FIELD_INPUT_CLASS}
+            />
+          </MemoryField>
         </div>
-      </section>
+      </MemorySection>
 
       {/* ============ Footer ============ */}
-      <div className="flex items-center justify-end gap-2 border-t border-border pt-3">
+      <div className="flex items-center justify-end gap-3 pt-2">
         {justSaved && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+          <span className="inline-flex items-center gap-1 text-[11px] font-mono text-emerald-600 dark:text-emerald-400">
             <Check size={11} aria-hidden="true" />
             {t('settings.savedToast')}
           </span>
         )}
         {!isDirty && !justSaved && (
-          <span className="text-[11px] text-muted-foreground">
+          <span className="text-[11px] font-mono text-muted-foreground">
             {t('settings.noChanges')}
           </span>
         )}
@@ -399,9 +499,10 @@ export function SettingsForm({ className }: { className?: string }) {
           type="submit"
           disabled={!canSave}
           className={cn(
-            'inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground',
+            'inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3.5 text-xs font-medium text-primary-foreground',
             'hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
             'disabled:cursor-not-allowed disabled:opacity-60',
+            canSave && 'hover:scale-105 transition-transform',
           )}
         >
           <Save size={12} aria-hidden="true" />
@@ -409,83 +510,5 @@ export function SettingsForm({ className }: { className?: string }) {
         </button>
       </div>
     </form>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Number field
-// ---------------------------------------------------------------------------
-
-interface NumberFieldProps {
-  id: string;
-  label: string;
-  help?: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (value: number) => void;
-  disabled?: boolean;
-  error?: string;
-  width?: 'full' | 'sm';
-}
-
-function NumberField({
-  id,
-  label,
-  help,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-  disabled = false,
-  error,
-  width = 'full',
-}: NumberFieldProps) {
-  const { t } = useTranslation('memory');
-  return (
-    <div className={width === 'sm' ? 'max-w-[10rem]' : undefined}>
-      <label
-        htmlFor={id}
-        className="mb-1 block text-[11px] font-medium text-foreground"
-      >
-        {label}
-      </label>
-      <input
-        id={id}
-        type="number"
-        value={Number.isFinite(value) ? value : 0}
-        min={min}
-        max={max}
-        step={step}
-        onChange={(e) => {
-          const parsed = Number(e.target.value);
-          onChange(Number.isFinite(parsed) ? parsed : min);
-        }}
-        disabled={disabled}
-        aria-invalid={error !== undefined}
-        aria-describedby={help ? `${id}-help` : undefined}
-        className={cn(
-          'h-8 w-full rounded-md border bg-background px-2 text-xs text-foreground tabular-nums',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
-          'disabled:cursor-not-allowed disabled:opacity-60',
-          error ? 'border-destructive' : 'border-border',
-        )}
-      />
-      {help && (
-        <p
-          id={`${id}-help`}
-          className="mt-0.5 text-[10px] text-muted-foreground"
-        >
-          {help}
-        </p>
-      )}
-      {error && (
-        <p className="mt-0.5 text-[10px] text-destructive" role="alert">
-          {t(error, { min, max })}
-        </p>
-      )}
-    </div>
   );
 }

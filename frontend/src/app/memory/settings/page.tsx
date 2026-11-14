@@ -3,23 +3,16 @@
 /**
  * The memory settings page (`/memory/settings`).
  *
- * This page MUST be reachable even when `mode === 'disabled'`.
- * It is the only path back to a working memory subsystem after
- * an accidental disable (spec §1.3 and §6.1 rule 1). The page
- * therefore renders unconditionally -- no mode-gate, no
- * redirect, no disabled state on the form itself.
+ * Reachable even when `mode === 'disabled'` -- this page is the
+ * only path back to a working memory subsystem (spec §1.3 / §6.1).
  *
- * Two sections:
+ * Layout:
  *
- *   1. `SettingsForm` -- the global settings editor.
- *
- *   2. `Projects with overrides` -- a read-only list of which
- *      projects have customized settings, with links to each
- *      project's detail page (where `ProjectOverrideForm`
- *      lives). Adding or editing an override is done from the
- *      project detail page, not from here -- keeping the
- *      override workflow colocated with the project it
- *      affects avoids a project picker on this page.
+ *   * Page title (matches the dashboard's heading style).
+ *   * `<SettingsForm>` -- renders the five settings sections.
+ *   * `Projects with overrides` section -- the projects that
+ *     have customized configuration, each row linking to the
+ *     project detail page where the override is edited.
  */
 
 'use client';
@@ -30,6 +23,7 @@ import { ArrowRight, FolderCog } from 'lucide-react';
 
 import { useMemorySettings } from '../../../features/memory/api/queries';
 import { SettingsForm } from '../../../features/memory/components/SettingsForm';
+import { MemorySection } from '../../../features/memory/components/MemorySection';
 import { cn } from '../../../features/memory/lib/cn';
 
 // ---------------------------------------------------------------------------
@@ -44,10 +38,10 @@ export default function MemorySettingsPage() {
   const overrideEntries = Object.entries(overrides);
 
   return (
-    <div className="mx-auto max-w-4xl space-y-6">
+    <div className="space-y-6">
       {/* ============ Title ============ */}
       <div>
-        <h2 className="text-base font-semibold text-foreground">
+        <h2 className="text-lg font-semibold font-heading text-foreground">
           {t('settings.title')}
         </h2>
         <p className="text-[11px] text-muted-foreground">
@@ -56,29 +50,26 @@ export default function MemorySettingsPage() {
       </div>
 
       {/* ============ Settings form ============ */}
-      <section className="rounded-lg border border-border bg-card p-4">
-        <SettingsForm />
-      </section>
+      <SettingsForm />
 
       {/* ============ Projects with overrides ============ */}
-      <section className="rounded-lg border border-border bg-card p-4">
-        <div className="mb-2 flex items-center gap-1.5">
-          <FolderCog
-            size={12}
-            aria-hidden="true"
-            className="text-muted-foreground"
-          />
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('settings.sections.projectOverrides')}
-          </h3>
-        </div>
-
+      <MemorySection
+        icon={FolderCog}
+        title={t('settings.sections.projectOverrides')}
+        subtitle={
+          overrideEntries.length > 0
+            ? `${overrideEntries.length} custom`
+            : t('settings.projectOverridesEmpty')
+        }
+        accent="purple"
+        delay={0.25}
+      >
         {settingsQuery.isLoading ? (
-          <div className="space-y-1.5" aria-busy="true">
+          <div className="space-y-2" aria-busy="true">
             {[0, 1].map((i) => (
               <div
                 key={i}
-                className="h-8 animate-pulse rounded-md bg-muted"
+                className="h-10 animate-pulse rounded-sm bg-muted/40"
               />
             ))}
           </div>
@@ -87,7 +78,7 @@ export default function MemorySettingsPage() {
             {t('settings.projectOverridesEmpty')}
           </p>
         ) : (
-          <ul className="space-y-1.5">
+          <ul className="space-y-2">
             {overrideEntries.map(([projectId, override]) => {
               const fieldCount = countOverrideFields(override);
               return (
@@ -95,13 +86,13 @@ export default function MemorySettingsPage() {
                   <Link
                     href={`/memory/projects/${encodeURIComponent(projectId)}`}
                     className={cn(
-                      'group flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2.5 py-1.5 text-[11px]',
-                      'hover:border-primary/40 hover:bg-muted/40',
+                      'group flex items-center justify-between gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-[11px]',
+                      'hover:border-primary/40 hover:bg-muted/40 transition-colors',
                       'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
                     )}
                   >
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate font-mono text-foreground">
+                      <span className="block truncate font-mono text-foreground font-semibold">
                         {projectId}
                       </span>
                       <span className="text-[10px] text-muted-foreground">
@@ -120,7 +111,7 @@ export default function MemorySettingsPage() {
             })}
           </ul>
         )}
-      </section>
+      </MemorySection>
     </div>
   );
 }
@@ -129,21 +120,7 @@ export default function MemorySettingsPage() {
 // Helper
 // ---------------------------------------------------------------------------
 
-/**
- * Count how many fields a project override actually customizes.
- *
- * The backend may return a full settings shape (with defaults
- * filled in) as the override -- we cannot trust `Object.keys`
- * alone to tell us "how customized is this project". The safest
- * heuristic is a shallow count of top-level fields; a nested
- * `token_budget` override counts as one field even if only
- * `max_tokens` differs inside it. That is accurate enough for
- * the summary label and avoids a per-project query just to
- * diff against global defaults.
- */
-function countOverrideFields(
-  override: Record<string, unknown> | object,
-): number {
+function countOverrideFields(override: Record<string, unknown> | object): number {
   let count = 0;
   for (const value of Object.values(override)) {
     if (value === undefined) continue;

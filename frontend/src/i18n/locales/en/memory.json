@@ -356,6 +356,39 @@
     },
     "downloadSuccess": "Downloaded {{filename}} ({{count}} entries, {{size}})",
     "truncated": "Export was capped at {{limit}} entries ({{total}} matched). Narrow the scope or status filter to fetch the rest.",
+    "scope": {
+      "tooltip": {
+        "title": "What is a Scope?",
+        "intro": "The scope decides where a memory lives and who can see it.",
+        "user_label": "User",
+        "user_desc": "Personal facts (always uses \"default\"). Visible in every project.",
+        "project_label": "Project",
+        "project_desc": "Knowledge for one project (e.g. \"acme\").",
+        "chat_label": "Chat",
+        "chat_desc": "Facts tied to one conversation (e.g. \"chat_9b66e9b2faa5\").",
+        "agent_label": "Agent",
+        "agent_desc": "Facts tied to one agent (e.g. \"peldrun\")."
+      },
+      "placeholder": {
+        "user": "default",
+        "project": "acme",
+        "chat": "chat_9b66e9b2faa5",
+        "agent": "peldrun",
+        "default": "identifier"
+      },
+      "help": {
+        "user": "Personal scope always uses \"default\" (single-user backend). The field is locked automatically — no input needed.",
+        "project_no_list": "The project id to export. Projects with memories appear as autocomplete suggestions as you type.",
+        "project_with_list": "The project id to export. Available: {{ids}}{{more}}.",
+        "project_more": " (+{{count}} more)",
+        "chat": "The chat id (e.g. \"chat_9b66e9b2faa5\"). Find it in the chat URL or session.json.",
+        "agent": "The agent id (e.g. \"peldrun\", \"researcher\"). Find it in the agents list.",
+        "default": "The identifier of the scope to export."
+      }
+    },
+    "help": {
+      "limit": "Maximum entries per export (up to {{max}})."
+    },
     "inspectPanel": {
       "title": "Package preview",
       "manifest": "Manifest",

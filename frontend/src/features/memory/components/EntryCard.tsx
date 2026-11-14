@@ -203,7 +203,7 @@ export function EntryCard({
   return (
     <article
       className={cn(
-        'group relative flex flex-col gap-2 rounded-lg border border-border bg-card p-3 text-foreground shadow-peldrun-sm transition-colors hover:border-border/80',
+        'group relative flex flex-col gap-2 rounded-lg border border-border bg-card p-3 text-foreground shadow-peldrun-sm transition-all hover:border-primary/30 hover:shadow-lg',
         className,
       )}
       aria-label={entry.content.slice(0, 80)}

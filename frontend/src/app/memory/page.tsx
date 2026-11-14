@@ -3,21 +3,30 @@
 /**
  * The memory dashboard home (`/memory`).
  *
- * Sections:
+ * Design language aligned with the app's SearchTab:
  *
- *   1. Disabled-memory banner (when `mode === 'disabled'`).
- *   2. Four KPI cards (runs, tokens, budget, drop rate) over
- *      the last 30 days.
- *   3. A compact tokens-over-time chart (last 7 days, daily
- *      buckets).
- *   4. Quick actions (new memory, import, export, usage).
- *   5. Recently updated projects (top 5 by last_updated).
+ *   * Ambient background + sticky header come from the parent
+ *     `MemoryLayout` -- this page only renders its content
+ *     column (`space-y-6`).
+ *   * Sections use `MemorySection` (bg-gigbg surface + accent
+ *     line + FADE_UP entry).
+ *   * KPI cards use `MemorySummaryCard` (gradient line + corner
+ *     glow + hover lift).
+ *   * Alerts use `MemoryBanner` (tone-coded colors + icon).
  *
- * Every section renders independently -- if the usage query
- * fails, the KPIs show a skeleton while the quick actions and
- * projects section still work. That is deliberate: the
- * dashboard is a navigation hub, and one failing widget
- * should never hide the way to the pages that DO work.
+ * Content order:
+ *
+ *   1. Page title + period label.
+ *   2. Disabled banner (when `mode === 'disabled'`).
+ *   3. Four KPI cards (runs, tokens, budget, drop rate) -- no
+ *      section wrapper, matching SearchTab's top-level cards.
+ *   4. Warning banner for high budget / drop rate.
+ *   5. Tokens-over-time chart (weekly granularity).
+ *   6. Quick actions (four links).
+ *   7. Recent projects (top 5 by last_updated).
+ *
+ * Every section renders independently -- if the summary query
+ * fails, the quick actions and project list still work.
  */
 
 'use client';
@@ -25,12 +34,17 @@
 import Link from 'next/link';
 import { useTranslation } from 'react-i18next';
 import {
+  Activity,
   BarChart3,
   Brain,
+  Coins,
   Download,
   FolderOpen,
+  Gauge,
   Plus,
+  TrendingDown,
   Upload,
+  type LucideIcon,
 } from 'lucide-react';
 
 import {
@@ -39,14 +53,21 @@ import {
   useUsageSummary,
   useUsageTimeseries,
 } from '../../features/memory/api/queries';
-import { UsageKpiCards } from '../../features/memory/components/UsageKpiCards';
 import { UsageTimeseriesChart } from '../../features/memory/components/UsageTimeseriesChart';
 import { ProjectCard } from '../../features/memory/components/ProjectCard';
 import { EmptyState } from '../../features/memory/components/EmptyState';
+import { MemorySection } from '../../features/memory/components/MemorySection';
+import { MemorySummaryCard } from '../../features/memory/components/MemorySummaryCard';
+import { MemoryBanner } from '../../features/memory/components/MemoryBanner';
 import { cn } from '../../features/memory/lib/cn';
+import {
+  formatTokens,
+  formatPercent,
+  formatCount,
+} from '../../features/memory/lib/format';
 
 // ---------------------------------------------------------------------------
-// Component
+// Page
 // ---------------------------------------------------------------------------
 
 export default function MemoryDashboardPage() {
@@ -66,18 +87,39 @@ export default function MemoryDashboardPage() {
 
   const mode = settingsQuery.data?.mode;
   const isDisabled = mode === 'disabled';
+  const warnThreshold = settingsQuery.data?.token_budget.warn_threshold;
 
-  // Top five most recently-updated projects.
+  const summary = summaryQuery.data;
+  const isEmpty = summary !== undefined && summary.run_count === 0;
+
   const recentProjects = [...(projectsQuery.data?.projects ?? [])]
     .sort((a, b) => b.last_updated - a.last_updated)
     .slice(0, 5);
 
+  // Budget accent: green under 50%, amber 50-79%, red 80%+
+  const budgetAccent = !summary
+    ? '#3b82f6'
+    : summary.budget_utilization >= 0.8
+      ? '#f43f5e'
+      : summary.budget_utilization >= 0.5
+        ? '#f59e0b'
+        : '#10b981';
+
+  // Drop-rate accent: green under 10%, amber 10-29%, red 30%+
+  const dropAccent = !summary
+    ? '#3b82f6'
+    : summary.drop_rate >= 0.3
+      ? '#f43f5e'
+      : summary.drop_rate >= 0.1
+        ? '#f59e0b'
+        : '#10b981';
+
   return (
-    <div className="mx-auto max-w-6xl space-y-5">
+    <div className="space-y-6">
       {/* ============ Title ============ */}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div>
-          <h2 className="text-base font-semibold text-foreground">
+          <h2 className="text-lg font-semibold font-heading text-foreground">
             {t('dashboard.title')}
           </h2>
           <p className="text-[11px] text-muted-foreground">
@@ -85,7 +127,7 @@ export default function MemoryDashboardPage() {
           </p>
         </div>
         {mode && (
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">
             {t('usage.period.label')}: {t('usage.period.month')}
           </span>
         )}
@@ -93,115 +135,179 @@ export default function MemoryDashboardPage() {
 
       {/* ============ Disabled banner ============ */}
       {isDisabled && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-300/60 bg-amber-50/60 p-3 text-xs dark:border-amber-700/60 dark:bg-amber-900/10">
-          <div className="flex items-start gap-2">
-            <Brain
-              size={14}
-              aria-hidden="true"
-              className="mt-0.5 shrink-0 text-amber-700 dark:text-amber-400"
-            />
-            <div>
-              <p className="font-medium text-amber-800 dark:text-amber-300">
-                {t('mode.disabled.name')}
-              </p>
-              <p className="text-[11px] text-amber-700/80 dark:text-amber-400/80">
-                {t('mode.disabled.description')}
-              </p>
-            </div>
-          </div>
-          <Link
-            href="/memory/settings"
-            className="inline-flex h-7 items-center gap-1.5 rounded-md bg-amber-600 px-2.5 text-[11px] font-medium text-white hover:bg-amber-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2"
-          >
-            {t('mode.enable')}
-          </Link>
-        </div>
+        <MemoryBanner
+          tone="warning"
+          title={t('mode.disabled.name')}
+          message={t('mode.disabled.description')}
+          action={
+            <Link
+              href="/memory/settings"
+              className="inline-flex h-7 items-center gap-1.5 rounded-md bg-amber-600 px-2.5 text-[11px] font-medium text-white hover:bg-amber-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2"
+            >
+              {t('mode.enable')}
+            </Link>
+          }
+        />
       )}
 
       {/* ============ KPI cards ============ */}
       {summaryQuery.isLoading ? (
-        <KpiSkeleton />
-      ) : summaryQuery.error ? (
-        <p
-          className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive"
-          role="alert"
+        <div
+          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"
+          aria-busy="true"
         >
-          {summaryQuery.error.message}
-        </p>
-      ) : summaryQuery.data ? (
-        <UsageKpiCards
-          summary={summaryQuery.data}
-          warnThreshold={settingsQuery.data?.token_budget.warn_threshold}
+          {[0, 1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-32 animate-pulse rounded-md border border-border bg-muted/40"
+            />
+          ))}
+        </div>
+      ) : summaryQuery.error ? (
+        <MemoryBanner
+          tone="error"
+          message={summaryQuery.error.message}
         />
+      ) : isEmpty ? (
+        <EmptyState
+          icon={Brain}
+          title={t('usage.empty')}
+          description={t('dashboard.quickActionsHint.newMemory')}
+          size="spacious"
+        />
+      ) : summary ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <MemorySummaryCard
+            label={t('usage.kpis.runs')}
+            value={formatCount(summary.run_count)}
+            icon={<Activity size={18} />}
+            accent="#3b82f6"
+            subtitle={t('usage.period.month')}
+            delay={0}
+          />
+          <MemorySummaryCard
+            label={t('usage.kpis.totalTokens')}
+            value={formatTokens(summary.total_tokens, t)}
+            icon={<Coins size={18} />}
+            accent="#8b5cf6"
+            subtitle={`${formatPercent(summary.budget_utilization)} ${t('usage.kpis.budgetUtil').toLowerCase()}`}
+            delay={0.05}
+          />
+          <MemorySummaryCard
+            label={t('usage.kpis.budgetUtil')}
+            value={formatPercent(summary.budget_utilization)}
+            icon={<Gauge size={18} />}
+            accent={budgetAccent}
+            subtitle={`${formatCount(summary.entries_used)} / ${formatCount(summary.entries_retrieved)}`}
+            delay={0.1}
+          />
+          <MemorySummaryCard
+            label={t('usage.kpis.dropRate')}
+            value={formatPercent(summary.drop_rate)}
+            icon={<TrendingDown size={18} />}
+            accent={dropAccent}
+            subtitle={`${formatCount(summary.entries_dropped)} ${t('usage.kpis.entriesDropped').toLowerCase()}`}
+            delay={0.15}
+          />
+        </div>
       ) : null}
 
-      {/* ============ Mini chart ============ */}
+      {/* ============ Warning banners ============ */}
+      {summary &&
+        warnThreshold !== undefined &&
+        summary.budget_utilization >= warnThreshold && (
+          <MemoryBanner
+            tone="warning"
+            message={t('usage.budgetWarning', {
+              pct: formatPercent(summary.budget_utilization),
+            })}
+          />
+        )}
+
+      {/* ============ Tokens over time ============ */}
       {timeseriesQuery.data && timeseriesQuery.data.points.length > 0 && (
-        <section className="rounded-lg border border-border bg-card p-3">
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('usage.timeseries.title')}
-          </h3>
-          <UsageTimeseriesChart data={timeseriesQuery.data} height={180} />
-        </section>
+        <MemorySection
+          icon={BarChart3}
+          title={t('usage.timeseries.title')}
+          subtitle={t('usage.period.week')}
+          accent="primary"
+          delay={0.2}
+        >
+          <UsageTimeseriesChart
+            data={timeseriesQuery.data}
+            height={180}
+          />
+        </MemorySection>
       )}
 
       {/* ============ Quick actions ============ */}
-      <section>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {t('dashboard.quickActions')}
-        </h3>
-        <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
-          <QuickAction
+      <MemorySection
+        icon={Plus}
+        title={t('dashboard.quickActions')}
+        subtitle={t('dashboard.subtitle')}
+        accent="emerald"
+        delay={0.25}
+      >
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <QuickActionTile
             href="/memory/browse"
             icon={Plus}
             label={t('entry.drafts.createTitle')}
             hint={t('dashboard.quickActionsHint.newMemory')}
-            tone="primary"
+            accent="primary"
           />
-          <QuickAction
+          <QuickActionTile
             href="/memory/import"
             icon={Upload}
             label={t('nav.import')}
             hint={t('dashboard.quickActionsHint.import')}
+            accent="emerald"
           />
-          <QuickAction
+          <QuickActionTile
             href="/memory/export"
             icon={Download}
             label={t('nav.export')}
             hint={t('dashboard.quickActionsHint.export')}
+            accent="cyan"
           />
-          <QuickAction
+          <QuickActionTile
             href="/memory/usage"
             icon={BarChart3}
             label={t('nav.usage')}
             hint={t('dashboard.quickActionsHint.usage')}
+            accent="purple"
           />
         </div>
-      </section>
+      </MemorySection>
 
       {/* ============ Recent projects ============ */}
-      <section>
-        <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('dashboard.recentActivity')}
-          </h3>
-          {recentProjects.length > 0 && (
+      <MemorySection
+        icon={FolderOpen}
+        title={t('dashboard.recentActivity')}
+        subtitle={
+          projectsQuery.data
+            ? `${formatCount(projectsQuery.data.projects.length)} ${t('nav.projects').toLowerCase()}`
+            : undefined
+        }
+        accent="cyan"
+        delay={0.3}
+        action={
+          recentProjects.length > 0 ? (
             <Link
               href="/memory/projects"
-              className="inline-flex items-center gap-1 text-[11px] text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              className="inline-flex items-center gap-1 rounded px-1 text-[11px] text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             >
-              <FolderOpen size={10} aria-hidden="true" />
               {t('nav.projects')}
             </Link>
-          )}
-        </div>
-
+          ) : undefined
+        }
+      >
         {projectsQuery.isLoading ? (
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {[0, 1, 2].map((i) => (
               <div
                 key={i}
-                className="h-24 animate-pulse rounded-lg border border-border bg-muted/40"
+                className="h-24 animate-pulse rounded-md bg-muted/40"
               />
             ))}
           </div>
@@ -212,83 +318,90 @@ export default function MemoryDashboardPage() {
             description={t('projects.empty.description')}
           />
         ) : (
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {recentProjects.map((project) => (
               <Link
                 key={project.project_id}
                 href={`/memory/projects/${encodeURIComponent(project.project_id)}`}
-                className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background rounded-lg"
+                className="rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
               >
                 <ProjectCard project={project} />
               </Link>
             ))}
           </div>
         )}
-      </section>
+      </MemorySection>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Sub-components
+// Local sub-component: quick action tile
 // ---------------------------------------------------------------------------
 
-interface QuickActionProps {
+const QUICK_ACCENT: Record<
+  'primary' | 'emerald' | 'cyan' | 'purple',
+  { icon: string; border: string }
+> = {
+  primary: {
+    icon: 'text-primary bg-primary/10',
+    border: 'hover:border-primary/40',
+  },
+  emerald: {
+    icon: 'text-emerald-500 bg-emerald-500/10',
+    border: 'hover:border-emerald-500/40',
+  },
+  cyan: {
+    icon: 'text-cyan-500 bg-cyan-500/10',
+    border: 'hover:border-cyan-500/40',
+  },
+  purple: {
+    icon: 'text-purple-500 bg-purple-500/10',
+    border: 'hover:border-purple-500/40',
+  },
+};
+
+interface QuickActionTileProps {
   href: string;
-  icon: React.ComponentType<{ size?: number; strokeWidth?: number }>;
+  icon: LucideIcon;
   label: string;
   hint: string;
-  tone?: 'primary' | 'default';
+  accent: 'primary' | 'emerald' | 'cyan' | 'purple';
 }
 
-function QuickAction({
+function QuickActionTile({
   href,
   icon: Icon,
   label,
   hint,
-  tone = 'default',
-}: QuickActionProps) {
+  accent,
+}: QuickActionTileProps) {
+  const styles = QUICK_ACCENT[accent];
   return (
     <Link
       href={href}
       className={cn(
-        'flex flex-col gap-1 rounded-lg border p-2.5 text-start transition-colors',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background',
-        tone === 'primary'
-          ? 'border-primary/40 bg-primary/5 hover:bg-primary/10'
-          : 'border-border bg-card hover:bg-muted/40',
+        'group flex flex-col gap-2.5 rounded-md border border-border bg-card p-4 text-start transition-all',
+        'hover:bg-muted/30 hover:shadow-sm',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-gigbg',
+        styles.border,
       )}
     >
       <div
         className={cn(
-          'flex h-6 w-6 items-center justify-center rounded-md',
-          tone === 'primary'
-            ? 'bg-primary/15 text-primary'
-            : 'bg-muted text-muted-foreground',
+          'flex h-8 w-8 items-center justify-center rounded-md transition-transform group-hover:scale-110',
+          styles.icon,
         )}
         aria-hidden="true"
       >
-        <Icon size={12} strokeWidth={2} />
+        <Icon size={14} strokeWidth={2.2} />
       </div>
-      <div>
-        <p className="text-[11px] font-medium text-foreground">{label}</p>
-        <p className="text-[10px] leading-snug text-muted-foreground">
+      <div className="min-w-0">
+        <p className="text-xs font-semibold text-foreground">{label}</p>
+        <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">
           {hint}
         </p>
       </div>
     </Link>
-  );
-}
-
-function KpiSkeleton() {
-  return (
-    <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-      {[0, 1, 2, 3].map((i) => (
-        <div
-          key={i}
-          className="h-16 animate-pulse rounded-lg border border-border bg-muted/40"
-        />
-      ))}
-    </div>
   );
 }

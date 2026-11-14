@@ -194,12 +194,25 @@ function Stat({ label, value, tone = 'default' }: StatProps) {
         : tone === 'amber'
           ? 'text-amber-600 dark:text-amber-400'
           : 'text-foreground';
+  const toneBorder =
+    tone === 'emerald'
+      ? 'border-emerald-500/30 bg-emerald-500/5'
+      : tone === 'slate'
+        ? 'border-slate-500/30 bg-slate-500/5'
+        : tone === 'amber'
+          ? 'border-amber-500/30 bg-amber-500/5'
+          : 'border-border/60 bg-card';
   return (
-    <div className="rounded-md border border-border bg-muted/30 px-2 py-1.5">
-      <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+    <div
+      className={cn(
+        'rounded-sm border px-3 py-2 transition-colors',
+        toneBorder,
+      )}
+    >
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
         {label}
       </p>
-      <p className={cn('text-sm font-semibold tabular-nums', valueClass)}>
+      <p className={cn('mt-0.5 text-base font-bold font-mono tabular-nums', valueClass)}>
         {value}
       </p>
     </div>

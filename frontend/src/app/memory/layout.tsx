@@ -107,33 +107,44 @@ export default function MemoryLayout({
 
   // ---- Post-mount: full layout ----------------------------------
   return (
-    <div className="flex min-h-full flex-col bg-background text-foreground">
-      {/* ============ Header ============ */}
-      <header className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-background/60 px-4 py-3 backdrop-blur">
-        <div className="flex items-center gap-2">
-          <div
-            className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10 text-primary"
-            aria-hidden="true"
-          >
-            <Brain size={16} strokeWidth={1.8} />
+    <div className="relative h-full w-full overflow-y-auto bg-background text-foreground font-sans flex flex-col">
+      {/* ============ Ambient background ============ */}
+      <div
+        className="pointer-events-none absolute inset-0 overflow-hidden"
+        aria-hidden="true"
+      >
+        <div className="absolute -top-40 -left-40 w-[500px] h-[500px] rounded-full bg-primary/5 blur-3xl" />
+        <div className="absolute top-1/3 -right-40 w-[400px] h-[400px] rounded-full bg-emerald-500/5 blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 w-[450px] h-[450px] rounded-full bg-amber-500/5 blur-3xl" />
+      </div>
+
+      {/* ============ Sticky header ============ */}
+      <header className="border-b border-border bg-card/60 backdrop-blur-xl px-6 py-4 sticky top-0 z-20">
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 icon">
+              <Brain size={16} className="text-primary" aria-hidden="true" />
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold font-heading tracking-wide">
+                {t('nav.title')}
+              </h1>
+              <p className="text-[10px] text-muted-foreground">
+                PELDRUN Memory Platform
+              </p>
+            </div>
           </div>
-          <div className="min-w-0">
-            <h1 className="text-sm font-semibold text-foreground">
-              {t('nav.title')}
-            </h1>
-            <p className="text-[10px] text-muted-foreground">
-              PELDRUN Memory Platform
-            </p>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <Link
+              href="/memory/settings"
+              className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+              aria-label={t('nav.settings')}
+            >
+              <ModeBadge size="sm" />
+            </Link>
           </div>
         </div>
-
-        <Link
-          href="/memory/settings"
-          className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-          aria-label={t('nav.settings')}
-        >
-          <ModeBadge size="sm" />
-        </Link>
       </header>
 
       {/* ============ Sub-navigation ============ */}
@@ -141,34 +152,38 @@ export default function MemoryLayout({
         className="border-b border-border bg-background/40"
         aria-label={t('a11y.mainNavigation')}
       >
-        <ul className="flex flex-wrap items-center gap-1 px-2 py-1">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const active = isActivePath(pathname, item.href, item.exact);
-            return (
-              <li key={item.href}>
-                <Link
-                  href={item.href}
-                  aria-current={active ? 'page' : undefined}
-                  className={cn(
-                    'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors',
-                    active
-                      ? 'bg-primary/10 text-primary'
-                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background',
-                  )}
-                >
-                  <Icon size={12} aria-hidden="true" />
-                  {t(item.labelKey)}
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
+        <div className="max-w-7xl mx-auto">
+          <ul className="flex flex-wrap items-center gap-1 px-6 py-1.5">
+            {NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const active = isActivePath(pathname, item.href, item.exact);
+              return (
+                <li key={item.href}>
+                  <Link
+                    href={item.href}
+                    aria-current={active ? 'page' : undefined}
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors',
+                      active
+                        ? 'bg-primary/10 text-primary'
+                        : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background',
+                    )}
+                  >
+                    <Icon size={12} aria-hidden="true" />
+                    {t(item.labelKey)}
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       </nav>
 
       {/* ============ Page content ============ */}
-      <main className="flex-1 p-4">{children}</main>
+      <main className="max-w-7xl w-full mx-auto p-6 flex-1 relative">
+        {children}
+      </main>
     </div>
   );
 }

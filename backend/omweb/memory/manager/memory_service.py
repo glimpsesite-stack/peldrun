@@ -289,7 +289,12 @@ class MemoryService:
                 settings=settings,
                 router_decision="no_need",
             )
-            self._record_usage(run_id=run_id, context=empty)
+            await self._record_usage(
+                run_id=run_id,
+                context=empty,
+                chat_id=chat_id,
+                project_id=project_id,
+            )
             return empty
 
         # ------------------------------------------------------------------
@@ -320,7 +325,12 @@ class MemoryService:
                 settings=settings,
                 router_decision="no_need",
             )
-            self._record_usage(run_id=run_id, context=empty)
+            await self._record_usage(
+                run_id=run_id,
+                context=empty,
+                chat_id=chat_id,
+                project_id=project_id,
+            )
             return empty
 
         # ------------------------------------------------------------------
@@ -363,7 +373,12 @@ class MemoryService:
                 router_decision=route.decision.value,
             )
 
-        self._record_usage(run_id=run_id, context=context)
+        await self._record_usage(
+            run_id=run_id,
+            context=context,
+            chat_id=chat_id,
+            project_id=project_id,
+        )
         return context
 
     # ------------------------------------------------------------------
@@ -424,33 +439,48 @@ class MemoryService:
         )
 
     # ------------------------------------------------------------------
-    # Internal: usage recording stub
+    # Internal: usage recording
     # ------------------------------------------------------------------
 
-    def _record_usage(
+    async def _record_usage(
         self,
         *,
         run_id: Optional[str],
         context: MemoryContext,
+        chat_id: Optional[str] = None,
+        project_id: Optional[str] = None,
         actual_tokens: Optional[int] = None,
     ) -> None:
-        """Record one retrieval's usage. STUB for P1.9.
+        """Record one retrieval's usage to the persistent ledger.
 
-        P1.9 replaces this method body with a call to
-        ``MemoryUsageTracker.record(run_id, context, actual_tokens)``
-        which writes to the ``memory_usage_ledger`` table.
+        Logs the usage at INFO level (operators rely on it for
+        real-time visibility) AND writes a row to
+        ``memory_usage_ledger`` via ``MemoryUsageTracker``. The
+        persistent write is best-effort: any failure (DB locked,
+        disk full, tracker import error) is logged at WARNING and
+        swallowed -- memory is an ENHANCEMENT, not a critical path,
+        and a monitoring write failure must never abort the run.
 
-        Until then, this logs the usage at INFO so operators can see
-        per-run memory token spend in the server log without needing
-        a persistent ledger. The signature will NOT change -- P1.9
-        keeps the same parameters, so no call site updates are
-        required when the tracker lands.
+        Parameters
+        ----------
+        run_id
+            The run this retrieval belongs to. May be ``None`` in
+            early-bootstrap / test scenarios; when ``None`` the
+            persistent write is SKIPPED (the ledger's
+            ``UNIQUE(run_id)`` constraint requires a non-empty id).
+        context
+            The ``MemoryContext`` produced by the pipeline.
+        chat_id, project_id
+            Copied from ``retrieve``'s arguments so the ledger can
+            filter by chat or project without a join.
+        actual_tokens
+            Reserved for the future token-accounting bridge
+            (``MemoryAccountingBridge``). Currently unused -- the
+            tracker computes ``context_tokens`` from the context.
         """
+        # Always emit the log line first -- operators rely on it
+        # even when the persistent write below is skipped or fails.
         try:
-            # ``mode`` access can raise if the service was closed
-            # between the ``retrieve`` call and this method. Read
-            # it defensively so a shutdown race during a slow
-            # retrieval does not throw from the log path.
             mode_value = self._lifecycle.settings.mode.value
         except RuntimeError:
             mode_value = "<closed>"
@@ -465,12 +495,34 @@ class MemoryService:
             mode_value,
             context.router_decision,
         )
-        # TODO(P1.9): replace this log with
-        #   await MemoryUsageTracker.record(...)
-        # The tracker is async; if we make _record_usage async in
-        # P1.9, the two call sites above will need ``await``. That
-        # is a mechanical change; the signature and semantics stay
-        # the same.
+
+        # Persistent write. Requires a non-empty run_id (the
+        # ledger's UNIQUE constraint is on run_id, and an empty
+        # string would collide across runs).
+        if not run_id or not run_id.strip():
+            return
+
+        try:
+            from omweb.memory.monitoring.memory_usage import (
+                get_memory_usage_tracker,
+            )
+
+            tracker = get_memory_usage_tracker()
+            await tracker.record(
+                run_id=run_id.strip(),
+                context=context,
+                chat_id=chat_id,
+                project_id=project_id,
+            )
+        except Exception as exc:
+            # Best-effort. Log at WARNING (not ERROR) so that
+            # missing/disabled tracking does not pollute the
+            # error stream of an otherwise healthy run.
+            logger.warning(
+                "Memory usage ledger write skipped for run %r: %s",
+                run_id,
+                exc,
+            )
 
 
 __all__ = ["MemoryService"]

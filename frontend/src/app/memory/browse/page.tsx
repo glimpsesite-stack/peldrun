@@ -3,53 +3,32 @@
 /**
  * The browse page (`/memory/browse`) -- the primary entry list.
  *
- * Three-column layout on desktop:
+ * Layout (desktop-only):
  *
- *   * Left: scope sidebar (user + projects that have memory).
- *   * Center: filter bar, list, and "Load more".
- *   * Right: an always-visible "New memory" button.
+ *   * Header: title + active scope badge + "New memory" button.
+ *   * Two-column body: sticky sidebar (16rem) + main column.
+ *   * Sidebar: Personal + Projects in two compact cards.
+ *   * Main: filter bar + entry list + "Load more".
  *
- * On mobile, the sidebar collapses above the list as a
- * horizontal scope picker -- the same component, restyled.
+ * The `md:` breakpoint at 768px is kept for narrow laptops, but
+ * the app targets desktop so the mobile-only horizontal scope
+ * chips have been removed (they never appeared at desktop widths
+ * anyway, and they add code that no path uses).
  *
- * URL contract
- * ------------
+ * Design aligned with the app's SearchTab:
  *
- * The `?scope=<type>:<id>` query parameter drives the whole
- * page. It is read on mount to seed the store, and it is
- * rewritten (via `router.replace`) whenever the user picks a
- * different scope. This makes links shareable and preserves
- * the user's scope across a page reload. The other filters
- * (status / type / pinned) live ONLY in the Zustand store --
- * they are not URL-synced, because they are transient view
- * preferences, not addressing information.
+ *   * Sidebar cards use `border-border/60 bg-card` -- the same
+ *     chrome used inside MemorySection in other pages.
+ *   * Section headers use the standard `text-[10px] uppercase
+ *     tracking-wider` pattern.
+ *   * Entries get the same hover treatment as MemorySummaryCard.
  *
- * Pagination
- * ----------
+ * Behaviour is unchanged from the pre-redesign version:
  *
- * Offset-based, "Load more" style. The page accumulates
- * entries in local state rather than using infinite scroll:
- *
- *   1. Offset 0 returns the first page -> replace `entries`.
- *   2. Offset 50 (after "Load more") -> append, de-duped.
- *   3. Changing scope or any filter resets offset to 0 and
- *      replaces `entries` with the first page.
- *
- * The append is guarded by checking `response.offset ===
- * currentOffset` -- a stale response from a page that was
- * cancelled by a filter change is ignored rather than
- * duplicating rows.
- *
- * Why `useQuery` directly, not `useEntryList`
- * -------------------------------------------
- *
- * The wrapper in `queries.ts` does not pass through
- * `placeholderData` / `keepPreviousData`, and pagination
- * NEEDS those: without them, moving to offset 50 makes
- * `data` undefined for a tick, which would flash the
- * empty state before the new page arrives. The direct
- * `useQuery` call lets us keep the previous page visible
- * while the next loads.
+ *   * URL `?scope=` → store on mount.
+ *   * Store → URL on scope change.
+ *   * Pagination via `Load more` (offset accumulation).
+ *   * Filter / scope change resets the offset.
  */
 
 'use client';
@@ -59,27 +38,16 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import {
-  Brain,
-  Plus,
-  User,
-  FolderOpen,
-  AlertTriangle,
-  type LucideIcon,
-} from 'lucide-react';
+import { Brain, Plus, User, FolderOpen } from 'lucide-react';
 
-import type { MemoryEntry, MemoryScopeRef } from '../../../features/memory/types/entry';
+import type {
+  MemoryEntry,
+  MemoryScopeRef,
+} from '../../../features/memory/types/entry';
 import type { MemoryApiError } from '../../../features/memory/types/errors';
-import {
-  MemoryScope,
-  MemoryStatusFilter,
-} from '../../../features/memory/types/enums';
-import {
-  memoryClient,
-} from '../../../features/memory/api/client';
-import {
-  memoryKeys,
-} from '../../../features/memory/api/keys';
+import { MemoryScope } from '../../../features/memory/types/enums';
+import { memoryClient } from '../../../features/memory/api/client';
+import { memoryKeys } from '../../../features/memory/api/keys';
 import {
   useProjectsList,
   useMemorySettings,
@@ -92,10 +60,7 @@ import {
   DEFAULT_PAGE_SIZE,
   HARD_DELETE_CONFIRM_TOKEN,
 } from '../../../features/memory/lib/constants';
-import {
-  DEFAULT_FILTERS,
-  useMemoryUIStore,
-} from '../../../features/memory/stores/memory-ui-store';
+import { useMemoryUIStore } from '../../../features/memory/stores/memory-ui-store';
 import { cn } from '../../../features/memory/lib/cn';
 import { EntryFilters } from '../../../features/memory/components/EntryFilters';
 import { EntryList } from '../../../features/memory/components/EntryList';
@@ -103,6 +68,8 @@ import { EntryEditor } from '../../../features/memory/components/EntryEditor';
 import { ConfirmDangerDialog } from '../../../features/memory/components/ConfirmDangerDialog';
 import { EmptyState } from '../../../features/memory/components/EmptyState';
 import { ScopeBadge } from '../../../features/memory/components/ScopeBadge';
+import { MemoryBanner } from '../../../features/memory/components/MemoryBanner';
+import { useKeyboardShortcuts } from '../../../features/memory/hooks/useKeyboardShortcuts';
 
 // ---------------------------------------------------------------------------
 // Page
@@ -118,12 +85,7 @@ export default function MemoryBrowsePage() {
   const activeScope = useMemoryUIStore((s) => s.active_scope);
   const setActiveScope = useMemoryUIStore((s) => s.setActiveScope);
 
-  // ---- URL -> store sync on mount --------------------------------
-  //
-  // We read the URL param ONCE on mount. Subsequent changes go
-  // the other way (store -> URL) so that the user's clicks
-  // remain the source of truth. This prevents a feedback loop
-  // where URL and store overwrite each other.
+  // URL -> store on mount.
   useEffect(() => {
     const scopeParam = searchParams?.get('scope');
     if (scopeParam) {
@@ -132,13 +94,13 @@ export default function MemoryBrowsePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- Projects list (for the scope sidebar) ---------------------
+  // ---- Queries ---------------------------------------------------
   const projectsQuery = useProjectsList();
   const settingsQuery = useMemorySettings();
   const canWrite = settingsQuery.data?.mode === 'read_write';
   const canRead = settingsQuery.data?.mode !== 'disabled';
 
-  // ---- Pagination state ------------------------------------------
+  // ---- Pagination -----------------------------------------------
   const [offset, setOffset] = useState(0);
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
 
@@ -158,7 +120,7 @@ export default function MemoryBrowsePage() {
     filters.is_pinned,
   ]);
 
-  // ---- The list query --------------------------------------------
+  // ---- The list query -------------------------------------------
   const listQuery = useQuery<
     Awaited<ReturnType<typeof memoryClient.entries.list>>,
     MemoryApiError
@@ -192,11 +154,7 @@ export default function MemoryBrowsePage() {
     placeholderData: keepPreviousData,
   });
 
-  // ---- Accumulate pages ------------------------------------------
-  //
-  // Guarded by `response.offset === currentOffset` -- a late
-  // response from an abandoned page is ignored rather than
-  // duplicating entries.
+  // ---- Accumulate pages -----------------------------------------
   useEffect(() => {
     const response = listQuery.data;
     if (!response) return;
@@ -216,7 +174,7 @@ export default function MemoryBrowsePage() {
     });
   }, [listQuery.data, offset]);
 
-  // ---- Derived flags ---------------------------------------------
+  // ---- Derived flags --------------------------------------------
   const hasMore =
     (listQuery.data?.count ?? 0) === DEFAULT_PAGE_SIZE &&
     entries.length > 0 &&
@@ -224,7 +182,6 @@ export default function MemoryBrowsePage() {
 
   const isLoading = listQuery.isPending && !listQuery.data;
   const isLoadingMore = listQuery.isFetching && offset > 0;
-  const error = listQuery.error;
 
   // ---- Dialogs ---------------------------------------------------
   const [editorOpen, setEditorOpen] = useState(false);
@@ -265,15 +222,12 @@ export default function MemoryBrowsePage() {
         scope_id: deletingEntry.scope_id,
         hard: true,
       });
-      // Remove from local list immediately (the mutation
-      // invalidates server queries; our local `entries` is
-      // independent and needs an explicit drop).
       setEntries((prev) =>
         prev.filter((e) => e.memory_id !== deletingEntry.memory_id),
       );
       setDeletingEntry(null);
     } catch {
-      // error surfaced in the dialog
+      // Error surfaced in the dialog
     }
   }
 
@@ -290,11 +244,21 @@ export default function MemoryBrowsePage() {
       });
       setPromotingEntry(null);
     } catch {
-      // error surfaced in the dialog
+      // Error surfaced in the dialog
     }
   }
 
-  // ---- Loading/skeleton scope picker -----------------------------
+  // ---- Keyboard shortcuts ---------------------------------------
+  useKeyboardShortcuts([
+    {
+      keys: 'n',
+      handler: () => {
+        if (canWrite && activeScope) handleCreate();
+      },
+    },
+  ]);
+
+  // ---- Derived: project scopes ----------------------------------
   const projectScopes: MemoryScopeRef[] = useMemo(
     () =>
       (projectsQuery.data?.projects ?? []).map((p) => ({
@@ -304,217 +268,161 @@ export default function MemoryBrowsePage() {
     [projectsQuery.data?.projects],
   );
 
+  // ---- Render ---------------------------------------------------
   return (
-    <div className="mx-auto grid max-w-6xl grid-cols-1 gap-4 md:grid-cols-[14rem_1fr]">
-      {/* ============ Mobile scope picker ============ */}
-      {/*
-       * On screens narrower than `md`, the vertical sidebar would
-       * push the entry list below the fold: the user opens
-       * `/memory/browse`, sees only the scope names, and must
-       * scroll to find any content. A horizontal, scrollable row
-       * of chips collapses the picker into ~40px of vertical
-       * space, keeping the list visible on first paint.
-       *
-       * The desktop sidebar (below) renders the same information
-       * in the same order, so the mental model does not change
-       * across breakpoints.
-       */}
-      <div className="md:hidden -mx-4 overflow-x-auto px-4 pb-1">
-        <div className="flex min-w-max gap-1.5">
-          <ScopeChip
-            active={
-              activeScope?.scope_type === MemoryScope.USER &&
-              activeScope.scope_id === 'default'
-            }
-            onClick={() =>
-              pickScope({
-                scope_type: MemoryScope.USER,
-                scope_id: 'default',
-              })
-            }
-            icon={User}
-            label={t('scope.userDefault')}
-          />
-          {projectsQuery.isLoading ? (
-            <>
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="h-7 w-20 animate-pulse rounded-full bg-muted"
-                />
-              ))}
-            </>
-          ) : (
-            projectScopes.map((ref) => (
-              <ScopeChip
-                key={ref.scope_id}
-                active={
-                  activeScope?.scope_type === ref.scope_type &&
-                  activeScope.scope_id === ref.scope_id
-                }
-                onClick={() => pickScope(ref)}
-                icon={FolderOpen}
-                label={ref.scope_id}
-              />
-            ))
+    <div className="space-y-6">
+      {/* ============ Header ============ */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <h2 className="text-lg font-semibold font-heading text-foreground">
+            {t('browse.title')}
+          </h2>
+          {activeScope && (
+            <ScopeBadge
+              scope_type={activeScope.scope_type}
+              scope_id={
+                activeScope.scope_type === 'user'
+                  ? undefined
+                  : activeScope.scope_id
+              }
+              size="sm"
+            />
           )}
         </div>
+        <button
+          type="button"
+          onClick={handleCreate}
+          disabled={!canWrite || !activeScope}
+          title={
+            !canWrite
+              ? t('errors.mode_read_only')
+              : `${t('browse.empty.action')} (N)`
+          }
+          aria-label={t('browse.empty.action')}
+          className={cn(
+            'inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-all',
+            'hover:bg-primary/90 hover:scale-105',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
+            'disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:scale-100',
+          )}
+        >
+          <Plus size={12} aria-hidden="true" />
+          {t('browse.empty.action')}
+        </button>
       </div>
 
-      {/* ============ Desktop sidebar ============ */}
-      <aside className="hidden space-y-3 md:block">
-        <section>
-          <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('browse.scopeSidebar.personal')}
-          </h3>
-          <ScopeButton
-            active={
-              activeScope?.scope_type === MemoryScope.USER &&
-              activeScope.scope_id === 'default'
-            }
-            onClick={() =>
-              pickScope({
-                scope_type: MemoryScope.USER,
-                scope_id: 'default',
-              })
-            }
+      {/* ============ Disabled notice ============ */}
+      {!canRead && (
+        <MemoryBanner
+          tone="warning"
+          message={t('errors.mode_disabled')}
+          action={
+            <Link href="/memory/settings" className="underline">
+              {t('errors.withSettings')}
+            </Link>
+          }
+        />
+      )}
+
+      {/* ============ Two-column body ============ */}
+      <div className="grid grid-cols-1 md:grid-cols-[16rem_1fr] gap-6">
+        {/* ---- Sidebar ---- */}
+        <aside className="md:sticky md:top-24 md:self-start space-y-3">
+          {/* Personal */}
+          <SidebarCard
             icon={User}
-            label={t('scope.userDefault')}
-          />
-        </section>
-
-        <section>
-          <h3 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-            {t('browse.scopeSidebar.projects')}
-          </h3>
-          {projectsQuery.isLoading ? (
-            <div className="space-y-1" aria-busy="true">
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="h-7 animate-pulse rounded-md bg-muted"
-                />
-              ))}
-            </div>
-          ) : projectScopes.length === 0 ? (
-            <p className="text-[11px] text-muted-foreground">
-              {t('projects.empty.title')}
-            </p>
-          ) : (
-            <div className="space-y-0.5">
-              {projectScopes.map((ref) => (
-                <ScopeButton
-                  key={ref.scope_id}
-                  active={
-                    activeScope?.scope_type === ref.scope_type &&
-                    activeScope.scope_id === ref.scope_id
-                  }
-                  onClick={() => pickScope(ref)}
-                  icon={FolderOpen}
-                  label={ref.scope_id}
-                />
-              ))}
-            </div>
-          )}
-        </section>
-      </aside>
-
-      {/* ============ Main column ============ */}
-      <div className="space-y-3">
-        {/* Header */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <h2 className="text-base font-semibold text-foreground">
-              {t('browse.title')}
-            </h2>
-            {activeScope && (
-              <ScopeBadge
-                scope_type={activeScope.scope_type}
-                scope_id={
-                  activeScope.scope_type === 'user'
-                    ? undefined
-                    : activeScope.scope_id
-                }
-                size="xs"
-              />
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={handleCreate}
-            disabled={!canWrite || !activeScope}
-            title={!canWrite ? t('errors.mode_read_only') : undefined}
-            aria-label={t('browse.empty.action')}
-            className={cn(
-              'inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground',
-              'hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
-              'disabled:cursor-not-allowed disabled:opacity-60',
-            )}
+            title={t('browse.scopeSidebar.personal')}
           >
-            <Plus size={12} aria-hidden="true" />
-            <span className="hidden sm:inline">{t('browse.empty.action')}</span>
-          </button>
-        </div>
-
-        {/* Disabled notice */}
-        {!canRead && (
-          <div className="flex items-center gap-2 rounded-md border border-amber-300/60 bg-amber-50/60 p-2 text-[11px] dark:border-amber-700/60 dark:bg-amber-900/10">
-            <AlertTriangle
-              size={11}
-              aria-hidden="true"
-              className="text-amber-700 dark:text-amber-400"
+            <ScopeButton
+              active={
+                activeScope?.scope_type === MemoryScope.USER &&
+                activeScope.scope_id === 'default'
+              }
+              onClick={() =>
+                pickScope({
+                  scope_type: MemoryScope.USER,
+                  scope_id: 'default',
+                })
+              }
+              icon={User}
+              label={t('scope.userDefault')}
             />
-            <span className="text-amber-800 dark:text-amber-300">
-              {t('errors.mode_disabled')}{' '}
-              <Link
-                href="/memory/settings"
-                className="underline"
-              >
-                {t('errors.withSettings')}
-              </Link>
-            </span>
-          </div>
-        )}
+          </SidebarCard>
 
-        {/* Filters */}
-        {activeScope && (
-          <EntryFilters orientation="horizontal" hideClear={false} />
-        )}
+          {/* Projects */}
+          <SidebarCard
+            icon={FolderOpen}
+            title={t('browse.scopeSidebar.projects')}
+          >
+            {projectsQuery.isLoading ? (
+              <div className="space-y-1" aria-busy="true">
+                {[0, 1, 2].map((i) => (
+                  <div
+                    key={i}
+                    className="h-7 animate-pulse rounded-md bg-muted"
+                  />
+                ))}
+              </div>
+            ) : projectScopes.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">
+                {t('projects.empty.title')}
+              </p>
+            ) : (
+              <div className="space-y-0.5">
+                {projectScopes.map((ref) => (
+                  <ScopeButton
+                    key={ref.scope_id}
+                    active={
+                      activeScope?.scope_type === ref.scope_type &&
+                      activeScope.scope_id === ref.scope_id
+                    }
+                    onClick={() => pickScope(ref)}
+                    icon={FolderOpen}
+                    label={ref.scope_id}
+                  />
+                ))}
+              </div>
+            )}
+          </SidebarCard>
+        </aside>
 
-        {/* Content */}
-        {!activeScope ? (
-          <EmptyState
-            icon={Brain}
-            title={t('browse.empty.title')}
-            description={t('scope.selectScope')}
-            size="spacious"
-          />
-        ) : (
-          <EntryList
-            entries={entries}
-            isLoading={isLoading}
-            isLoadingMore={isLoadingMore}
-            error={error}
-            hasMore={hasMore}
-            onLoadMore={() => setOffset((o) => o + DEFAULT_PAGE_SIZE)}
-            onRetry={() => listQuery.refetch()}
-            onEdit={
-              canWrite
-                ? (entry) => handleEdit(entry)
-                : undefined
-            }
-            onDelete={
-              canWrite
-                ? (entry) => setDeletingEntry(entry)
-                : undefined
-            }
-            onPromote={
-              canWrite
-                ? (entry) => setPromotingEntry(entry)
-                : undefined
-            }
-          />
-        )}
+        {/* ---- Main column ---- */}
+        <div className="space-y-4 min-w-0">
+          {!activeScope ? (
+            <EmptyState
+              icon={Brain}
+              title={t('browse.empty.title')}
+              description={t('scope.selectScope')}
+              size="spacious"
+            />
+          ) : (
+            <>
+              <EntryFilters orientation="horizontal" />
+              <EntryList
+                entries={entries}
+                isLoading={isLoading}
+                isLoadingMore={isLoadingMore}
+                error={listQuery.error}
+                hasMore={hasMore}
+                onLoadMore={() =>
+                  setOffset((o) => o + DEFAULT_PAGE_SIZE)
+                }
+                onRetry={() => listQuery.refetch()}
+                onEdit={canWrite ? handleEdit : undefined}
+                onDelete={
+                  canWrite
+                    ? (entry) => setDeletingEntry(entry)
+                    : undefined
+                }
+                onPromote={
+                  canWrite
+                    ? (entry) => setPromotingEntry(entry)
+                    : undefined
+                }
+              />
+            </>
+          )}
+        </div>
       </div>
 
       {/* ============ Dialogs ============ */}
@@ -536,10 +444,6 @@ export default function MemoryBrowsePage() {
               : activeScope
           }
           onSaved={() => {
-            // The mutation already invalidated the queries.
-            // Our local `entries` is independent -- refresh
-            // the first page to pick up the new/updated row
-            // without disturbing the current scroll.
             if (offset === 0) {
               listQuery.refetch();
             } else {
@@ -570,7 +474,7 @@ export default function MemoryBrowsePage() {
         }}
         title={t('entry.promote.title')}
         description={t('entry.promote.description')}
-        confirmToken={promotingEntry?.scope_id ?? ''}
+        confirmToken="COPY"
         confirmLabel={t('entry.actions.promote')}
         isPending={promoteMutation.isPending}
         onConfirm={handlePromoteConfirm}
@@ -580,13 +484,41 @@ export default function MemoryBrowsePage() {
 }
 
 // ---------------------------------------------------------------------------
-// Scope button
+// Sub-components
 // ---------------------------------------------------------------------------
+
+interface SidebarCardProps {
+  icon: React.ComponentType<{ size?: number; className?: string }>;
+  title: string;
+  children: React.ReactNode;
+}
+
+function SidebarCard({
+  icon: Icon,
+  title,
+  children,
+}: SidebarCardProps) {
+  return (
+    <div className="rounded-md border border-border/60 bg-card p-3">
+      <div className="flex items-center gap-1.5 mb-2">
+        <Icon
+          size={11}
+          className="text-muted-foreground"
+          aria-hidden="true"
+        />
+        <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          {title}
+        </h3>
+      </div>
+      {children}
+    </div>
+  );
+}
 
 interface ScopeButtonProps {
   active: boolean;
   onClick: () => void;
-  icon: LucideIcon;
+  icon: React.ComponentType<{ size?: number; className?: string }>;
   label: string;
 }
 
@@ -611,48 +543,6 @@ function ScopeButton({
     >
       <Icon size={11} aria-hidden="true" className="shrink-0" />
       <span className="truncate font-mono">{label}</span>
-    </button>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Mobile scope chip
-// ---------------------------------------------------------------------------
-
-/**
- * A pill-shaped variant of `ScopeButton` for the mobile
- * horizontal picker.
- *
- * Differences from `ScopeButton`:
- *
- *   * Rounded-full vs rounded-md -- reads better in a horizontal
- *     strip of chips than a list of full-width rows.
- *   * `whitespace-nowrap` -- a long project id stays on one
- *     line; the parent container scrolls horizontally rather
- *     than wrapping to a second row.
- *   * No `truncate` -- truncating in a chip steals space that
- *     the parent's horizontal scroll would have provided.
- *
- * Same `active` visual language as `ScopeButton` (primary
- * background at 10% opacity), so the selection state reads
- * identically across breakpoints.
- */
-function ScopeChip({ active, onClick, icon: Icon, label }: ScopeButtonProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-current={active ? 'true' : undefined}
-      className={cn(
-        'inline-flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] transition-colors',
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
-        active
-          ? 'border-primary/40 bg-primary/10 font-medium text-primary'
-          : 'border-border bg-card text-muted-foreground hover:bg-muted hover:text-foreground',
-      )}
-    >
-      <Icon size={11} aria-hidden="true" className="shrink-0" />
-      <span className="whitespace-nowrap font-mono">{label}</span>
     </button>
   );
 }

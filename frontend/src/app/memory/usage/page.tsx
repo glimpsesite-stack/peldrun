@@ -3,54 +3,27 @@
 /**
  * Usage dashboard (`/memory/usage`).
  *
- * Monitoring surface for the memory subsystem. Four sections
- * arranged top-to-bottom:
+ * Design aligned with SearchTab and the memory Dashboard:
  *
- *   1. **Period selector** -- day / week / month / all. Drives
- *      every query on the page. Changing it re-fetches all
- *      three, which is correct: the numbers must agree across
- *      sections.
+ *   * Header with title + period selector (a segmented control).
+ *   * Four KPI cards via `UsageKpiCards` (uses `MemorySummaryCard`
+ *     internally).
+ *   * Two chart sections via `MemorySection`, each with a `<select>`
+ *     in its action slot to change granularity / dimension without
+ *     leaving the page.
  *
- *   2. **KPI cards** -- runs, tokens, budget utilization, and
- *      drop rate over the selected period. Includes an
- *      automatic budget warning banner when utilization
- *      crosses `settings.token_budget.warn_threshold`.
+ * Failure isolation preserved from the pre-redesign version:
  *
- *   3. **Time series** -- a line chart of token consumption
- *      per bucket. Granularity is separately selectable
- *      (day / week / month) so a user can zoom out without
- *      changing the period.
+ *   * Each query (summary / timeseries / breakdown) fails
+ *     independently. A failed summary does not hide the charts,
+ *     and a failed chart does not hide the summary.
  *
- *   4. **Breakdown** -- a pie chart of tokens by dimension
- *      (scope / project / chat). The dimension is separately
- *      selectable so a user can slice the same tokens four
- *      different ways without refetching the summary.
+ * A11y:
  *
- * Empty / loading / error states
- * ------------------------------
- *
- * The three sections fail INDEPENDENTLY:
- *
- *   * If the summary query fails, the KPI cards show the
- *     error, but the charts still render from their own
- *     queries.
- *
- *   * If the timeseries query fails, the timeseries chart
- *     shows the error, but the KPIs remain.
- *
- *   * A period with zero runs collapses to a single
- *     `<EmptyState>` below the period selector -- there is
- *     no point in showing four cards of zeros.
- *
- * Extra drop-rate warning
- * -----------------------
- *
- * The spec (F7.5) calls out a specific case: when the drop
- * rate exceeds 30%, the token budget may be too small for the
- * workload. `UsageKpiCards` already colors the drop-rate KPI
- * in warning tones at that threshold, but a text banner makes
- * the diagnosis actionable ("consider raising budget").
- * Rendered below the KPI cards when `drop_rate > 0.3`.
+ *   * Charts are wrapped in `role="img"` + `aria-label` so screen
+ *     readers announce the chart's purpose and the current period.
+ *   * The period selector uses `aria-pressed` on its buttons.
+ *   * Each `<select>` has an `aria-label`.
  */
 
 'use client';
@@ -60,8 +33,9 @@ import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
   BarChart3,
+  PieChart,
   RefreshCw,
-  type LucideIcon,
+  TrendingUp,
 } from 'lucide-react';
 
 import type {
@@ -76,23 +50,18 @@ import {
   useUsageTimeseries,
 } from '../../../features/memory/api/queries';
 import { cn } from '../../../features/memory/lib/cn';
+import { formatPercent } from '../../../features/memory/lib/format';
 import { UsageKpiCards } from '../../../features/memory/components/UsageKpiCards';
 import { UsageBreakdownChart } from '../../../features/memory/components/UsageBreakdownChart';
 import { UsageTimeseriesChart } from '../../../features/memory/components/UsageTimeseriesChart';
 import { EmptyState } from '../../../features/memory/components/EmptyState';
+import { MemorySection } from '../../../features/memory/components/MemorySection';
+import { MemoryBanner } from '../../../features/memory/components/MemoryBanner';
 
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
-/**
- * The period options shown in the top selector.
- *
- * Fixed order and labels (from `memory.json`), no dynamic
- * derivation from `ALL_USAGE_PERIODS` -- the display order
- * matters here (ascending span), and `all` is deliberately
- * last because it is the least common view.
- */
 const PERIOD_OPTIONS: Array<{ value: UsagePeriod; labelKey: string }> = [
   { value: 'day', labelKey: 'usage.period.day' },
   { value: 'week', labelKey: 'usage.period.week' },
@@ -100,9 +69,6 @@ const PERIOD_OPTIONS: Array<{ value: UsagePeriod; labelKey: string }> = [
   { value: 'all', labelKey: 'usage.period.all' },
 ];
 
-/**
- * The granularity options shown in the timeseries header.
- */
 const GRANULARITY_OPTIONS: Array<{
   value: UsageGranularity;
   labelKey: string;
@@ -112,14 +78,6 @@ const GRANULARITY_OPTIONS: Array<{
   { value: 'month', labelKey: 'usage.timeseries.granularity.month' },
 ];
 
-/**
- * The dimension options shown in the breakdown header.
- *
- * `source` is intentionally omitted from the UI -- it is an
- * accepted alias for `scope` on the wire, so exposing both
- * would confuse users. The backend normalizes the response's
- * `by` field to `scope` either way.
- */
 const DIMENSION_OPTIONS: Array<{
   value: 'scope' | 'project' | 'chat';
   labelKey: string;
@@ -136,14 +94,12 @@ const DIMENSION_OPTIONS: Array<{
 export default function MemoryUsagePage() {
   const { t } = useTranslation('memory');
 
-  // ---- Local selectors -------------------------------------------
   const [period, setPeriod] = useState<UsagePeriod>('month');
   const [granularity, setGranularity] = useState<UsageGranularity>('day');
   const [breakdownBy, setBreakdownBy] = useState<
     'scope' | 'project' | 'chat'
   >('scope');
 
-  // ---- Queries ---------------------------------------------------
   const settingsQuery = useMemorySettings();
   const summaryQuery = useUsageSummary({
     period,
@@ -163,11 +119,11 @@ export default function MemoryUsagePage() {
   const isEmpty = summary !== undefined && summary.run_count === 0;
 
   return (
-    <div className="mx-auto max-w-6xl space-y-4 p-4">
+    <div className="space-y-6">
       {/* ============ Title + period selector ============ */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-base font-semibold text-foreground">
+          <h2 className="text-lg font-semibold font-heading text-foreground">
             {t('usage.title')}
           </h2>
           <p className="text-[11px] text-muted-foreground">
@@ -176,7 +132,7 @@ export default function MemoryUsagePage() {
         </div>
 
         <div
-          className="inline-flex rounded-md border border-border bg-card p-0.5"
+          className="inline-flex rounded-md border border-border bg-card p-0.5 shadow-sm"
           role="group"
           aria-label={t('usage.period.label')}
         >
@@ -189,10 +145,10 @@ export default function MemoryUsagePage() {
                 onClick={() => setPeriod(opt.value)}
                 aria-pressed={active}
                 className={cn(
-                  'rounded px-2.5 py-1 text-[11px] font-medium transition-colors',
+                  'rounded px-2.5 py-1 text-[11px] font-medium transition-all',
                   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background',
                   active
-                    ? 'bg-primary text-primary-foreground'
+                    ? 'bg-primary text-primary-foreground shadow-sm'
                     : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                 )}
               >
@@ -204,68 +160,83 @@ export default function MemoryUsagePage() {
       </div>
 
       {/* ============ KPI cards ============ */}
-      <section>
-        {summaryQuery.isLoading ? (
-          <KpiSkeleton />
-        ) : summaryQuery.error ? (
-          <ErrorCard
-            error={summaryQuery.error}
-            onRetry={() => summaryQuery.refetch()}
-          />
-        ) : isEmpty ? (
-          <EmptyState
-            icon={BarChart3}
-            title={t('usage.empty')}
-            size="spacious"
-          />
-        ) : summary ? (
-          <>
-            <UsageKpiCards summary={summary} warnThreshold={warnThreshold} />
-
-            {/* Extra drop-rate banner (F7.5). Distinct from
-                the budget-utilization warning inside
-                UsageKpiCards -- this one fires only when the
-                drop rate alone signals "the budget is too
-                small for the workload". */}
-            {summary.drop_rate > 0.3 && (
-              <p
-                className="mt-2 flex items-start gap-1.5 rounded-md border border-amber-300/60 bg-amber-50/60 px-2.5 py-1.5 text-[11px] text-amber-800 dark:border-amber-700/60 dark:bg-amber-900/10 dark:text-amber-300"
-                role="status"
-              >
-                <AlertTriangle
-                  size={11}
-                  aria-hidden="true"
-                  className="mt-0.5 shrink-0"
-                />
-                <span>
-                  {t('usage.budgetWarning', {
-                    pct: `${(summary.drop_rate * 100).toFixed(0)}`,
-                  })}
-                </span>
-              </p>
-            )}
-          </>
-        ) : null}
-      </section>
-
-      {/* ============ Charts (only when not empty) ============ */}
-      {!isEmpty && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          {/* ---- Timeseries ---- */}
-          <section className="rounded-lg border border-border bg-card p-3">
-            <ChartHeader
-              title={t('usage.timeseries.title')}
-              icon={BarChart3}
-              selectId="usage-granularity"
-              selectValue={granularity}
-              selectLabel={t('usage.timeseries.granularity.day')}
-              onSelect={(v) => setGranularity(v as UsageGranularity)}
-              options={GRANULARITY_OPTIONS.map((o) => ({
-                value: o.value,
-                label: t(o.labelKey),
-              }))}
+      {summaryQuery.isLoading ? (
+        <div
+          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"
+          aria-busy="true"
+        >
+          {[0, 1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-32 animate-pulse rounded-md border border-border bg-muted/40"
             />
+          ))}
+        </div>
+      ) : summaryQuery.error ? (
+        <MemoryBanner
+          tone="error"
+          message={summaryQuery.error.message}
+          action={
+            <button
+              type="button"
+              onClick={() => summaryQuery.refetch()}
+              className="inline-flex items-center gap-1 rounded border border-current px-2 py-0.5 font-medium hover:opacity-80"
+            >
+              <RefreshCw size={10} aria-hidden="true" />
+              {t('common.retry')}
+            </button>
+          }
+        />
+      ) : isEmpty ? (
+        <EmptyState
+          icon={BarChart3}
+          title={t('usage.empty')}
+          size="spacious"
+        />
+      ) : summary ? (
+        <>
+          <UsageKpiCards
+            summary={summary}
+            warnThreshold={warnThreshold}
+          />
+          {summary.drop_rate > 0.3 && (
+            <MemoryBanner
+              tone="warning"
+              message={t('usage.budgetWarning', {
+                pct: formatPercent(summary.drop_rate),
+              })}
+            />
+          )}
+        </>
+      ) : null}
 
+      {/* ============ Charts ============ */}
+      {!isEmpty && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* ---- Timeseries ---- */}
+          <MemorySection
+            icon={TrendingUp}
+            title={t('usage.timeseries.title')}
+            subtitle={t(`usage.period.${period}`)}
+            accent="primary"
+            delay={0.2}
+            action={
+              <select
+                value={granularity}
+                onChange={(e) =>
+                  setGranularity(e.target.value as UsageGranularity)
+                }
+                aria-label={t('usage.timeseries.granularity.day')}
+                className="h-6 rounded border border-border bg-background px-1.5 text-[10px] font-mono text-foreground cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1"
+              >
+                {GRANULARITY_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {t(o.labelKey)}
+                  </option>
+                ))}
+              </select>
+            }
+          >
             {timeseriesQuery.isLoading ? (
               <ChartSkeleton height={240} />
             ) : timeseriesQuery.error ? (
@@ -274,34 +245,48 @@ export default function MemoryUsagePage() {
                 onRetry={() => timeseriesQuery.refetch()}
               />
             ) : timeseriesQuery.data ? (
-              <UsageTimeseriesChart
-                data={timeseriesQuery.data}
-                height={240}
-              />
+              <div
+                role="img"
+                aria-label={`${t('usage.timeseries.title')} — ${t(`usage.period.${period}`)}`}
+              >
+                <UsageTimeseriesChart
+                  data={timeseriesQuery.data}
+                  height={240}
+                />
+              </div>
             ) : null}
-          </section>
+          </MemorySection>
 
           {/* ---- Breakdown ---- */}
-          <section className="rounded-lg border border-border bg-card p-3">
-            <ChartHeader
-              title={t('usage.breakdown.title', {
-                dimension: t(
-                  `usage.breakdown.dimensions.${breakdownBy}`,
-                ),
-              })}
-              icon={BarChart3}
-              selectId="usage-breakdown-by"
-              selectValue={breakdownBy}
-              selectLabel={t('usage.breakdown.dimensions.scope')}
-              onSelect={(v) =>
-                setBreakdownBy(v as 'scope' | 'project' | 'chat')
-              }
-              options={DIMENSION_OPTIONS.map((o) => ({
-                value: o.value,
-                label: t(o.labelKey),
-              }))}
-            />
-
+          <MemorySection
+            icon={PieChart}
+            title={t('usage.breakdown.title', {
+              dimension: t(
+                `usage.breakdown.dimensions.${breakdownBy}`,
+              ),
+            })}
+            subtitle={t(`usage.period.${period}`)}
+            accent="cyan"
+            delay={0.25}
+            action={
+              <select
+                value={breakdownBy}
+                onChange={(e) =>
+                  setBreakdownBy(
+                    e.target.value as 'scope' | 'project' | 'chat',
+                  )
+                }
+                aria-label={t('usage.breakdown.dimensions.scope')}
+                className="h-6 rounded border border-border bg-background px-1.5 text-[10px] font-mono text-foreground cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1"
+              >
+                {DIMENSION_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {t(o.labelKey)}
+                  </option>
+                ))}
+              </select>
+            }
+          >
             {breakdownQuery.isLoading ? (
               <ChartSkeleton height={220} />
             ) : breakdownQuery.error ? (
@@ -310,12 +295,21 @@ export default function MemoryUsagePage() {
                 onRetry={() => breakdownQuery.refetch()}
               />
             ) : breakdownQuery.data ? (
-              <UsageBreakdownChart
-                data={breakdownQuery.data}
-                height={220}
-              />
+              <div
+                role="img"
+                aria-label={`${t('usage.breakdown.title', {
+                  dimension: t(
+                    `usage.breakdown.dimensions.${breakdownBy}`,
+                  ),
+                })} — ${t(`usage.period.${period}`)}`}
+              >
+                <UsageBreakdownChart
+                  data={breakdownQuery.data}
+                  height={220}
+                />
+              </div>
             ) : null}
-          </section>
+          </MemorySection>
         </div>
       )}
     </div>
@@ -326,48 +320,6 @@ export default function MemoryUsagePage() {
 // Sub-components
 // ---------------------------------------------------------------------------
 
-interface ChartHeaderProps {
-  title: string;
-  icon: LucideIcon;
-  selectId: string;
-  selectValue: string;
-  selectLabel: string;
-  onSelect: (value: string) => void;
-  options: Array<{ value: string; label: string }>;
-}
-
-function ChartHeader({
-  title,
-  icon: Icon,
-  selectId,
-  selectValue,
-  selectLabel,
-  onSelect,
-  options,
-}: ChartHeaderProps) {
-  return (
-    <div className="mb-2 flex items-center justify-between gap-2">
-      <h3 className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        <Icon size={11} aria-hidden="true" />
-        {title}
-      </h3>
-      <select
-        id={selectId}
-        value={selectValue}
-        onChange={(e) => onSelect(e.target.value)}
-        aria-label={selectLabel}
-        className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1"
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
 interface ErrorCardProps {
   error: MemoryApiError;
   onRetry: () => void;
@@ -377,34 +329,18 @@ function ErrorCard({ error, onRetry }: ErrorCardProps) {
   const { t } = useTranslation('memory');
   return (
     <div
-      className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] text-destructive"
+      className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-[11px] text-destructive"
       role="alert"
     >
       <span className="min-w-0 flex-1 truncate">{error.message}</span>
       <button
         type="button"
         onClick={onRetry}
-        className="inline-flex items-center gap-1 rounded border border-destructive/40 bg-card px-2 py-0.5 font-medium text-destructive hover:bg-destructive/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive"
+        className="inline-flex items-center gap-1 rounded border border-destructive/40 bg-card px-2 py-0.5 font-medium text-destructive hover:bg-destructive/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive transition-colors"
       >
         <RefreshCw size={10} aria-hidden="true" />
         {t('common.retry')}
       </button>
-    </div>
-  );
-}
-
-function KpiSkeleton() {
-  return (
-    <div
-      className="grid grid-cols-2 gap-2 lg:grid-cols-4"
-      aria-busy="true"
-    >
-      {[0, 1, 2, 3].map((i) => (
-        <div
-          key={i}
-          className="h-16 animate-pulse rounded-lg border border-border bg-muted/40"
-        />
-      ))}
     </div>
   );
 }

@@ -57,9 +57,6 @@ import {
   MemoryType,
 } from '../types/enums';
 import {
-  makeSettingsPatchSchema, // reuse of `type` for `MemorySettings` import only; see note
-} from '../lib/validators'; // eslint-disable-line @typescript-eslint/no-unused-vars -- intentional; see file header
-import {
   memoryEntryCreateSchema,
   memoryEntryUpdateSchema,
   zodErrorToFieldMap,
@@ -80,6 +77,7 @@ import { cn } from '../lib/cn';
 import { ImportanceSlider } from './ImportanceSlider';
 import { TagsInput } from './TagsInput';
 import { ScopeBadge } from './ScopeBadge';
+import { useFocusTrap } from '../hooks/useFocusTrap';
 
 // ---------------------------------------------------------------------------
 // Props
@@ -165,6 +163,13 @@ export function EntryEditor({
   const [isPinned, setIsPinned] = useState(DEFAULT_IS_PINNED);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const contentRef = useRef<HTMLTextAreaElement>(null);
+  const panelRef = useRef<HTMLFormElement>(null);
+
+  // Traps Tab/Shift+Tab inside the form while open, and restores
+  // focus to the trigger button on close. The useEffect above
+  // already auto-focuses the content textarea on mount; the trap
+  // only ensures focus STAYS inside once it is there.
+  useFocusTrap(panelRef, open);
 
   // ---- Reset state when the dialog opens -------------------------
   useEffect(() => {
@@ -342,7 +347,32 @@ export function EntryEditor({
       }}
     >
       <form
+        ref={panelRef}
         onSubmit={handleSubmit}
+        onKeyDown={(e) => {
+          // Cmd/Ctrl+Enter submits the form from anywhere inside
+          // it -- most importantly from inside the content
+          // textarea, where the user is actually typing. The
+          // alternative (moving focus to the Save button) is
+          // three keystrokes; this is one.
+          //
+          // `requestSubmit()` (not `submit()`) fires the submit
+          // event so `onSubmit` -> `handleSubmit` runs with all
+          // its validation. `submit()` bypasses validation.
+          //
+          // `e.currentTarget` is the form itself (attached on the
+          // form, not the textarea), so `requestSubmit` is
+          // guaranteed available in all modern browsers (Safari
+          // 16+, Chrome 76+, Firefox 75+).
+          if (
+            (e.metaKey || e.ctrlKey) &&
+            e.key === 'Enter' &&
+            !isPending
+          ) {
+            e.preventDefault();
+            e.currentTarget.requestSubmit();
+          }
+        }}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

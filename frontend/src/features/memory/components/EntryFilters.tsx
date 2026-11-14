@@ -77,7 +77,7 @@ export function EntryFilters({
       className={cn(
         'text-xs',
         isHorizontal
-          ? 'flex flex-wrap items-center gap-3'
+          ? 'flex flex-wrap items-center gap-3 rounded-md border border-border/60 bg-card p-3'
           : 'space-y-3 rounded-lg border border-border bg-card p-3',
         className,
       )}

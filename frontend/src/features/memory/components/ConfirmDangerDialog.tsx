@@ -57,6 +57,7 @@ import { AlertTriangle, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { cn } from '../lib/cn';
+import { useFocusTrap } from '../hooks/useFocusTrap';
 
 // ---------------------------------------------------------------------------
 // Props
@@ -121,8 +122,16 @@ export function ConfirmDangerDialog({
   const { t } = useTranslation('memory');
   const [entered, setEntered] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const descriptionId = useId();
+
+  // Traps Tab/Shift+Tab inside the panel while open, and
+  // restores focus to the trigger button on close. The
+  // ConfirmDangerDialog already auto-focuses its input via the
+  // setTimeout below; the trap only ensures focus STAYS inside
+  // once it is there.
+  useFocusTrap(panelRef, open);
 
   // Reset the typed token whenever the dialog opens or closes.
   // Without this, a user who opens the dialog, types DELETE,
@@ -184,6 +193,7 @@ export function ConfirmDangerDialog({
       role="presentation"
     >
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

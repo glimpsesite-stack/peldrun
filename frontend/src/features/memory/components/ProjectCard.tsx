@@ -102,9 +102,9 @@ export function ProjectCard({
       onClick={onClick}
       type={onClick ? 'button' : undefined}
       className={cn(
-        'group flex w-full flex-col gap-3 rounded-lg border border-border bg-card p-3 text-start text-foreground',
+        'group relative flex w-full flex-col gap-3 overflow-hidden rounded-lg border border-border bg-card p-3 text-start text-foreground transition-all',
         onClick &&
-          'cursor-pointer transition-colors hover:border-primary/40 hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
+          'cursor-pointer hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2',
         className,
       )}
       aria-label={t('projects.detail.title', { id: project.project_id })}
