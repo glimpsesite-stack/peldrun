@@ -3,151 +3,168 @@
 PELDRUN Memory Platform - Phase 1-B: Extraction Prompts.
 
 Single source of truth for the extraction LLM's system prompt and
-the JSON schema the model is required to produce. Changing either
-of these REQUIRES bumping ``PROMPT_VERSION`` below -- the version
-is recorded in ``ExtractionMeta.prompt_version`` for every memory
-the pipeline produces, so an A/B comparison of prompt changes is
-always possible from the audit trail.
-
-Why the prompt is in a dedicated module
----------------------------------------
-
-1. **Testability.** `tests/memory/test_phase1b_extraction.py`
-   asserts specific prompt phrases exist (e.g. the verbatim
-   snippet rule). Hard-coding the string inside `gateway.py`
-   would require re-implementing the test logic against that
-   file's internals.
-
-2. **Versioning.** `PROMPT_VERSION` is read by
-   `ExtractionOrchestrator` when it builds `ExtractionMeta`.
-   Keeping it next to the prompt ensures they can never drift.
-
-3. **Multilingual clarity.** The prompt is written in English
-   (the LLM's instruction-tuning is overwhelmingly English), but
-   it EXPLICITLY instructs the model to extract content in the
-   SOURCE language (AR/RU/EN) -- so an Arabic conversation
-   produces Arabic memories, an English one produces English
-   memories, and a mixed one produces mixed-language memories.
+the JSON schema the model is required to produce.
 
 Design invariants
 -----------------
 
-1. **The verbatim snippet rule is non-negotiable (§21.5).**
-   The system prompt repeats the rule in THREE places: an
-   instruction paragraph, a "DO NOT" list, and a per-field
-   description inside the JSON schema. This redundancy is
-   deliberate -- prompt-following degrades with distance from
-   the instruction, so a rule stated once is often ignored.
+1. **Token-frugal by default (v3+).**
+   Small models (4B parameters and below) lose instruction-
+   following when the prompt exceeds ~500 tokens. The v1 prompt
+   was ~1450 tokens (verbose rules + pretty-printed schema with
+   per-field descriptions). The v3 prompt below is ~300 tokens
+   by inlining a compact JSON example and removing redundant
+   rule repetitions. Quality is preserved because the
+   ``EvidenceValidator`` (not the prompt) is the ground truth
+   for the verbatim rule -- a snippet that is not literally
+   present in the source is rejected regardless of what the
+   prompt said.
 
-2. **JSON-only output.**
-   ``ResponseFormat.JSON`` is set by the gateway, but the prompt
-   ALSO instructs "Return ONLY the JSON object, no prose before
-   or after" because some providers silently wrap JSON responses
-   in markdown fences even when asked for JSON.
+2. **Verbatim evidence is stated ONCE, strongly.**
+   v1 stated the rule three times (paragraph + DO-NOT list +
+   schema description). That redundancy burns tokens and, on
+   small models, pushes the actual output schema far from the
+   instructions. v3 states it once, in a MUST sentence, and
+   trusts the validator to enforce it.
 
-3. **The schema is machine-readable.**
-   ``EXTRACTION_JSON_SCHEMA`` is a plain Python dict. The
-   gateway passes it as ``response_format`` when the provider
-   supports structured output; when the provider does NOT
-   support it (older local models), the gateway falls back to
-   "prompt-only JSON" and relies on a parsing helper that
-   tolerates markdown fences.
+3. **JSON schema is inline as a JSON example.**
+   The model reads the shape from an example object far more
+   reliably than from JSON-Schema syntax. We still export
+   ``EXTRACTION_JSON_SCHEMA`` because ``gateway.py`` passes it
+   as ``response_format`` when the provider supports structured
+   output -- but the prompt itself no longer embeds it.
+
+4. **Language rule is stated once, in one line.**
+   v1 explained the AR/RU/EN rule over four lines. v3 uses one
+   line: "LANGUAGE: same as source (AR/RU/EN). Do not translate."
+
+5. **No stop-thinking instruction (v4+).**
+   v3 included a "STOP THINKING" line. In practice this does
+   NOT disable reasoning on reasoning-capable models -- the
+   thinking phase runs BEFORE any user-visible token is
+   generated, and is controlled at the API level (see
+   ``gateway.py``). v4 removes the line because it was
+   ineffective AND cost ~20 tokens. Reasoning disablement is
+   the API layer's responsibility, not the prompt's.
+
+6. **Language-neutral structural example (v6).**
+   The system prompt is written in English (instruction-tuning
+   language). The JSON example must NOT contain any language-
+   specific literals -- no Arabic, no Russian, no English that
+   a 4B model might copy literally. v6 uses ``<placeholder>``
+   tokens for content/snippet and realistic integers for
+   importance/confidence (75, 0.9) instead of the skeleton
+   values (0, 0.0). This enforces language neutrality by
+   structure, not by instruction, and prevents the "literal
+   copy of the example" failure mode observed in v5.
+
+Versioning
+----------
+``PROMPT_VERSION`` is recorded in every ``ExtractionMeta``. A
+change to this file REQUIRES a version bump so that memories
+produced under different prompts remain distinguishable in the
+audit trail.
+
+- v1: initial (verbose).
+- v2: v1 + verbose STOP-THINKING section (token-expensive).
+- v3: compact rewrite. ~300 tokens.
+- v4: v3 without the STOP-THINKING line (it does not actually
+  disable reasoning on reasoning-capable models; reasoning is
+  controlled at the API level). ~280 tokens.
+- v5: v4 + explicit "greeting-with-facts" rule. Small models
+  (4B) were classifying entire messages as "greetings" because
+  they opened with a greeting, and skipping the durable facts
+  inside. v5 instructs the model to extract facts regardless of
+  a greeting preamble. ~340 tokens.
+- v6: structural example + anti-translation + anti-literal-copy.
+  Observed: small models (4B) copied ``"turn_id": "optional"``
+  and ``"importance": 0`` from the skeleton example literally.
+  v6 uses language-neutral ``<placeholders>`` and a realistic
+  numeric example. Adds a MANDATORY RULES block that explicitly
+  enforces language-verbatim and forbids literal copying of the
+  example. ~420 tokens.
 """
 
 from __future__ import annotations
 
 
-PROMPT_VERSION: str = "v1"
-"""Version tag recorded in every `ExtractionMeta.prompt_version`.
-
-Bump this on ANY substantive change to
-``EXTRACTION_SYSTEM_PROMPT`` or ``EXTRACTION_JSON_SCHEMA``. A
-memory produced under v1 must be distinguishable from one
-produced under v2 -- a change in extraction quality MUST be
-attributable to a version, not to an untracked edit.
-"""
+PROMPT_VERSION: str = "v6"
+"""Version tag recorded in every `ExtractionMeta.prompt_version`."""
 
 
 # ---------------------------------------------------------------------------
-# System prompt
+# System prompt (compact, ~300 tokens)
 # ---------------------------------------------------------------------------
 
 
 EXTRACTION_SYSTEM_PROMPT: str = """\
-You are a memory extraction assistant for a chat application.
+You extract durable facts from a chat conversation into JSON.
 
-Your task is to read a short conversation excerpt and identify any
-DURABLE FACTS that are worth remembering across future sessions.
-A durable fact is any piece of information that:
+DURABLE = true beyond this chat AND useful in a LATER chat.
+Extract: names, identities, preferences, personal facts, decisions,
+         procedures, relationships, skills, constraints.
+Skip ONLY: pure greetings, pure acknowledgements ("thanks", "ok"),
+            transient states ("I'm tired now"),
+            and requests already fulfilled in this same turn.
 
-  * will remain true beyond this conversation, AND
-  * would be useful to recall in a LATER conversation.
+IMPORTANT: A message may contain BOTH a greeting AND durable facts.
+Extract the facts EVEN IF the message starts with a greeting.
+Example: "Hi, I'm Alice and I love coffee"
+         -> extract "name is Alice" AND "loves coffee".
+         Do NOT skip the whole message just because it opens with
+         a greeting.
 
-Do NOT extract:
-  * transient states ("I'm hungry right now"),
-  * greetings or small talk,
-  * requests that were fulfilled in this turn (unless the request
-    itself encodes a durable preference),
-  * content that only makes sense within this specific turn.
+Max {max_candidates} candidates. Empty array valid only if the
+message is PURELY greeting/acknowledgement with zero durable content.
 
-Extract at most {max_candidates} candidates. Prefer FEWER, HIGHER
-quality candidates over many marginal ones.
+LANGUAGE: same as source (AR/RU/EN). Do not translate.
 
-Language
---------
-Extract the memory content in the SAME LANGUAGE as the source
-message (Arabic, Russian, or English). If the source mixes
-languages, use the dominant one. Do NOT translate.
+EVIDENCE: every candidate MUST have `evidence.snippet` set to an
+EXACT VERBATIM substring of the source message. Copy the exact
+characters -- no paraphrase, no translation, no typo fixes, no
+edits of any kind. If you cannot find an exact quote, omit the
+candidate entirely.
 
-Memory types (pick exactly one per candidate)
----------------------------------------------
-  * "semantic"    -- timeless facts about the world or the user
-  * "episodic"    -- events with a specific time reference
-  * "procedural"  -- reusable procedures or workflows
-  * "preference"  -- user tastes, defaults, or constraints
-  * "decision"    -- accepted decisions with their rationale
+Return ONLY this JSON object. The example below shows the exact
+JSON structure you must produce (values are illustrative):
 
-Evidence -- MANDATORY AND VERBATIM
-----------------------------------
-Every candidate MUST include an `evidence` object pointing at the
-EXACT substring of the source message that justifies the memory.
+{{"candidates": [
+  {{
+    "content": "<memory text in SOURCE language>",
+    "memory_type": "semantic",
+    "importance": 75,
+    "confidence": 0.9,
+    "tags": ["tag1", "tag2"],
+    "evidence": {{
+      "turn_index": 0,
+      "snippet": "<EXACT verbatim substring from source>",
+      "message_role": "user"
+    }}
+  }}
+]}}
 
-evidence.snippet MUST be a VERBATIM substring of the original
-message content:
-  * Do NOT paraphrase.
-  * Do NOT summarize.
-  * Do NOT translate.
-  * Do NOT correct typos.
-  * Copy-paste the EXACT text, whitespace preserved.
-  * Keep the snippet UNDER 200 characters.
-  * If you cannot find an exact quote, OMIT the evidence (the
-    candidate will be rejected).
+MANDATORY RULES (violating any rejects the candidate):
+- LANGUAGE: content and snippet MUST be in the SAME language
+  as the source message. Arabic source -> Arabic output.
+  English source -> English output. NEVER translate.
+- VERBATIM: snippet MUST be copied CHARACTER-BY-CHARACTER
+  from the source message.
+- DO NOT invent facts. Only extract what is literally stated.
+- importance: integer 0-100 (e.g., 75). Do NOT use 0.
+- confidence: number 0.0-1.0 (e.g., 0.9). Do NOT use 0.0.
+- tags: short lowercase keywords.
+- turn_id: OMIT this field entirely. It is optional and you
+  must not include it.
+- Do NOT copy the example values literally. Replace
+  <memory text...> and <EXACT...> with actual text from the
+  source.
 
-The evidence object also records:
-  * "turn_index"    -- 0-based index of the turn in the input
-  * "message_role"  -- "user" or "assistant" (which side said it)
-  * "turn_id"       -- optional; include if the input provides it
-
-DO NOT:
-  * invent quotes that are not present verbatim in the source,
-  * cite multiple messages in a single evidence snippet,
-  * return anything except a JSON object.
-
-Output format
--------------
-Return ONLY a JSON object matching this exact schema:
-
-{json_schema}
-
-The top-level object MUST have a single key, "candidates", whose
-value is a JSON array. An empty array means "nothing worth
-extracting from this excerpt" -- this is a VALID and common
-result. Do NOT pad the array with low-confidence guesses.
+Output JSON only. Start with `{{`, end with `}}`.
 """
 
 
 # ---------------------------------------------------------------------------
-# JSON schema
+# JSON schema (for response_format; no per-field descriptions)
 # ---------------------------------------------------------------------------
 
 
@@ -176,11 +193,6 @@ EXTRACTION_JSON_SCHEMA: dict = {
                             "type": "string",
                             "minLength": 1,
                             "maxLength": 2000,
-                            "description": (
-                                "The memory text, in the source "
-                                "language. One self-contained "
-                                "sentence or short paragraph."
-                            ),
                         },
                         "memory_type": {
                             "type": "string",
@@ -228,11 +240,6 @@ EXTRACTION_JSON_SCHEMA: dict = {
                                     "type": "string",
                                     "minLength": 3,
                                     "maxLength": 200,
-                                    "description": (
-                                        "VERBATIM substring of "
-                                        "the source message. "
-                                        "No paraphrase."
-                                    ),
                                 },
                                 "message_role": {
                                     "type": "string",
@@ -246,22 +253,14 @@ EXTRACTION_JSON_SCHEMA: dict = {
         },
     },
 }
-"""Machine-readable JSON schema for the extraction response.
+"""Machine-readable JSON schema for providers that support structured
+output (OpenAI-style ``response_format``). No per-field
+``description`` strings -- those were redundant with the inline
+example in the prompt and cost ~600 tokens when pretty-printed.
 
-The shape is STRICT on the LLM's output so that:
-
-  * every required field is guaranteed present (so the parser
-    never has to invent defaults),
-  * the `memory_type` enum is enforced at the model level
-    (never trust the LLM to spell "preference" correctly),
-  * the `evidence.snippet` length cap is declared as a schema
-    constraint so capable models respect it during generation
-    (belt-and-suspenders with the validator's own cap).
-
-The `name` and `strict` fields match OpenAI's structured-output
-API convention. Other providers ignore them; the gateway decides
-whether to pass the schema as `response_format` or embed it into
-the prompt.
+The prompt itself is the source of truth for the model. This schema
+is ONLY used as the wire-format contract for providers that accept
+a schema.
 """
 
 
@@ -276,24 +275,17 @@ def build_extraction_system_prompt(
 ) -> str:
     """Return the system prompt with runtime substitutions applied.
 
-    The prompt contains two format placeholders:
+    Only one placeholder is substituted now: ``{max_candidates}``.
+    The schema is inline in the prompt (as a JSON example) --
+    embedding it separately as pretty-printed JSON was costing
+    ~600 tokens and pushing small models into confusion.
 
-      * ``{max_candidates}`` -- the hard cap on output candidates
-        (from ``MemoryAISettings.max_candidates_per_job``),
-      * ``{json_schema}`` -- the schema, rendered as pretty JSON.
-
-    Both are substituted here in ONE place so the prompt itself
-    stays a literal string. A future change to the schema
-    automatically flows into the prompt; a future change to the
-    cap flows in from settings.
+    The doubled braces (``{{`` / ``}}``) are Python ``str.format``
+    escapes for literal ``{`` / ``}`` characters -- the inline
+    JSON example needs them to survive ``.format()`` unchanged.
     """
-    import json as _json
-    schema_str = _json.dumps(
-        EXTRACTION_JSON_SCHEMA["schema"], indent=2
-    )
     return EXTRACTION_SYSTEM_PROMPT.format(
         max_candidates=int(max_candidates),
-        json_schema=schema_str,
     )
 
 

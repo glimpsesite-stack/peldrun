@@ -113,7 +113,7 @@ Design invariants
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -306,6 +306,46 @@ class MemoryAIExtractionSettings(BaseModel):
             "``asyncio.wait_for``. 45s matches the plan's "
             "default; the range allows 5s (very fast local "
             "models) up to 180s (slow reasoning models)."
+        ),
+    )
+
+    # ------------------------- reasoning control ------------------------
+    #
+    # Provider-neutral reasoning-disablement payload forwarded verbatim
+    # as ``extra_body`` to the OpenAI-compatible transport used by the
+    # extraction gateway. Reasoning-capable models (Nemotron, Qwen-QwQ,
+    # DeepSeek-R1, OpenAI o-series, ...) emit a hidden "thinking" phase
+    # BEFORE any visible token -- and each provider spells the disable
+    # switch differently. This field is the OPERATOR-VISIBLE place to
+    # declare which spelling their provider expects, so no provider
+    # name is ever hard-coded inside the gateway.
+    #
+    # Defaults to the vLLM/LM Studio convention (the most common way to
+    # host reasoning models locally, and honored by vLLM, SGLang, TGI,
+    # LM Studio, and most OpenAI-compatible proxies). Operators using a
+    # different provider change this via ``PATCH /api/memory/settings``:
+    #
+    #   OpenAI o-series:    {"reasoning": {"effort": "none"}}
+    #   DeepSeek:           {"thinking": {"type": "disabled"}}
+    #   SiliconFlow/AliYun: {"enable_thinking": false}
+    #   OpenRouter:         {"reasoning": {"effort": "none"}}
+    #
+    # An empty dict disables the extra_body entirely (useful for
+    # non-reasoning models, so the SDK sends nothing the provider
+    # might reject).
+    extraction_extra_body: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        description=(
+            "Provider-specific extra_body forwarded verbatim to the "
+            "extraction LLM call. Used to DISABLE the reasoning / "
+            "thinking phase on reasoning-capable models (e.g. "
+            "Nemotron, Qwen-QwQ, DeepSeek-R1, OpenAI o-series). "
+            "Defaults to the vLLM/LM Studio convention "
+            "(``chat_template_kwargs.enable_thinking=false``). "
+            "Change the default via the settings API to match your "
+            "provider's spelling. Empty dict disables the extra_body."
         ),
     )
 

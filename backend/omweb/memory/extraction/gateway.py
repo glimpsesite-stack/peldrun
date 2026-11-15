@@ -317,7 +317,10 @@ TransportFn = Callable[..., Awaitable[LLMStructuredResponse]]
 
 
 _DEFAULT_TIMEOUT_SECONDS: int = 45
-_DEFAULT_MAX_OUTPUT_TOKENS: int = 1200
+# 800 tokens is enough for ~20 compact candidates. 1200 was wasted
+# budget for reasoning loops (a stuck model produces thousands of
+# "thinking" tokens before ever outputting JSON).
+_DEFAULT_MAX_OUTPUT_TOKENS: int = 800
 
 
 class MemoryModelGateway:
@@ -350,6 +353,8 @@ class MemoryModelGateway:
         self,
         *,
         transport: Optional[TransportFn] = None,
+        force_openai_compat: bool = False,
+        extraction_extra_body: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Parameters
@@ -357,11 +362,37 @@ class MemoryModelGateway:
         transport
             Optional callable that performs the actual LLM
             invocation. When ``None``, the gateway uses
-            ``_default_transport`` (which, in Phase 1-B, raises
-            ``NotImplementedError`` -- Phase 1-C will fill it
-            in). Tests ALWAYS inject a transport.
+            ``_default_transport``. Tests ALWAYS inject a
+            transport.
+        force_openai_compat
+            When True (default for extraction), the transport uses
+            ``OpenAICompatProvider`` directly through the public
+            ``peldrun.llm.providers.openai_compat`` API, bypassing
+            the chat-side native-adapter bridge entirely. This is
+            the hermetic path: no dependency on
+            ``provider_factory``'s adapter-upgrade logic, no
+            ``LLMRequest`` construction, no capability resolver.
+            The SAME ``AsyncOpenAI`` SDK and the SAME wire
+            parameters (``reasoning_effort``, ``extra_body``) that
+            the chat path supports are used, so extraction and chat
+            share the SDK without sharing code.
+            When False, falls through to the legacy
+            ``provider_factory`` path for advanced users who need
+            provider-specific adapter quirks.
+        extraction_extra_body
+            Provider-neutral reasoning-disablement payload
+            forwarded verbatim as ``extra_body`` to the
+            OpenAI-compatible transport. Populated from
+            ``MemoryAIExtractionSettings.extraction_extra_body``
+            -- see its docstring for the operator-facing semantics
+            and per-provider spellings. When empty, the extra_body
+            is omitted entirely (correct for non-reasoning models).
         """
         self._transport = transport
+        self._force_openai_compat = bool(force_openai_compat)
+        self._extraction_extra_body = dict(
+            extraction_extra_body or {}
+        )
 
     async def generate_structured(
         self,
@@ -525,6 +556,36 @@ class MemoryModelGateway:
                 api_key=api_key,
             )
         )
+
+        # --- NEW BRANCH: independent OpenAI-compat transport ----
+        #
+        # Extraction runs through a HERMETIC path that shares only
+        # the public SDK surface with the chat path. It does NOT
+        # touch ``provider_factory``, ``LLMRequest``, the capability
+        # resolver, or the native-adapter upgrade logic -- those are
+        # chat concerns (tool calls, streaming, multimodal) that
+        # extraction does not need and that have historically caused
+        # subtle bugs (native-adapter 404s, reasoning loops on
+        # models that emit ``reasoning_content`` before ``content``).
+        #
+        # The chat path is untouched: it continues to use
+        # ``provider_factory`` via ``dispatcher``. Extraction and
+        # chat share the SDK (``AsyncOpenAI``) and the wire
+        # parameters (``reasoning_effort``, ``extra_body``) without
+        # sharing code -- so a change to one can never break the
+        # other.
+        if self._force_openai_compat:
+            return await self._transport_via_openai_compat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                provider_id=provider_id,
+                model_id=model_id,
+                resolved_base_url=resolved_base_url,
+                resolved_api_key=resolved_api_key,
+                max_output_tokens=max_output_tokens,
+                timeout_seconds=timeout_seconds,
+                connection_id=connection_id,
+            )
 
         # --- Step 2: resolve native adapter upgrade -------------
         #
@@ -815,6 +876,234 @@ class MemoryModelGateway:
             cost_nano_usd = 0
 
         # --- Step 7: parse JSON ---------------------------------
+        raw_text = getattr(response, "content", "") or ""
+        parsed = parse_llm_json(raw_text)
+
+        return LLMStructuredResponse(
+            parsed=parsed,
+            raw_text=raw_text,
+            cost_nano_usd=cost_nano_usd,
+            input_tokens=(
+                int(getattr(usage, "input_tokens", 0) or 0)
+                if usage else 0
+            ),
+            output_tokens=(
+                int(getattr(usage, "output_tokens", 0) or 0)
+                if usage else 0
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Hermetic OpenAI-compat transport (extraction default)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_openai_compat_base_url(
+        url: Optional[str],
+    ) -> Optional[str]:
+        """Strip native API paths so ``OpenAICompatProvider`` works.
+
+        Design rationale
+        ----------------
+        Many local servers expose BOTH a native API and an
+        OpenAI-compatible API under the SAME host:
+
+          LM Studio:  native at ``/api/v1/*``  | compat at ``/v1/*``
+          vLLM:       native at ``/api/*``     | compat at ``/v1/*``
+          Ollama:     native at ``/api/*``     | compat at ``/v1/*``
+          TGI/SGLang: native at ``/api/*``     | compat at ``/v1/*``
+
+        The vault stores the URL the user configured -- most often
+        the NATIVE one (``http://host:port/api/v1``), because the
+        chat dispatcher upgrades it to a native adapter that appends
+        ``/chat`` (correct for native).
+
+        Extraction uses ``OpenAICompatProvider``, which appends
+        ``/chat/completions`` to ``base_url``. Passing the native
+        URL verbatim produces ``/api/v1/chat/completions`` -- which
+        every one of the servers above rejects with "unknown
+        endpoint".
+
+        This helper strips the trailing native segment (``/api/v1``,
+        ``/api/v0``, or ``/api``) so ``OpenAICompatProvider`` can
+        append ``/v1`` and hit the compat endpoint. It is NOT
+        provider-specific: no name, no port, no marker matching.
+        It is a STRUCTURAL normalization based on the well-known
+        native-vs-compat URL convention every OpenAI-compatible
+        server follows.
+
+        When the URL does NOT end with a native segment (``/v1``
+        alone, or a bare host), it is returned unchanged and
+        ``OpenAICompatProvider``'s existing ``/v1`` detection
+        takes over.
+        """
+        if not url:
+            return url
+        clean = url.rstrip("/")
+        # Ordered longest-first so /api/v1 wins over /api.
+        for native_suffix in ("/api/v1", "/api/v0", "/api"):
+            if clean.endswith(native_suffix):
+                return clean[: -len(native_suffix)] or None
+        return clean
+
+    async def _transport_via_openai_compat(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        provider_id: str,
+        model_id: str,
+        resolved_base_url: Optional[str],
+        resolved_api_key: Optional[str],
+        max_output_tokens: int,
+        timeout_seconds: int,
+        connection_id: str,
+    ) -> LLMStructuredResponse:
+        """Extraction transport built on the public OpenAI-compat API.
+
+        This is the path invoked when ``force_openai_compat=True``
+        (the extraction default). It reaches the wire through the
+        SAME components the chat path uses as a fallback:
+
+          * ``OpenAICompatProvider`` (from
+            ``peldrun.llm.providers.openai_compat``) -- the public
+            class that wraps ``AsyncLLMClient``.
+          * ``AsyncLLMClient.chat_completion`` -- already handles
+            ``reasoning_effort`` and forwards ``extra_body`` to the
+            OpenAI SDK.
+
+        Every component is imported from its PUBLIC module. Nothing
+        internal to the chat path is reached, patched, or extended.
+        A future change to ``provider_factory``, to the native
+        adapters, or to ``LLMRequest`` cannot affect this method.
+
+        Reasoning disablement
+        ---------------------
+        ``self._extraction_extra_body`` is forwarded verbatim as
+        ``extra_body`` (see ``MemoryAIExtractionSettings.
+        extraction_extra_body``). When non-empty,
+        ``reasoning_effort="none"`` is ALSO set so that
+        ``AsyncLLMClient.chat_completion`` enters the branch that
+        forwards ``extra_body`` to the SDK (see client.py: the
+        branch is guarded by ``if effort ...``). This is the exact
+        mechanism the chat path uses to control reasoning -- we are
+        reusing it, not modifying it.
+
+        Cost tracking
+        -------------
+        ``default_tracker.complete`` records the invocation in
+        ``token_ledger``. The ``provider`` field is the ORIGINAL
+        ``provider_id`` (e.g. ``"gigachat"``, ``"nvidia"``) so
+        pricing lookup by ``provider`` works -- not the internal
+        adapter class name ``"openai_compat"``.
+        """
+        import time
+        import uuid
+
+        from peldrun.llm.client import LLMConfig, LLMResponse
+        from peldrun.llm.providers.openai_compat import (
+            OpenAICompatProvider,
+        )
+
+        # Normalize the vault's canonical base_url into an
+        # OpenAI-compat-compatible one (see
+        # _normalize_openai_compat_base_url for the rationale).
+        # Without this, native-URL providers (LM Studio, vLLM,
+        # Ollama) return 404 because OpenAICompatProvider appends
+        # /chat/completions to /api/v1 instead of /v1.
+        openai_compat_base_url = self._normalize_openai_compat_base_url(
+            resolved_base_url
+        )
+
+        adapter = OpenAICompatProvider(
+            config=LLMConfig(
+                model=model_id,
+                base_url=openai_compat_base_url,
+                api_key=resolved_api_key,
+                timeout=float(timeout_seconds),
+                max_tokens=int(max_output_tokens),
+                temperature=0.0,
+            )
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # Reasoning disablement: operator-configured extra_body from
+        # settings; reasoning_effort="none" is set ONLY when
+        # extra_body is non-empty, matching the semantics the chat
+        # path already implements (client.py forwards extra_body
+        # only inside the reasoning_effort branch).
+        generate_kwargs: Dict[str, Any] = {}
+        if self._extraction_extra_body:
+            generate_kwargs["extra_body"] = dict(
+                self._extraction_extra_body
+            )
+            generate_kwargs["reasoning_effort"] = "none"
+
+        start_time = time.time()
+        try:
+            response: LLMResponse = await asyncio.wait_for(
+                adapter.generate(messages=messages, **generate_kwargs),
+                timeout=float(timeout_seconds),
+            )
+        except asyncio.TimeoutError as exc:
+            raise LLMTransportError(
+                f"LLM call timed out after {timeout_seconds}s",
+                provider_id=provider_id,
+                model_id=model_id,
+                cause=exc,
+            ) from exc
+        except LLMTransportError:
+            raise
+        except Exception as exc:
+            raise LLMTransportError(
+                f"Provider call failed: {exc}",
+                provider_id=provider_id,
+                model_id=model_id,
+                cause=exc,
+            ) from exc
+        finally:
+            try:
+                await adapter.close()
+            except Exception:
+                pass
+
+        # --- Accounting -----------------------------------------
+        usage = getattr(response, "usage", None)
+        cost_nano_usd = 0
+        try:
+            from peldrun.llm.accounting import (
+                InvocationContext,
+                default_tracker,
+            )
+            record = await default_tracker.complete(
+                response=response,
+                context=InvocationContext(
+                    provider=provider_id,
+                    model_requested=model_id,
+                    mode="extraction",
+                    job_id=connection_id,
+                    chat_id=None,
+                    project_id=None,
+                    turn_id=None,
+                    base_url=resolved_base_url or "",
+                ),
+                started_at=start_time,
+                invocation_id=f"inv_extract_{uuid.uuid4().hex[:10]}",
+            )
+            cost_nano_usd = int(
+                getattr(record, "cost_nano_usd", 0) or 0
+            )
+        except Exception as exc:
+            logger.warning(
+                "Extraction transport: cost tracking failed "
+                "(using 0): %s", exc,
+            )
+
+        # --- Parse JSON -----------------------------------------
         raw_text = getattr(response, "content", "") or ""
         parsed = parse_llm_json(raw_text)
 

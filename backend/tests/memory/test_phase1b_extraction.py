@@ -375,7 +375,7 @@ async def test_T5_mock_gateway_success(
     # the orchestrator built.
     assert len(transport.captured) == 1
     captured = transport.captured[0]
-    assert "memory extraction assistant" in captured["system_prompt"]
+    assert "durable facts" in captured["system_prompt"]
     assert "=== Turn 1 ===" in captured["user_prompt"]
     assert "=== Turn 2 ===" in captured["user_prompt"]
     assert captured["provider_id"] == "openai"

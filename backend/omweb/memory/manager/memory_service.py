@@ -1277,8 +1277,24 @@ class MemoryService:
                 )
                 transport = None
 
+        # Resolve extraction_extra_body from the CURRENT settings so
+        # that PATCH /api/memory/settings + reload_settings rebuilds
+        # the gateway with the operator's preferred payload.
+        _extraction_extra_body = dict(
+            getattr(
+                getattr(settings, "extraction", None),
+                "extraction_extra_body",
+                {},
+            )
+            or {}
+        )
+
         if transport is not None:
-            gateway = MemoryModelGateway(transport=transport)
+            gateway = MemoryModelGateway(
+                transport=transport,
+                force_openai_compat=True,
+                extraction_extra_body=_extraction_extra_body,
+            )
             self._has_real_transport = True
             logger.info(
                 "MemoryService: extraction gateway wired with "
@@ -1286,7 +1302,10 @@ class MemoryService:
             )
         elif self._transport_provider is not None:
             # Provider supplied but returned None -> explicit opt-out.
-            gateway = MemoryModelGateway()
+            gateway = MemoryModelGateway(
+                force_openai_compat=True,
+                extraction_extra_body=_extraction_extra_body,
+            )
             self._has_real_transport = False
             logger.info(
                 "MemoryService: transport_provider returned None -- "
@@ -1295,7 +1314,10 @@ class MemoryService:
         else:
             # No provider supplied. Default transport is REAL
             # (peldrun.llm-backed). Worker starts.
-            gateway = MemoryModelGateway()
+            gateway = MemoryModelGateway(
+                force_openai_compat=True,
+                extraction_extra_body=_extraction_extra_body,
+            )
             self._has_real_transport = True
             logger.info(
                 "MemoryService: extraction gateway using DEFAULT "
@@ -1762,12 +1784,25 @@ class MemoryService:
             return
 
         try:
-            from omweb.memory.monitoring.memory_usage import (
-                get_memory_usage_tracker,
+            from omweb.memory.monitoring import (
+                get_memory_accounting_bridge,
             )
 
-            tracker = get_memory_usage_tracker()
-            await tracker.record(
+            # Use the bridge (NOT the tracker) so that the
+            # memory token count is BOTH written to the
+            # memory_usage_ledger AND registered as a
+            # one-shot pending value for the next
+            # LLMInvocationRecord (see
+            # ``MemoryAccountingBridge.record_retrieval``).
+            #
+            # Using ``tracker.record()`` directly would write
+            # the ledger row but leave
+            # ``LLMInvocationRecord.memory_tokens_used`` at
+            # ``None`` for every run -- which defeats the
+            # per-invocation memory attribution that Phase 2
+            # task 2.3 requires.
+            bridge = get_memory_accounting_bridge()
+            await bridge.record_retrieval(
                 run_id=run_id.strip(),
                 context=context,
                 chat_id=chat_id,

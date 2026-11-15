@@ -92,6 +92,35 @@ Design invariants
    When either side is missing, the check is skipped. This
    avoids failing validation on sessions written before
    turn_ids were recorded.
+
+6. **Chat-mode fallback MUST mirror the orchestrator.**
+   The orchestrator (``_prepare_from_session_json``) and the
+   validator both apply a fallback to session-level
+   ``prompt`` / ``result`` when the turn's per-turn fields
+   are empty AND the turn is the last one. This fallback
+   exists because ``dispatcher.run_direct_chat`` writes the
+   user prompt and assistant reply to the SESSION top level,
+   not to ``turns[]``.
+
+   **The two fallbacks MUST stay byte-for-byte identical.**
+   If the orchestrator uses the fallback and the validator
+   does not, the LLM sees text the validator cannot locate
+   -> every candidate is rejected with
+   ``turn_index_out_of_range``. If the validator uses a
+   DIFFERENT fallback (e.g. checks every turn, not just the
+   last), it accepts snippets the orchestrator never showed
+   the LLM, defeating the audit trail.
+
+   Any change to the fallback logic in one file REQUIRES the
+   same change in the other. The Phase 1-C acceptance test
+   ``test_T5_mock_gateway_success`` exercises this path
+   end-to-end and will fail loudly if the two drift apart.
+
+   Phase 2+ migration path: eliminate the session-level
+   fallback entirely by writing per-turn user/assistant
+   content to ``session.json["turns"][i]["user"]`` at
+   dispatch time. When that lands, remove the fallback here
+   AND in the orchestrator in the same commit.
 """
 
 from __future__ import annotations
@@ -474,7 +503,46 @@ class EvidenceValidator:
                 raise ValueError(
                     f"turn at index {evidence.turn_index} is not a dict"
                 )
-            return _get_turn_field(turn, evidence.message_role)
+
+            # First attempt: canonical per-turn fields.
+            text, actual_role = _get_turn_field(
+                turn, evidence.message_role
+            )
+            if text:
+                return text, actual_role
+
+            # Fallback: chat-mode sessions written by
+            # ``dispatcher.run_direct_chat`` (and its ancestors)
+            # store the most recent user/assistant exchange at the
+            # SESSION level (``session["prompt"]`` /
+            # ``session["result"]``), while ``turns[]`` carries
+            # ONLY metadata (turn_id, timestamp, usage). Without
+            # this fallback, the validator would report
+            # ``turn_index_out_of_range`` for every candidate the
+            # LLM produces, even though the LLM SAW the text
+            # (``ExtractionOrchestrator._prepare_from_session_json``
+            # uses the same fallback when building the prompt).
+            #
+            # The fallback fires ONLY for the LAST turn (matching
+            # the orchestrator's exact behavior). Earlier turns
+            # have no accessible content until the write path
+            # stores per-turn user/assistant text (a future fix
+            # tracked separately).
+            is_last_turn = evidence.turn_index == len(turns) - 1
+            if not is_last_turn:
+                return "", actual_role
+
+            fallback_user = str(source.get("prompt") or "")
+            fallback_assistant = str(source.get("result") or "")
+
+            if evidence.message_role == "user":
+                return fallback_user, "user"
+            if evidence.message_role == "assistant":
+                return fallback_assistant, "assistant"
+            # Unknown role: combine both, same separator as
+            # ``_get_turn_field``.
+            combined = f"{fallback_user}\n{fallback_assistant}"
+            return combined, "user+assistant"
 
         if recommended_source == "session_context_json":
             conversation = source.get("conversation")

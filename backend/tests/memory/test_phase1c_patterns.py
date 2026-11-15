@@ -17,6 +17,29 @@ covered T5/T6/T11/T13):
     T16  -- batch -> every pending session, skip processed
     T18  -- session changed mid-flight -> SESSION_CHANGED
 
+Legacy vs Hermetic transport
+----------------------------
+The ``test_real_transport_*`` tests at the bottom of this file
+exercise the LEGACY transport path (``force_openai_compat=False``,
+which routes through ``provider_factory.create``). Extraction
+production uses the HERMETIC path
+(``force_openai_compat=True``, which uses ``OpenAICompatProvider``
+directly). Both paths are legitimate and tested independently:
+
+  * Legacy   -> ``test_real_transport_*`` (this file)
+  * Hermetic -> ``test_phase1b_reasoning_disable.py``
+
+The hermetic path was introduced to solve a specific production
+bug: reasoning-capable models (Nemotron, Qwen-QwQ, DeepSeek-R1)
+emitted a hidden "thinking" phase that looped indefinitely on
+Arabic content, and the legacy path could not pass ``extra_body``
+to the SDK (because ``client.py``'s ``config.extra_params`` is
+dead code — it is never read). Rather than patch ``client.py``
+(a chat-owned file), extraction uses ``OpenAICompatProvider``
+directly with ``reasoning_effort="none"`` and ``extra_body`` —
+both of which are PUBLIC kwargs that ``client.py`` already
+supports.
+
 Design notes
 ------------
 
