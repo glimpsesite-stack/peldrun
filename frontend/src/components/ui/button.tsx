@@ -1,7 +1,7 @@
 ﻿import React from "react";
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: "primary" | "secondary" | "outline" | "glow" | "ghost" | "danger" | "destructive" | "save" | "rb";
+  variant?: "primary" | "secondary" | "outline" | "glow" | "ghost" | "danger" | "destructive" | "save" | "rb" | "nonestyle";
   size?: "sm" | "md" | "lg";
   children?: React.ReactNode;
 }
@@ -20,6 +20,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
       destructive: "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-peldrun-xs",
       save: "bg-[#101010] text-[#fff] hover:text-primary-foreground hover:bg-primary/90 shadow-peldrun-xs",
       rb: "border border-rb bg-rb hover:bg-rb/90 text-[#fff] shadow-peldrun-xs",
+      nonestyle: "nonestyle",
     };
 
     const sizes: Record<string, string> = {

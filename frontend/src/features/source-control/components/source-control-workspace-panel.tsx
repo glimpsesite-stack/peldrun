@@ -227,17 +227,17 @@ export function SourceControlWorkspacePanel({
           )}
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-0.5 shrink-0">
           <Button
-            variant="ghost"
+            variant="nonestyle"
             size="sm"
             onClick={handleRefresh}
             disabled={refreshing}
-            className="h-7 w-7 p-0 text-[#fff] hover:text-foreground"
+            className="text-[#fff] hover:text-green-400"
             title="Refresh source control data"
           >
             <RefreshCw
-              size={12}
+              size={15}
               className={refreshing ? "animate-spin text-[#fff]" : ""}
             />
           </Button>
@@ -268,11 +268,12 @@ export function SourceControlWorkspacePanel({
             <button
               type="button"
               onClick={onClose}
-              className="p-1 rounded hover:bg-muted"
+              className="nonestyle"
               title="Close"
               aria-label="Close"
+
             >
-              <X className="w-3.5 h-3.5 text-muted-foreground" />
+              <X className=" text-muted " size={14} />
             </button>
           )}
         </div>

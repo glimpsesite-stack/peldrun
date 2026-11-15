@@ -188,7 +188,8 @@ export function SourceControlPanel({
           <AgentModePanel key={`agent-${reloadKey}`} />
         </div>
         <div className={mode === "manual" ? "h-full" : "hidden"}>
-          <ManualModePanel />
+          {/* Added reloadKey so the panel resets and re-fetches upon reconnection */}
+          <ManualModePanel key={`manual-${reloadKey}`} />
         </div>
         <div className={mode === "browse" ? "h-full" : "hidden"}>
           <BrowsePanel key={`browse-${reloadKey}`} chatId={resolvedChatId} />
