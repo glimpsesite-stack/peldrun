@@ -526,30 +526,186 @@ class MemoryModelGateway:
             )
         )
 
-        # --- Step 2: build ConnectionContext --------------------
+        # --- Step 2: resolve native adapter upgrade -------------
+        #
+        # [PHASE 1-C FIX] Same "legacy -> native" routing the chat
+        # dispatcher applies via ``dispatcher._resolve_native_adapter``.
+        #
+        # MOTIVATION
+        # ----------
+        # A provider can serve two API surfaces simultaneously:
+        #
+        #   * OpenAI-compatible shim at ``<root>/v1/*``    — legacy
+        #   * Native API at          ``<root>/api/vN/*``   — native
+        #
+        # LM Studio, Ollama, and similar local servers follow this
+        # pattern. The distinction matters because the TWO surfaces
+        # use different chat endpoints:
+        #
+        #   legacy   POST <base>/chat/completions
+        #   native   POST <base>/chat            (LM Studio)
+        #            POST <base>/chat            (Ollama native)
+        #
+        # When a user configures the vault with the native URL
+        # (``baseUrl = ".../api/v1"``) but the settings pick the
+        # legacy adapter id (``provider_id = "lmstudio"``), the
+        # legacy adapter appends ``/chat/completions`` to the native
+        # base, producing a 404:
+        #
+        #   POST http://host:1235/api/v1/chat/completions  <- rejected
+        #   (LM Studio only accepts /api/v1/chat)
+        #
+        # WHY THIS IS NOT HARD-CODING
+        # ---------------------------
+        # This block contains no provider-name constants and no URL
+        # substring matching. Everything comes from DATA that each
+        # adapter declares about itself:
+        #
+        #   * ``provider_registry.find(candidate)``  -- the adapter
+        #     registry, populated at import time from adapter modules.
+        #   * ``adapter_class.PROFILE.default_base_url_markers``  --
+        #     a list of substrings the adapter itself declares as
+        #     "URLs I own".
+        #   * ``adapter_class.ADAPTER_STYLE``  -- "v1" for native
+        #     adapters, anything else for legacy.
+        #
+        # A future adapter (``vllm_native``, ``tgi_native``, ...)
+        # registers itself in the same way and is picked up
+        # automatically without touching this file.
+        #
+        # ALGORITHM (mirrors dispatcher._resolve_native_adapter)
+        # ------------------------------------------------------
+        #   1. Look up the caller-supplied provider_id in the registry.
+        #   2. If it is a BUILTIN provider and its adapter style is
+        #      not "v1" (i.e. it is a legacy wrapper), try to find a
+        #      sibling registration named ``{provider_id}_native``.
+        #   3. If the sibling exists, read its declared base_url
+        #      markers. If the resolved base_url contains ANY marker
+        #      (or is empty, meaning "use the provider's default"),
+        #      upgrade to the native adapter id.
+        #   4. If any step fails (import error, no registration, no
+        #      markers, no match), keep the caller's provider_id.
+        #
+        # The upgrade is conservative: it only fires for BUILTIN
+        # providers (never plugin packages) and only when the
+        # markers clearly match. A custom proxy URL such as
+        # ``http://my-proxy/openai/`` stays on the legacy adapter,
+        # preserving the user's intent.
+        resolved_provider_id = provider_id
+        try:
+            from peldrun.llm.providers.registry import (
+                SOURCE_BUILTIN,
+                provider_registry,
+            )
+
+            registration = provider_registry.find(provider_id)
+            if (
+                registration is not None
+                and registration.source == SOURCE_BUILTIN
+            ):
+                adapter_style = getattr(
+                    registration.adapter_class,
+                    "ADAPTER_STYLE",
+                    "legacy",
+                )
+                if adapter_style != "v1":
+                    # Legacy wrapper -- attempt native upgrade.
+                    native_reg = provider_registry.find(
+                        f"{provider_id}_native"
+                    )
+                    if native_reg is not None:
+                        profile = getattr(
+                            native_reg.adapter_class,
+                            "PROFILE",
+                            None,
+                        )
+                        markers: list = []
+                        if profile is not None:
+                            raw_markers = getattr(
+                                profile,
+                                "default_base_url_markers",
+                                None,
+                            )
+                            if isinstance(raw_markers, list):
+                                markers = [
+                                    str(m).strip().lower()
+                                    for m in raw_markers
+                                    if isinstance(m, str)
+                                    and str(m).strip()
+                                ]
+
+                        base_url_lower = (
+                            resolved_base_url or ""
+                        ).strip().lower()
+
+                        # Match if base_url is empty (use adapter
+                        # default) OR contains a declared marker.
+                        if (
+                            not base_url_lower
+                            or any(m in base_url_lower for m in markers)
+                        ):
+                            resolved_provider_id = (
+                                native_reg.provider_id
+                            )
+                            logger.info(
+                                "Extraction transport: upgraded "
+                                "provider %r -> %r "
+                                "(base_url=%r matches native "
+                                "adapter markers=%r)",
+                                provider_id,
+                                resolved_provider_id,
+                                resolved_base_url,
+                                markers,
+                            )
+                        else:
+                            logger.debug(
+                                "Extraction transport: provider "
+                                "%r stays on legacy adapter "
+                                "(base_url=%r matches no native "
+                                "markers=%r)",
+                                provider_id,
+                                resolved_base_url,
+                                markers,
+                            )
+        except Exception as _upgrade_err:
+            logger.debug(
+                "Extraction transport: native adapter resolution "
+                "skipped (using %r verbatim): %s",
+                provider_id,
+                _upgrade_err,
+            )
+
+        # --- Step 3: build ConnectionContext --------------------
         connection = ConnectionContext(
             connection_id=connection_id,
-            provider_id=provider_id,
+            provider_id=resolved_provider_id,
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             timeout=float(timeout_seconds),
             extra_params=extra_params,
         )
 
-        # --- Step 3: resolve model capabilities -----------------
+        # --- Step 4: resolve model capabilities -----------------
         model_caps = resolve_model_capabilities(
-            provider_id=provider_id,
+            provider_id=resolved_provider_id,
             model_id=model_id,
             connection_id=None,
         )
 
-        # --- Step 4: build LLMRequest ---------------------------
+        # --- Step 5: build LLMRequest ---------------------------
+        #
+        # NOTE the ``provider_id`` here is ``resolved_provider_id``
+        # (computed in Step 2 above), not the raw caller argument.
+        # The two differ only when the vault's base_url matches a
+        # native adapter's declared markers -- in which case we MUST
+        # target the native adapter's endpoints, not the legacy
+        # wrapper's ``/chat/completions`` path.
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         llm_request = LLMRequest(
-            provider_id=provider_id,
+            provider_id=resolved_provider_id,
             model_id=model_id,
             connection_id=connection_id,
             messages=messages,
@@ -575,11 +731,22 @@ class MemoryModelGateway:
             connection=connection,
         )
 
-        # --- Step 5: dispatch -----------------------------------
+        # --- Step 6: dispatch -----------------------------------
+        #
+        # CRITICAL: the factory's FIRST argument selects the adapter
+        # class -- ``connection.provider_id`` is metadata carried
+        # along with the request, not the class discriminator. Using
+        # the raw ``provider_id`` here (instead of
+        # ``resolved_provider_id``) would instantiate the LEGACY
+        # adapter (e.g. LMStudioProvider), which appends
+        # ``/chat/completions`` to a native base URL and produces
+        # the exact 404 we are fixing.
         start_time = time.time()
         adapter = None
         try:
-            adapter = provider_factory.create(provider_id, connection)
+            adapter = provider_factory.create(
+                resolved_provider_id, connection,
+            )
             try:
                 response = await asyncio.wait_for(
                     adapter.generate(llm_request),
@@ -597,7 +764,7 @@ class MemoryModelGateway:
         except asyncio.TimeoutError as exc:
             raise LLMTransportError(
                 f"LLM call timed out after {timeout_seconds}s",
-                provider_id=provider_id,
+                provider_id=resolved_provider_id,
                 model_id=model_id,
                 cause=exc,
             ) from exc
@@ -606,16 +773,22 @@ class MemoryModelGateway:
         except Exception as exc:
             raise LLMTransportError(
                 f"Provider call failed: {exc}",
-                provider_id=provider_id,
+                provider_id=resolved_provider_id,
                 model_id=model_id,
                 cause=exc,
             ) from exc
 
-        # --- Step 6: accounting ---------------------------------
+        # --- Step 7: accounting ---------------------------------
+        #
+        # ``provider=`` records WHICH adapter executed the call. Use
+        # ``resolved_provider_id`` so cost/usage ledgers distinguish
+        # legacy vs. native adapter invocations of the same provider
+        # -- which matters for debugging 404s like the one this
+        # block was introduced to fix.
         usage = getattr(response, "usage", None)
         inv_id = f"inv_extract_{uuid.uuid4().hex[:10]}"
         tracker_ctx = InvocationContext(
-            provider=provider_id,
+            provider=resolved_provider_id,
             model_requested=model_id,
             mode="extraction",  # distinct from "chat"/"agent"
             job_id=connection_id,

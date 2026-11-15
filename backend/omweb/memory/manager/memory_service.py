@@ -386,7 +386,45 @@ class MemoryService:
         decide whether to fire the per-turn trigger. Returns
         ``None`` when extraction is disabled, which the dispatcher
         treats as "do nothing".
+
+        [PHASE 3 FIX] Reads from ``self._lifecycle.settings.ai``
+        FIRST, then falls back to ``extraction_settings_provider``.
+
+        Why the primary source is lifecycle
+        -----------------------------------
+        In production, ``initialize_memory_service`` does NOT pass
+        ``extraction_settings_provider`` (the parameter defaults to
+        ``None``). The authoritative AI settings live on
+        ``self._lifecycle.settings.ai`` after every successful
+        ``ainitialize()`` / ``reload_settings()`` call.
+
+        Before this fix, the method consulted ONLY
+        ``extraction_settings_provider`` -- which is ``None`` in
+        production -- so it always returned ``None``. The dispatcher
+        hook then treated extraction as "disabled" and silently
+        skipped every turn, producing the "no jobs enqueued"
+        symptom users observed even after enabling AI in the UI.
+
+        The fallback path preserves backward compatibility for
+        embedders that wire their own settings source explicitly.
         """
+        # --- Primary: lifecycle settings (authoritative) -------
+        try:
+            if self._lifecycle.is_ready:
+                ai = getattr(self._lifecycle.settings, "ai", None)
+                if ai is not None:
+                    if not getattr(ai, "enabled", False):
+                        return None
+                    if not getattr(ai, "extraction_enabled", False):
+                        return None
+                    trigger = getattr(ai, "extraction_trigger", None)
+                    if trigger in ("after_turn", "after_session", "both"):
+                        return trigger
+                    return None
+        except Exception:
+            pass
+
+        # --- Fallback: caller-supplied provider (tests) --------
         if self._extraction_settings_provider is None:
             return None
         try:
@@ -594,6 +632,26 @@ class MemoryService:
         provider only when ``provider_id`` or the DISABLED boundary
         changed; otherwise just swap the settings reference).
 
+        [PHASE 3 FIX] After the lifecycle reload, this method ALSO
+        re-evaluates the extraction pipeline. This is what makes
+        the "user enables AI in the UI, extraction starts immediately"
+        flow work without a server restart:
+
+          * settings flipped from disabled -> enabled:
+            ``_close_extraction()`` then ``_initialize_extraction()``
+            -- the pipeline is rebuilt with fresh settings.
+          * settings flipped from enabled -> disabled:
+            ``_close_extraction()`` -- the pipeline is torn down.
+          * settings unchanged (enabled state same):
+            no-op. The running pipeline stays as-is.
+
+        The extraction re-init is best-effort: any failure is
+        logged at WARNING and swallowed, so a broken settings file
+        or a transport init error never breaks the caller (which
+        is typically the ``PATCH /api/memory/settings`` endpoint).
+        The caller receives the successfully-reloaded settings
+        regardless of extraction state.
+
         Used by ``PATCH /api/memory/settings`` (P1.8) and by the
         ``main.py`` lifespan if a reload-on-SIGHUP hook is added
         later.
@@ -609,6 +667,60 @@ class MemoryService:
             new_settings.mode.value,
             new_settings.provider_id,
         )
+
+        # --- Phase 3: re-evaluate extraction pipeline -------------
+        try:
+            ai = getattr(new_settings, "ai", None)
+            want_enabled = (
+                ai is not None
+                and getattr(ai, "enabled", False)
+                and getattr(ai, "extraction_enabled", False)
+                and new_settings.mode.can_write
+                and new_settings.provider_id == "sqlite_fts"
+            )
+            have_enabled = self._outbox is not None
+
+            if want_enabled and not have_enabled:
+                # Pipeline off -> on. Build a fresh pipeline.
+                logger.info(
+                    "MemoryService: AI extraction enabled via "
+                    "settings reload; initializing pipeline."
+                )
+                try:
+                    await self._initialize_extraction()
+                    logger.info(
+                        "MemoryService: extraction pipeline started "
+                        "via reload."
+                    )
+                except Exception as init_err:
+                    logger.warning(
+                        "MemoryService: extraction reload failed "
+                        "(non-fatal): %s", init_err,
+                    )
+            elif not want_enabled and have_enabled:
+                # Pipeline on -> off. Tear down.
+                logger.info(
+                    "MemoryService: AI extraction disabled via "
+                    "settings reload; stopping pipeline."
+                )
+                try:
+                    await self._close_extraction()
+                    logger.info(
+                        "MemoryService: extraction pipeline stopped "
+                        "via reload."
+                    )
+                except Exception as close_err:
+                    logger.warning(
+                        "MemoryService: extraction close during "
+                        "reload failed (non-fatal): %s", close_err,
+                    )
+            # else: state unchanged -> nothing to do.
+        except Exception as reload_err:
+            logger.warning(
+                "MemoryService: extraction reload check failed "
+                "(non-fatal): %s", reload_err,
+            )
+
         return new_settings
 
     # ------------------------------------------------------------------
@@ -877,25 +989,66 @@ class MemoryService:
     async def _initialize_extraction(self) -> None:
         """Bring up the extraction subsystem when it is applicable.
 
-        Preconditions checked IN ORDER:
-          1. ``extraction_settings_provider`` was supplied,
-          2. it returns a non-None settings object,
-          3. ``settings.enabled`` and ``settings.extraction_enabled``
-             are both True,
-          4. the current provider is ``sqlite_fts`` (extraction
-             requires the ``memory_jobs`` table, which only exists
-             in the SQLite schema),
-          5. an extraction model is configured.
+        Phase 3 (P1.6 UI) — settings source resolution:
+          1. ``self._lifecycle.settings.ai`` is the AUTHORITATIVE
+             source. It is populated by ``_lifecycle.ainitialize``
+             and refreshed by ``reload_settings``. Reading it here
+             (rather than through ``extraction_settings_provider``)
+             means PATCH ``/api/memory/settings`` from the UI
+             controls extraction without any extra wiring in
+             ``main.py``.
+          2. ``extraction_settings_provider`` remains supported as
+             a BACKWARD-COMPAT fallback (tests, embedders that wire
+             their own settings source). When both are available,
+             the lifecycle settings win.
+
+        Additional preconditions (unchanged from Phase 1-C):
+          3. ``settings.enabled`` AND ``settings.extraction_enabled``
+             must both be True (dual-gate).
+          4. Memory mode must permit writes (``mode.can_write``).
+          5. The provider must be ``sqlite_fts`` -- extraction
+             requires the ``memory_jobs`` / ``memory_chat_cursors``
+             tables that only exist in the SQLite schema.
+          6. A resolvable extraction model must exist (see
+             ``_model_config_provider`` below for the null-
+             ``provider_id`` fallback path).
 
         Any failure leaves ``self._outbox`` and friends at ``None``
         -- extraction is simply unavailable, which is the correct
         degradation.
         """
-        if self._extraction_settings_provider is None:
-            return
 
-        settings = self._extraction_settings_provider()
+        # Local settings provider -- unified source of truth.
+        # Defined as a CLOSURE (not a class method) so that the
+        # multiple consumers below (TriggerRouter, SessionStatusWatcher,
+        # and the gateway) all see the SAME resolution logic without
+        # duplication.
+        def _get_ai_settings():
+            # Primary: lifecycle settings (authoritative after
+            # ainitialize, changes on reload_settings).
+            try:
+                if self._lifecycle.is_ready:
+                    ai = getattr(
+                        self._lifecycle.settings, "ai", None
+                    )
+                    if ai is not None:
+                        return ai
+            except Exception:
+                pass
+            # Fallback: caller-supplied provider (backward compat).
+            if self._extraction_settings_provider is not None:
+                try:
+                    return self._extraction_settings_provider()
+                except Exception:
+                    return None
+            return None
+
+        settings = _get_ai_settings()
         if settings is None:
+            logger.debug(
+                "MemoryService: no AI settings available; "
+                "extraction disabled."
+            )
             return
         if not getattr(settings, "enabled", False):
             return
@@ -975,24 +1128,79 @@ class MemoryService:
 
         # Model config provider: converts the extraction settings'
         # ``extraction`` sub-object into an ``ExtractionModelConfig``.
+        #
+        # [PHASE 3 FIX] Re-reads settings on EVERY call so a PATCH
+        # from the UI takes effect for the NEXT job without a
+        # restart. Two resolution paths when ``provider_id`` is
+        # null:
+        #
+        #   1. Model is set, provider is null:
+        #      Look up the model in the vaults via
+        #      ``_resolve_model_provider``. This handles the common
+        #      UI flow where the user picks a model from the
+        #      "memory-models" dropdown without an explicit
+        #      provider association (e.g. LM Studio models,
+        #      Ollama models).
+        #
+        #   2. Neither is set:
+        #      Fall back to the FIRST marked-memory model, via
+        #      ``_resolve_first_memory_model``. This gives the
+        #      extraction pipeline a sensible default when the
+        #      user enabled AI but has not yet picked a specific
+        #      model.
+        #
+        # Both paths log at DEBUG when they cannot resolve, so the
+        # reason a job was NOT enqueued is diagnosable from the
+        # server log.
         def _model_config_provider():
-            s = (
-                self._extraction_settings_provider()
-                if self._extraction_settings_provider else None
-            )
-            if s is None:
+            current = _get_ai_settings()
+            if current is None:
                 return None
-            if not getattr(s, "enabled", False):
+            if not getattr(current, "enabled", False):
                 return None
-            if not getattr(s, "extraction_enabled", False):
+            if not getattr(current, "extraction_enabled", False):
                 return None
-            extraction = getattr(s, "extraction", None)
+            extraction = getattr(current, "extraction", None)
             if extraction is None:
                 return None
+
             pid = getattr(extraction, "provider_id", None)
             mid = getattr(extraction, "model_id", None)
+
+            # Path 1: model set, provider null -> infer provider.
+            if mid and not pid:
+                inferred = self._resolve_model_provider(str(mid))
+                if inferred is not None:
+                    pid = inferred
+                    logger.info(
+                        "MemoryService: inferred provider %r for "
+                        "model %r (no explicit provider_id in "
+                        "settings).",
+                        pid, mid,
+                    )
+
+            # Path 2: neither set -> first marked memory model.
+            if not mid:
+                fallback = self._resolve_first_memory_model()
+                if fallback is not None:
+                    pid, mid = fallback
+                    logger.info(
+                        "MemoryService: using first marked memory "
+                        "model %r::%r (no explicit selection in "
+                        "settings).",
+                        pid, mid,
+                    )
+
             if not pid or not mid:
+                logger.debug(
+                    "MemoryService: extraction model not resolved "
+                    "(provider=%r, model=%r); no job will be "
+                    "created until the user picks a model in "
+                    "Settings → Memory → AI.",
+                    pid, mid,
+                )
                 return None
+
             return ExtractionModelConfig(
                 provider_id=str(pid),
                 model_id=str(mid),
@@ -1012,7 +1220,12 @@ class MemoryService:
         watcher = SessionStatusWatcher(
             scanner,
             router,
-            settings_provider=self._extraction_settings_provider,
+            # Re-use the same closure as the router and gateway so
+            # all three consumers see the same AI settings source.
+            # Passing ``self._extraction_settings_provider`` directly
+            # would break when it is ``None`` (the production case
+            # with the current ``initialize_memory_service`` wiring).
+            settings_provider=_get_ai_settings,
         )
 
         # ------------------------------------------------------------------
@@ -1163,6 +1376,264 @@ class MemoryService:
             self._has_real_transport,
             heartbeat_seconds,
         )
+
+    # ------------------------------------------------------------------
+    # Internal: extraction model resolution (Phase 3 / P1.6 UI)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_model_provider(model_id: str) -> Optional[str]:
+        """Infer provider id for a model from AUTHORITATIVE sources ONLY.
+
+        Design contract -- no hard-coded knowledge anywhere:
+
+          * NO provider-name constants (``"openai"``, ``"ollama"``,
+            ``"lmstudio"``, ``"anthropic"``, ...). Provider ids are
+            always READ from a data source, never embedded in this
+            module.
+
+          * NO URL substrings (ports, domains, path segments). The
+            module never inspects a base_url to guess a provider.
+
+          * NO model-name prefixes (``gpt-``, ``claude-``, ...).
+            A model called "custom-gpt-xyz" is a legitimate custom
+            deployment; it must not be silently routed to OpenAI.
+
+        When nothing authoritative resolves the model, this method
+        returns ``None``. ``_model_config_provider`` upstream treats
+        ``None`` as "no job enqueue" and logs the reason. That is
+        the CORRECT behavior: an unresolved model means the operator
+        has not declared which provider owns it, and guessing would
+        produce a job that fails on the first LLM call.
+
+        Resolution order -- each step reads ONLY from what its
+        source declares:
+
+          1. ``models_metadata.json[model_id].provider``
+             Explicit assignment written by /api/config/fetch-models.
+             If present, it is the answer -- no further probing.
+
+          2. ``models_vault.json`` per-entry assignment:
+             a. ``cloud_vault[*].savedModels``      -> entry["id"]
+             b. ``cloud_vault[*].popularModels``    -> entry["id"]
+             c. ``lmstudio_vault.savedModels``      -> lmstudio_vault["provider"]
+             d. ``ollama_vault.savedModels``        -> ollama_vault["provider"]
+             e. ``provider_package_models[pkg_id]`` -> pkg_id (the dict key)
+
+        Vault entry contract
+        --------------------
+        A vault entry MUST carry a ``provider`` field (or the
+        cloud-vault's ``id`` field) to be resolvable. Entries
+        without one -- e.g. an ``ollama_vault`` missing
+        ``"provider": "ollama"`` -- return ``None``. Operators who
+        need the model to be routable add the field; the UI's
+        Save action writes it automatically for new entries.
+
+        Vault file location resolution (unchanged from Phase 1-C):
+          1. ``PELDRUN_MODELS_VAULT_PATH`` env var (tests).
+          2. ``<backend>/data/models_vault.json``.
+          3. ``<backend>/data/models_vault copy.json``.
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        if not model_id:
+            return None
+
+        # ------------------------------------------------------------------
+        # Step 1 -- explicit provider in models_metadata.json
+        # ------------------------------------------------------------------
+        try:
+            from peldrun.storage_paths import get_storage_root
+
+            meta_path = get_storage_root() / "models_metadata.json"
+            if meta_path.is_file():
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                entry = meta.get(model_id) or meta.get(
+                    model_id.lower()
+                )
+                if isinstance(entry, dict):
+                    explicit = entry.get("provider")
+                    if (
+                        isinstance(explicit, str)
+                        and explicit.strip()
+                    ):
+                        return explicit.strip()
+        except Exception as exc:
+            logger.debug(
+                "MemoryService._resolve_model_provider: metadata "
+                "read failed for %r: %s", model_id, exc,
+            )
+
+        # ------------------------------------------------------------------
+        # Step 2 -- models_vault.json per-entry assignment
+        # ------------------------------------------------------------------
+        try:
+            env_override = os.environ.get(
+                "PELDRUN_MODELS_VAULT_PATH", ""
+            ).strip()
+            vault_path: Optional[Path] = None
+            if env_override:
+                vault_path = Path(env_override).expanduser()
+            else:
+                backend_dir = Path(__file__).resolve().parents[3]
+                for candidate in (
+                    backend_dir / "data" / "models_vault.json",
+                    backend_dir / "data" / "models_vault copy.json",
+                ):
+                    if candidate.is_file():
+                        vault_path = candidate
+                        break
+
+            if vault_path is None or not vault_path.is_file():
+                return None
+
+            with open(vault_path, "r", encoding="utf-8") as f:
+                vault = json.load(f)
+
+            # 2a -- cloud_vault: entry["id"] IS the provider id.
+            # Try savedModels first (authoritative -- user saved
+            # the model under this provider explicitly), then
+            # popularModels (provider-curated suggestions).
+            for list_key in ("savedModels", "popularModels"):
+                cloud_vault = vault.get("cloud_vault") or []
+                if not isinstance(cloud_vault, list):
+                    continue
+                for entry in cloud_vault:
+                    if not isinstance(entry, dict):
+                        continue
+                    models = entry.get(list_key) or []
+                    if not isinstance(models, list):
+                        continue
+                    if model_id in models:
+                        pid = entry.get("id")
+                        if isinstance(pid, str) and pid.strip():
+                            return pid.strip()
+
+            # 2b + 2c -- local vaults: entry["provider"] IS the
+            # provider id. The vault key (``lmstudio_vault``,
+            # ``ollama_vault``, ...) is NOT used as a fallback
+            # because that would re-introduce hard-coded provider
+            # names. Entries without ``provider`` are unresolvable
+            # by contract.
+            for vault_key in (
+                "lmstudio_vault",
+                "ollama_vault",
+            ):
+                local_entry = vault.get(vault_key)
+                if not isinstance(local_entry, dict):
+                    continue
+                saved = local_entry.get("savedModels") or []
+                if not isinstance(saved, list):
+                    continue
+                if model_id not in saved:
+                    continue
+                pid = local_entry.get("provider")
+                if isinstance(pid, str) and pid.strip():
+                    return pid.strip()
+                # Entry lacks ``provider``. Skip -- the next vault
+                # (if any) might match, otherwise return None.
+
+            # 2d -- provider_package_models: the DICT KEY is the
+            # package id (which doubles as the provider id when
+            # dispatching through provider_factory).
+            pkg_models = vault.get("provider_package_models")
+            if isinstance(pkg_models, dict):
+                for pkg_id, pkg_data in pkg_models.items():
+                    if not isinstance(pkg_data, dict):
+                        continue
+                    saved = pkg_data.get("savedModels") or []
+                    if not isinstance(saved, list):
+                        continue
+                    if model_id in saved:
+                        pid = str(pkg_id).strip()
+                        if pid:
+                            return pid
+
+            # 2e -- custom_endpoints: user-added OpenAI-compatible
+            # endpoints. Each entry carries ``providerId`` (the
+            # canonical id passed to ``provider_factory``) and
+            # ``savedModels``. The read-only contract is identical
+            # to the other vault containers: we NEVER invent a
+            # provider id -- we only return what the entry declares.
+            custom = vault.get("custom_endpoints")
+            if isinstance(custom, list):
+                for entry in custom:
+                    if not isinstance(entry, dict):
+                        continue
+                    saved = entry.get("savedModels") or []
+                    if not isinstance(saved, list):
+                        continue
+                    if model_id not in saved:
+                        continue
+                    pid = entry.get("providerId") or entry.get("id")
+                    if isinstance(pid, str) and pid.strip():
+                        return pid.strip()
+        except Exception as exc:
+            logger.debug(
+                "MemoryService._resolve_model_provider: vault lookup "
+                "failed for %r: %s", model_id, exc,
+            )
+
+        return None
+
+    @staticmethod
+    def _resolve_first_memory_model() -> Optional[tuple]:
+        """Return ``(provider_id, model_id)`` for the first marked model.
+
+        Calls ``config_rtr.get_memory_models()`` -- the same function
+        behind ``GET /api/config/memory-models``. It returns a list
+        of STRINGS, each being either:
+
+          * ``"provider_id::model_id"`` -- when the model has an
+            explicit provider association, OR
+          * ``"model_id"`` alone -- when the model is a local
+            deployment (LM Studio / Ollama) without an explicit
+            provider entry.
+
+        In the second case, provider is inferred via
+        ``_resolve_model_provider`` before returning.
+
+        Returns ``None`` when no model is marked as memory, or
+        when the function itself raises (the router is a critical
+        startup dependency -- a broken config_rtr must NOT break
+        extraction).
+        """
+        try:
+            from omweb.routers.config_rtr import (
+                get_memory_models,
+            )
+            marked = get_memory_models()
+        except Exception as exc:
+            logger.debug(
+                "MemoryService._resolve_first_memory_model: "
+                "get_memory_models() failed: %s", exc,
+            )
+            return None
+
+        if not isinstance(marked, list) or not marked:
+            return None
+
+        first = marked[0]
+        if not isinstance(first, str) or not first.strip():
+            return None
+
+        if "::" in first:
+            pid, mid = first.split("::", 1)
+            pid = pid.strip()
+            mid = mid.strip()
+            if pid and mid:
+                return (pid, mid)
+            return None
+
+        # No explicit provider -- infer from vaults.
+        mid = first.strip()
+        pid = MemoryService._resolve_model_provider(mid)
+        if pid is None:
+            return None
+        return (pid, mid)
 
     async def _close_extraction(self) -> None:
         """Tear down the extraction subsystem. Idempotent.

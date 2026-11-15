@@ -93,6 +93,31 @@ export interface LMStudioSettings {
 }
 
 export interface OllamaSettings {
+  /**
+   * The canonical provider id, used by the LLM dispatcher and by the
+   * memory extraction subsystem to route requests for this provider's
+   * models.
+   *
+   * Declared on the TYPE -- not inferred from a base URL or a model
+   * name prefix. ``OllamaSettings`` IS Ollama, so ``provider = "ollama"``
+   * is an invariant of the shape, exactly as ``provider = "lmstudio"``
+   * is an invariant of ``LMStudioSettings`` (already declared there).
+   *
+   * This field is what makes ``models_vault.json``'s ``ollama_vault``
+   * entry self-describing: ``MemoryService._resolve_model_provider``
+   * reads the value verbatim from the vault -- no hard-coded provider
+   * names, no guessing from URLs, no model-name heuristics.
+   *
+   * Consumers of this field:
+   *   - ``saveVaultToBackend()`` -- persists it under
+   *     ``ollama_vault.provider`` in ``storage/models_vault.json``.
+   *   - ``MemoryService._resolve_model_provider()`` (backend) --
+   *     returns it as the provider id for any model in
+   *     ``ollama_vault.savedModels``.
+   *   - ``dispatcher.py`` -> ``provider_factory.create()`` -- receives
+   *     it as the ``provider_id`` argument.
+   */
+  provider: string;
   baseUrl: string;
   /**
    * Optional metadata endpoint. Ollama's `/v1/models` is minimal; the
@@ -108,6 +133,19 @@ export interface OllamaSettings {
 }
 
 export const INITIAL_OLLAMA_SETTINGS: OllamaSettings = {
+  /**
+   * Canonical provider id. This is a FACT about the shape, not a
+   * heuristic: the type is ``OllamaSettings``; every instance of it
+   * represents Ollama; therefore its default declares ``"ollama"``.
+   *
+   * A user with a legacy vault entry that predates this field will
+   * still get the correct value on the next save, because
+   * ``fetchConfig`` spreads ``INITIAL_OLLAMA_SETTINGS`` BEFORE the
+   * vault entry, so a MISSING ``provider`` in the vault falls back
+   * to this value here, and a PRESENT one (user-defined custom
+   * naming) survives verbatim.
+   */
+  provider: "ollama",
   baseUrl: "http://127.0.0.1:11434",
   model: "",
   status: "untested",

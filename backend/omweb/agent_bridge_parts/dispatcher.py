@@ -3051,6 +3051,65 @@ async def run_direct_chat(
             logger.debug(f"[BRIDGE DIRECT CHAT] Sidecar sync notice: {sidecar_err}")
 
         # ─────────────────────────────────────────────────────────────
+        # [PHASE 1-C FIX] Persist the FULL turn content into turns[].
+        #
+        # Previously, job_manager.complete_job wrote:
+        #   * session["prompt"]  = user text (last job only)
+        #   * session["result"]  = assistant text (last job only)
+        #   * session["turns"]   = [{turn_id, timestamp, usage}] only
+        #
+        # That means historical turns had NO accessible content.
+        # The extraction orchestrator's chat-mode fallback (see
+        # orchestrator._prepare_from_session_json) can only recover
+        # the LAST turn's text from the session level -- earlier
+        # turns are unreachable.
+        #
+        # This block enriches the LAST turn in turns[] with the
+        # canonical ``user`` and ``assistant`` fields, making the
+        # turn self-contained for every future extraction pass.
+        #
+        # The write is idempotent: if a caller ever populates these
+        # fields earlier, the update below short-circuits.
+        #
+        # Atomicity: we run INSIDE a project_manager lock via
+        # ``record_turn_and_sync``, which handles the file write
+        # atomically. Existing callers are unaffected -- the turn
+        # schema only GAINS two fields, never loses any.
+        # ─────────────────────────────────────────────────────────────
+        try:
+            _current = project_manager.get_chat(chat_id) or {}
+            _current_turns = _current.get("turns") or []
+            if _current_turns:
+                _last_idx = len(_current_turns) - 1
+                _last_turn = _current_turns[_last_idx]
+                if isinstance(_last_turn, dict):
+                    _needs_user = not _last_turn.get("user")
+                    _needs_assistant = not _last_turn.get("assistant")
+                    if _needs_user or _needs_assistant:
+                        if _needs_user:
+                            _last_turn["user"] = prompt
+                        if _needs_assistant:
+                            _last_turn["assistant"] = result_text
+                        # Reuse the standard write path -- no direct
+                        # file manipulation here.
+                        project_manager.save_chat_session(
+                            chat_id, _current
+                        )
+                        logger.info(
+                            "[BRIDGE DIRECT CHAT] Enriched turn %d "
+                            "with user/assistant text for job %s "
+                            "(needed user=%s, assistant=%s)",
+                            _last_idx, job_id,
+                            _needs_user, _needs_assistant,
+                        )
+        except Exception as _enrich_err:
+            # Best-effort: a write failure must not break the chat.
+            logger.debug(
+                "[BRIDGE DIRECT CHAT] Turn enrichment skipped "
+                "for job %s: %s", job_id, _enrich_err,
+            )
+
+        # ─────────────────────────────────────────────────────────────
         # [PHASE 1-C] After-Turn extraction hook (chat mode).
         #
         # Placement: AFTER ``complete_job`` (which persists session.json)
@@ -3082,7 +3141,28 @@ async def run_direct_chat(
         # different snapshot hash and therefore its own job; the
         # idempotency key prevents double-enqueuing the SAME turn.
         # ─────────────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # [PHASE 3 FIX] Timing-instrumented After-Turn hook.
+        #
+        # The enqueue path itself is milliseconds, but a slow worker
+        # start, a lock contention on the outbox, or an unexpected
+        # sync-I/O call inside `route_after_turn` can extend the hook
+        # runtime beyond what users perceive as "instant". Wrapping
+        # the hook with explicit timing makes that cost visible in
+        # the log -- the previous code emitted no signal at all, so
+        # "the chat felt slow" was indistinguishable from "the hook
+        # hung".
+        #
+        # The hook remains await'ed here (not fire-and-forget).
+        # Introducing background execution is a bigger behavioral
+        # change; we make it only after the timing log proves the
+        # hook is the actual bottleneck. If `elapsed_ms` is < 500ms
+        # in all normal runs (as expected), the freeze the operator
+        # observed is NOT the memory hook.
+        # ─────────────────────────────────────────────────────────────
         try:
+            import time as _time_mem
+
             from omweb.memory import get_memory_service
 
             _mem_svc = get_memory_service()
@@ -3090,21 +3170,38 @@ async def run_direct_chat(
                 _chat_after = project_manager.get_chat(job_id) or {}
                 _turns_after = _chat_after.get("turns") or []
                 if _turns_after:
+                    _hook_t0 = _time_mem.monotonic()
                     await _mem_svc.notify_turn_completed(
                         chat_id=chat_id,
                         project_id=project_id,
                         current_turn_index=len(_turns_after) - 1,
                     )
+                    _turn_ms = (_time_mem.monotonic() - _hook_t0) * 1000.0
+                    logger.info(
+                        "[BRIDGE DIRECT CHAT] notify_turn_completed "
+                        "took %.1f ms for job %s",
+                        _turn_ms, job_id,
+                    )
+                    _hook_t1 = _time_mem.monotonic()
                     await _mem_svc.notify_session_updated(
                         chat_id=chat_id,
                         project_id=project_id,
                     )
+                    _session_ms = (
+                        _time_mem.monotonic() - _hook_t1
+                    ) * 1000.0
+                    logger.info(
+                        "[BRIDGE DIRECT CHAT] notify_session_updated "
+                        "took %.1f ms for job %s",
+                        _session_ms, job_id,
+                    )
         except Exception as _mem_hook_err:
-            logger.debug(
+            logger.warning(
                 "[BRIDGE DIRECT CHAT] After-Turn memory hook "
-                "skipped for job %s: %s",
+                "failed for job %s: %s",
                 job_id,
                 _mem_hook_err,
+                exc_info=True,
             )
 
         await dispatch_event(

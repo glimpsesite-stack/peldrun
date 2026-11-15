@@ -357,10 +357,61 @@ class ExtractionOrchestrator:
         job: MemoryJob,
         session: Dict[str, Any],
     ) -> List[_TurnData]:
-        """Extract turns from a `session.json` document.
+        """Extract turns from a ``session.json`` document.
 
-        `session["turns"]` is a list of
-        ``{id, user, assistant, timestamp, ...}`` objects.
+        Content resolution -- per turn, in priority order:
+
+          1. **Canonical**: ``turn["user"]`` / ``turn["assistant"]``.
+             This is the format every future session format should
+             use, and the format older exports may carry.
+
+          2. **Chat-mode fallback for the LAST turn**: when the
+             turn lacks the canonical fields AND it is the session's
+             final turn, read ``session["prompt"]`` and
+             ``session["result"]``.
+
+             WHY THIS EXISTS
+             ---------------
+             PELDRUN's ``job_manager.complete_job`` writes the most
+             recent job's user prompt and assistant reply to the
+             SESSION-level ``prompt`` / ``result`` fields, while
+             ``turns[]`` carries only metadata (``turn_id``,
+             ``timestamp``, ``usage``). Every chat-mode session
+             therefore looks like::
+
+                 {
+                   "prompt": "user said X",
+                   "result": "assistant said Y",
+                   "turns": [
+                     {"turn_id": "turn_1", "timestamp": ..., "usage": {...}}
+                   ]
+                 }
+
+             Without this fallback, ``_prepare_turns`` returns an
+             empty list for EVERY chat session, ``extract()`` returns
+             an empty ``ExtractionResult`` WITHOUT calling the LLM
+             (cost=0), and the worker writes a ``completed`` job
+             with ``candidates=0``. The extraction pipeline appears
+             to run but produces zero memories.
+
+             The fallback is bounded to the LAST turn because the
+             session-level ``prompt`` / ``result`` describe only the
+             most recent job. Turns earlier in ``turns[]`` have no
+             accessible content until the dispatcher switches to
+             ``record_turn_and_sync`` (write path fix, tracked
+             separately). Turn 0 on a single-turn session -- the
+             common case -- is the last turn, so it is covered.
+
+             NO HARD-CODING: this reads ``session["prompt"]`` and
+             ``session["result"]`` -- the same public fields
+             ``dispatcher.run_direct_chat`` writes. No provider,
+             no model, no URL is inspected.
+
+          3. **Skip**: when neither source yields text, the turn is
+             dropped. This preserves the previous "empty turn"
+             semantics and keeps ``turn_index`` alignment for
+             evidence validation (the validator indexes into the
+             ORIGINAL ``turns[]`` array, not the filtered list).
         """
         turns = session.get("turns")
         if not isinstance(turns, list):
@@ -381,15 +432,48 @@ class ExtractionOrchestrator:
         start = max(0, start)
         end = min(end, total - 1)
 
+        # Pre-resolve the session-level chat-mode fallback ONCE,
+        # outside the loop. The fields describe the last turn
+        # only, so caching them avoids re-extracting them for
+        # every iteration (cheap, but cleaner).
+        session_level_user = ""
+        session_level_assistant = ""
+        raw_prompt = session.get("prompt")
+        raw_result = session.get("result")
+        if isinstance(raw_prompt, str):
+            session_level_user = raw_prompt.strip()
+        if isinstance(raw_result, str):
+            session_level_assistant = raw_result.strip()
+
         result: List[_TurnData] = []
         for idx in range(start, end + 1):
             turn = turns[idx]
             if not isinstance(turn, dict):
                 continue
+
+            # --- Priority 1: canonical per-turn fields --------
             user_text = str(turn.get("user") or "").strip()
             assistant_text = str(turn.get("assistant") or "").strip()
+
+            # --- Priority 2: chat-mode fallback (LAST turn) ---
+            # Only fires when BOTH canonical fields are missing
+            # AND this is the final turn. The last-turn restriction
+            # is load-bearing: session-level ``prompt``/``result``
+            # carry the most recent job, not every job in history.
+            if (
+                not user_text
+                and not assistant_text
+                and idx == total - 1
+            ):
+                if session_level_user:
+                    user_text = session_level_user
+                if session_level_assistant:
+                    assistant_text = session_level_assistant
+
+            # --- Priority 3: skip ------------------------------
             if not user_text and not assistant_text:
                 continue
+
             raw_id = turn.get("turn_id") or turn.get("id")
             turn_id = (
                 raw_id.strip()

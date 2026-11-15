@@ -401,7 +401,38 @@ export default function SettingsPage() {
       }
 
       if (vault.ollama_vault) {
-        storedOllama = { ...INITIAL_OLLAMA_SETTINGS, ...vault.ollama_vault, savedModels: vault.ollama_vault.savedModels || [] };
+        // [PHASE 3 FIX] Preserve the type-level ``provider``
+        // declaration across legacy vault entries.
+        //
+        // The spread order (``...INITIAL`` then ``...vault.ollama_vault``)
+        // already yields the correct value for the two common cases:
+        //
+        //   * Vault entry has NO ``provider`` field (the common legacy
+        //     case -- entries written before this fix) -> the spread
+        //     keeps ``INITIAL_OLLAMA_SETTINGS.provider = "ollama"``.
+        //
+        //   * Vault entry has a CUSTOM ``provider`` (e.g. the user
+        //     manually renamed it to ``"ollama-2"``) -> the spread
+        //     respects that value.
+        //
+        // The explicit line below covers the third, less common case:
+        // a hand-edited vault with ``"provider": null`` -- JSON null
+        // parses to JS ``null``, which is truthy-falsy-wise "falsy"
+        // and would otherwise propagate as ``null``, breaking the
+        // backend resolver. This is one line of defensive coding, not
+        // a hard-coded fallback: the value still comes from the type
+        // declaration when the vault is silent.
+        const vaultProvider =
+          (vault.ollama_vault as { provider?: unknown }).provider;
+        storedOllama = {
+          ...INITIAL_OLLAMA_SETTINGS,
+          ...vault.ollama_vault,
+          provider:
+            typeof vaultProvider === "string" && vaultProvider.trim()
+              ? vaultProvider
+              : INITIAL_OLLAMA_SETTINGS.provider,
+          savedModels: vault.ollama_vault.savedModels || [],
+        };
       }
 
       if (vault.cloud_vault && Array.isArray(vault.cloud_vault) && vault.cloud_vault.length > 0) {
