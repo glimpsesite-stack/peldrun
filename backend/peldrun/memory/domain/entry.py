@@ -76,7 +76,13 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from peldrun.memory.domain.enums import (
     MemoryScope,
@@ -84,6 +90,7 @@ from peldrun.memory.domain.enums import (
     MemoryStatus,
     MemoryType,
 )
+from peldrun.memory.domain.extraction_meta import ExtractionMeta
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +384,16 @@ class MemoryEntry(BaseModel):
             "it, so the audit trail is complete."
         ),
     )
+    extraction_meta: Optional[ExtractionMeta] = Field(
+        default=None,
+        description=(
+            "Extraction provenance (Phase 1-B, §22). MANDATORY when "
+            "`provenance.source_type == MemorySourceType.EXTRACTION`; "
+            "FORBIDDEN otherwise. Enforced by a model-level "
+            "validator below. Persisted as `extraction_meta_json` "
+            "in the `memories` table."
+        ),
+    )
 
     # ------------------------- lifecycle -----------------------------------
 
@@ -551,6 +568,49 @@ class MemoryEntry(BaseModel):
     ) -> Optional[datetime]:
         """Coerce every datetime field to aware UTC."""
         return _ensure_utc_aware(v)
+
+    @model_validator(mode="after")
+    def _check_extraction_meta_consistency(
+        self,
+    ) -> "MemoryEntry":
+        """Enforce the extraction_meta <-> source_type invariant.
+
+        Rules:
+          * EXTRACTION source  => extraction_meta MUST be present.
+          * Any other source   => extraction_meta MUST be None.
+
+        Rationale:
+          * An EXTRACTION entry without meta breaks the
+            explainability guarantee -- the UI cannot answer
+            "which job produced this?".
+          * A user-created entry WITH meta is a data bug --
+            the extraction pipeline never created it, so
+            attaching extraction provenance would misrepresent
+            its origin.
+
+        The exception messages name the offending source type
+        and the observed state so the caller knows exactly what
+        to fix.
+        """
+        is_extraction = (
+            self.provenance.source_type
+            is MemorySourceType.EXTRACTION
+        )
+        has_meta = self.extraction_meta is not None
+
+        if is_extraction and not has_meta:
+            raise ValueError(
+                "MemoryEntry with source_type=EXTRACTION MUST "
+                "carry extraction_meta; the extraction pipeline "
+                "must set it when building the entry"
+            )
+        if not is_extraction and has_meta:
+            raise ValueError(
+                f"MemoryEntry with source_type={self.provenance.source_type.value!r} "
+                f"MUST NOT carry extraction_meta; only "
+                f"'extraction' entries may have one"
+            )
+        return self
 
     # ------------------------- derived properties --------------------------
 

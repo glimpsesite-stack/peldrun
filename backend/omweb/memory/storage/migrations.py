@@ -95,7 +95,7 @@ logger = logging.getLogger("omweb.memory.storage.migrations")
 # ---------------------------------------------------------------------------
 
 
-CURRENT_VERSION: int = 1
+CURRENT_VERSION: int = 2
 """Highest schema version this module knows how to produce.
 
 Bump only when adding a new migration. Every bump must be paired
@@ -240,6 +240,235 @@ def _apply_v1(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# DDL -- v2 (memory_jobs + memory_chat_cursors + extraction meta columns)
+# ---------------------------------------------------------------------------
+#
+# v2 introduces the durable extraction pipeline: a job queue, a
+# per-chat cursor table that enforces the cursor invariant (§19.3),
+# and two new columns on `memories` that bind each extracted entry
+# to the job that produced it (§22 ExtractionMeta).
+#
+# Every DDL statement below is either `CREATE ... IF NOT EXISTS`
+# (idempotent) or wrapped by a `_column_exists` probe in
+# `_apply_v2` (SQLite has no `ADD COLUMN IF NOT EXISTS`). This
+# preserves the module's crash-safety guarantee: a crash between
+# DDL and version recording re-runs the whole migration safely.
+
+_V2_MEMORY_JOBS_DDL: str = """
+CREATE TABLE IF NOT EXISTS memory_jobs (
+    job_id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL DEFAULT 'extraction',
+    chat_id TEXT NOT NULL,
+    project_id TEXT,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+
+    trigger_type TEXT NOT NULL DEFAULT 'after_session',
+    source_session_path TEXT,
+    start_turn_index INTEGER,
+    end_turn_index INTEGER,
+    last_processed_turn_index_at_enqueue INTEGER DEFAULT 0,
+
+    message_snapshot_hash TEXT NOT NULL,
+    snapshot_verified_at REAL,
+
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    model_provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    lease_owner TEXT,
+    lease_expires_at REAL,
+    heartbeat_at REAL,
+
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    next_retry_at REAL,
+
+    error_code TEXT,
+    error_message TEXT,
+
+    candidates_count INTEGER DEFAULT 0,
+    created_memories_count INTEGER DEFAULT 0,
+    cost_nano_usd INTEGER DEFAULT 0,
+    decisions_json TEXT DEFAULT '[]'
+);
+"""
+
+_V2_MEMORY_JOBS_INDEXES_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_memory_jobs_pending
+ON memory_jobs(status, next_retry_at)
+WHERE status IN ('pending', 'retry_pending');
+
+CREATE INDEX IF NOT EXISTS idx_memory_jobs_chat
+ON memory_jobs(chat_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_jobs_trigger
+ON memory_jobs(trigger_type, status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_jobs_chat_fifo
+ON memory_jobs(chat_id, created_at ASC)
+WHERE status IN ('pending', 'retry_pending');
+"""
+
+_V2_MEMORY_CHAT_CURSORS_DDL: str = """
+CREATE TABLE IF NOT EXISTS memory_chat_cursors (
+    chat_id TEXT PRIMARY KEY,
+    last_processed_turn_index INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_chat_cursors_updated
+ON memory_chat_cursors(updated_at DESC);
+"""
+
+_V2_MEMORIES_EXTRACTION_INDEX_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_memories_job
+ON memories(extraction_job_id)
+WHERE extraction_job_id IS NOT NULL;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Migration v2 -- full function body
+# ---------------------------------------------------------------------------
+
+
+def _column_exists(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    """Return True when `column_name` already exists on `table_name`.
+
+    SQLite does not support ``ALTER TABLE ... ADD COLUMN IF NOT
+    EXISTS``. To keep ``_apply_v2`` idempotent (which the module's
+    crash-safety guarantee requires), we query a ``PRAGMA`` before
+    issuing the ADD COLUMN.
+
+    `table_xinfo` vs `table_info` -- why BOTH
+    -----------------------------------------
+    `PRAGMA table_info` returns every column EXCEPT VIRTUAL
+    GENERATED columns in some SQLite builds and versions. The
+    `extraction_job_id` column added by `_apply_v2` IS a virtual
+    generated column, so `table_info` alone would report it as
+    "missing" even after a successful ALTER TABLE -- causing this
+    guard to re-run the ADD COLUMN and raise "duplicate column
+    name" on a crash-retry path.
+
+    `PRAGMA table_xinfo` was introduced specifically to include
+    generated columns (with an extra `hidden` flag at position 6).
+    It is the authoritative source. We prefer `table_xinfo` when
+    available and fall back to `table_info` on very old SQLite
+    builds that lack it. The fallback path is safe because the
+    only column this migration adds that needs it is
+    `extraction_job_id` -- on a build old enough to lack
+    `table_xinfo`, generated columns are almost certainly
+    unsupported too, and the ALTER TABLE would have failed with a
+    clear error rather than a silent duplicate.
+
+    The `table_name` and `column_name` arguments MUST be hardcoded
+    literals supplied by migration code. This function does NOT
+    sanitize them -- it is not a public API and never accepts
+    user-supplied values.
+    """
+    # Prefer table_xinfo (includes generated columns).
+    try:
+        cur = conn.execute(f"PRAGMA table_xinfo({table_name})")
+        for row in cur.fetchall():
+            # PRAGMA table_xinfo columns: cid, name, type, notnull,
+            # dflt_value, pk, hidden. ``name`` is at index 1.
+            if row[1] == column_name:
+                return True
+        return False
+    except sqlite3.Error:
+        pass  # fall through to table_info
+
+    # Fallback for SQLite versions without table_xinfo.
+    try:
+        cur = conn.execute(f"PRAGMA table_info({table_name})")
+        for row in cur.fetchall():
+            if row[1] == column_name:
+                return True
+    except sqlite3.Error:
+        return False
+    return False
+
+
+def _apply_v2(conn: sqlite3.Connection) -> None:
+    """Apply the Phase 1 schema: jobs, cursors, extraction columns.
+
+    Layout
+    ------
+      1. `memory_jobs` table + 4 indexes (FIFO, pending, trigger,
+         chat).
+      2. `memory_chat_cursors` table + 1 index (recency).
+      3. `memories.extraction_meta_json` -- JSON blob per entry,
+         NULL for user-created entries (§22 ExtractionMeta).
+      4. `memories.extraction_job_id` -- VIRTUAL generated column
+         that mirrors `extraction_meta_json.job_id` into a plain
+         TEXT column. This is the review note #5 fix: a functional
+         index on `json_extract(...)` is NOT used by SQLite's
+         query planner for plain `WHERE job_id = ?` lookups; a
+         generated column IS.
+      5. Index on the generated column so
+         `GET /api/memory/jobs/{job_id}` is a single index lookup.
+
+    Idempotency
+    -----------
+    Tables and indexes use ``CREATE ... IF NOT EXISTS``. The two
+    ``ALTER TABLE ADD COLUMN`` statements are guarded by
+    ``_column_exists`` because SQLite has no conditional ADD
+    COLUMN syntax. A crash between any step and
+    ``_record_version(conn, 2)`` re-runs the whole function
+    safely -- tables are skipped (already exist), indexes are
+    skipped (already exist), and columns are skipped (already
+    exist).
+
+    FTS5 is not touched by this migration
+    -------------------------------------
+    The existing FTS5 external-content table
+    (`memories_fts`) tracks only ``content`` and
+    ``normalized_content``. Adding new columns to ``memories``
+    has no effect on the FTS index. The existing UPDATE trigger
+    already has a ``WHEN`` guard that skips the FTS rebuild when
+    those two columns are unchanged, so routine updates to
+    ``extraction_meta_json`` will not trigger an FTS rewrite.
+    """
+    # 1. Job queue table + indexes.
+    conn.executescript(_V2_MEMORY_JOBS_DDL)
+    conn.executescript(_V2_MEMORY_JOBS_INDEXES_DDL)
+
+    # 2. Per-chat cursor table + index.
+    conn.executescript(_V2_MEMORY_CHAT_CURSORS_DDL)
+
+    # 3. Extraction metadata column on `memories`.
+    if not _column_exists(conn, "memories", "extraction_meta_json"):
+        conn.execute(
+            "ALTER TABLE memories "
+            "ADD COLUMN extraction_meta_json TEXT DEFAULT NULL"
+        )
+
+    # 4. Generated column mirroring `$.job_id`. VIRTUAL (not
+    #    STORED) because VIRTUAL is the only kind SQLite allows
+    #    in `ALTER TABLE ADD COLUMN`. The generated column is
+    #    never written by the application; it is populated
+    #    automatically from `extraction_meta_json`.
+    if not _column_exists(conn, "memories", "extraction_job_id"):
+        conn.execute(
+            "ALTER TABLE memories "
+            "ADD COLUMN extraction_job_id TEXT "
+            "GENERATED ALWAYS AS "
+            "(json_extract(extraction_meta_json, '$.job_id')) VIRTUAL"
+        )
+
+    # 5. Index on the generated column.
+    conn.executescript(_V2_MEMORIES_EXTRACTION_INDEX_DDL)
+
+
+# ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
 #
@@ -254,6 +483,7 @@ def _apply_v1(conn: sqlite3.Connection) -> None:
 
 _MIGRATIONS: List[Tuple[int, Any]] = [
     (1, _apply_v1),
+    (2, _apply_v2),
 ]
 
 

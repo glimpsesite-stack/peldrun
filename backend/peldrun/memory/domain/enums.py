@@ -5,11 +5,12 @@ PELDRUN Memory Platform - Domain Enumerations.
 SINGLE SOURCE OF TRUTH for the closed vocabularies used throughout
 the memory subsystem:
 
-    * MemoryType       -- semantic classification of an entry.
-    * MemoryScope      -- ownership boundary (isolation + ranking).
-    * MemorySourceType -- origin of an entry (who / what created it).
-    * MemoryStatus     -- lifecycle state (active / archived / superseded).
-    * MemoryMode       -- global subsystem operating mode.
+    * MemoryType         -- semantic classification of an entry.
+    * MemoryScope        -- ownership boundary (isolation + ranking).
+    * MemorySourceType   -- origin of an entry (who / what created it).
+    * MemoryStatus       -- lifecycle state (active / archived / superseded).
+    * MemoryMode         -- global subsystem operating mode.
+    * ExtractionTrigger  -- what caused an extraction job to be created.
 
 Design invariants
 -----------------
@@ -381,6 +382,58 @@ class MemoryMode(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# ExtractionTrigger -- what caused an extraction job
+# ---------------------------------------------------------------------------
+
+
+class ExtractionTrigger(str, Enum):
+    """Reason an extraction job was created.
+
+    Persisted on every ``MemoryJob`` row (``memory_jobs.trigger_type``)
+    and echoed on ``ExtractionMeta`` so the audit trail records not
+    only that a memory was extracted but also WHICH lifecycle event
+    triggered the extraction. The four triggers have very different
+    cost/durability profiles:
+
+    * AFTER_TURN     -- fires on the hot path of an interactive turn.
+                        Low-latency expectation; usually batched.
+    * AFTER_SESSION  -- fires once per completed session. Cheaper per
+                        turn than AFTER_TURN; the default trigger.
+    * BATCH          -- operator-initiated retroactive extraction
+                        across historical sessions. Runs in the
+                        background with a pause/resume UI.
+    * MANUAL         -- one-shot extraction from a specific session
+                        via the UI button. Treated as an explicit
+                        user action, not a system behavior.
+    """
+
+    AFTER_TURN = "after_turn"
+    """Triggered at the end of a user/assistant turn (``run_direct_chat``)."""
+
+    AFTER_SESSION = "after_session"
+    """Triggered when a session's status transitions to ``completed``."""
+
+    BATCH = "batch"
+    """Triggered by a retroactive batch job across historical sessions."""
+
+    MANUAL = "manual"
+    """Triggered explicitly by the user (e.g. the "Extract from this chat" button)."""
+
+    @property
+    def is_automatic(self) -> bool:
+        """True for triggers fired by the runtime without a per-job user click."""
+        return self in _AUTOMATIC_TRIGGERS
+
+
+_AUTOMATIC_TRIGGERS: Final[frozenset[ExtractionTrigger]] = frozenset(
+    {
+        ExtractionTrigger.AFTER_TURN,
+        ExtractionTrigger.AFTER_SESSION,
+    }
+)
+
+
+# ---------------------------------------------------------------------------
 # Canonical frozen sets -- for validators and API layer
 # ---------------------------------------------------------------------------
 
@@ -402,6 +455,11 @@ MEMORY_STATUSES: Final[frozenset[MemoryStatus]] = frozenset(MemoryStatus)
 MEMORY_MODES: Final[frozenset[MemoryMode]] = frozenset(MemoryMode)
 """All valid MemoryMode members, as a frozen set."""
 
+EXTRACTION_TRIGGERS: Final[frozenset[ExtractionTrigger]] = frozenset(
+    ExtractionTrigger
+)
+"""All valid ExtractionTrigger members, as a frozen set."""
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -415,10 +473,12 @@ __all__ = [
     "MemorySourceType",
     "MemoryStatus",
     "MemoryMode",
+    "ExtractionTrigger",
     # Canonical frozen sets
     "MEMORY_TYPES",
     "MEMORY_SCOPES",
     "MEMORY_SOURCE_TYPES",
     "MEMORY_STATUSES",
     "MEMORY_MODES",
+    "EXTRACTION_TRIGGERS",
 ]

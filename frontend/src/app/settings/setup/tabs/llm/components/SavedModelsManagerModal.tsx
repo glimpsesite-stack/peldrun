@@ -18,9 +18,14 @@ import {
   Cloud,
   Terminal,
   Package,
+  Archive,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { fetchModelFacts, inferModelCapabilities } from "@/lib/modelMetadata";
+import {
+  fetchModelFacts,
+  getLocalMetadataVault,
+  inferModelCapabilities,
+} from "@/lib/modelMetadata";
 import type { ModelFacts, CapabilitySource } from "@/lib/modelMetadata";
 
 /* -------------------------------------------------------------------------- */
@@ -130,6 +135,13 @@ export function SavedModelsManagerModal({
   const [newModelInput, setNewModelInput] = useState("");
   const [modelFactsMap, setModelFactsMap] = useState<Record<string, ModelFacts>>({});
 
+  // Bumped whenever a capability is edited through the nested
+  // ModelInfoModal. The Memory badge is read directly from
+  // localStorage on every render, so bumping this counter forces the
+  // list to re-render and re-read fresh values — without it, the
+  // badge would stay stale until the whole modal is reopened.
+  const [metadataVersion, setMetadataVersion] = useState(0);
+
   /* -------------------------- Reset on open ----------------------------- */
   useEffect(() => {
     if (!isOpen) return;
@@ -185,7 +197,12 @@ export function SavedModelsManagerModal({
     if (!searchQuery.trim()) return allModels;
     const q = searchQuery.toLowerCase();
     return allModels.filter((m) => m.toLowerCase().includes(q));
-  }, [allModels, searchQuery]);
+    // `metadataVersion` is intentionally a dependency: it is not
+    // read inside the memo body, but bumping it must invalidate the
+    // memo so the render loop re-reads `getLocalMetadataVault()`
+    // after the user edits a model's Memory flag.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allModels, searchQuery, metadataVersion]);
 
   /* -------------------------- Actions ----------------------------------- */
   const toggleModel = (model: string) => {
@@ -377,6 +394,15 @@ export function SavedModelsManagerModal({
               const inferredCaps =
                 inferModelCapabilities(modelId, {}, providerId) || {};
 
+              // Memory is user-authored and lives ONLY in the local
+              // vault (never in `facts` — the catalog has no provider
+              // counterpart for it). Reading it here directly means
+              // the badge reflects the latest toggle without waiting
+              // for the catalog overlay.
+              const isMemory =
+                getLocalMetadataVault()[modelId]?.capabilities?.memory ===
+                true;
+
               let isVision = inferredCaps.isVision;
               let isTools = inferredCaps.isTools;
               let isReasoning = inferredCaps.isReasoning;
@@ -475,6 +501,14 @@ export function SavedModelsManagerModal({
 
                   {/* Capability badges — same rendering rules as discovery modal */}
                   <div className="flex flex-wrap items-center gap-1.5 pl-6 font-sans">
+                    {isMemory && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20"
+                        title="Memory model — designated by you for RAG / vector memory (source: manual)"
+                      >
+                        <Archive size={10} /> Memory
+                      </span>
+                    )}
                     {isReasoning && (
                       <span
                         className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
@@ -554,7 +588,13 @@ export function SavedModelsManagerModal({
         {/* Nested ModelInfoModal — identical to the discovery modal's flow. */}
         <ModelInfoModal
           isOpen={Boolean(infoModalModel)}
-          onClose={() => setInfoModalModel(null)}
+          onClose={() => {
+            setInfoModalModel(null);
+            // Force the model list to re-read localStorage so any
+            // Memory toggle applied inside the info modal appears
+            // immediately in the badge row behind it.
+            setMetadataVersion((v) => v + 1);
+          }}
           modelKey={infoModalModel || ""}
           explicitMeta={null}
           providerId={providerId}

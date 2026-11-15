@@ -1,0 +1,215 @@
+{
+  "cloud_vault": [
+    {
+      "id": "google",
+      "name": "Google Gemini",
+      "type": "",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/interactions",
+      "apiKey": "AQ.",
+      "model": "gemini-4-argon",
+      "popularModels": [
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
+        "gemini-2.5-pro-preview-05-06"
+      ],
+      "badge": "google",
+      "keyPrefixHint": "Google Gemini keys start with 'AIzaSy...'",
+      "status": "online",
+      "savedModels": [
+        "gemini-4-argon",
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.8-flash",
+        "gemma-4-31b-it",
+        "gemma-4-26b-a4b-it",
+        "gemini-2.5-computer-use-preview-10-2025",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite"
+      ],
+      "metadataEndpoint": "https://generativelanguage.googleapis.com/v1beta/models",
+      "latency": 733
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "type": "",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "sk- ",
+      "model": "deepseek-flash",
+      "popularModels": [
+        "deepseek-chat",
+        "deepseek-reasoner"
+      ],
+      "badge": "deepseek",
+      "keyPrefixHint": "DeepSeek keys start with 'sk-'",
+      "status": "online",
+      "savedModels": [
+        "deepseek-flash",
+        "deepseek-v4-pro"
+      ],
+      "metadataEndpoint": "https://api.deepseek.com/models",
+      "latency": 1077
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "type": "",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-proj- - - ",
+      "model": "gpt-6-astra",
+      "popularModels": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o1",
+        "o3-mini"
+      ],
+      "badge": "openai-chatgpt",
+      "keyPrefixHint": "OpenAI keys start with 'sk-proj-'",
+      "status": "online",
+      "savedModels": [
+        "gpt-6-astra",
+        "gpt-5.5"
+      ],
+      "latency": 1246
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic Claude",
+      "type": "anthropic",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-usr- - - ",
+      "model": "claude-fable-5",
+      "popularModels": [
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229"
+      ],
+      "badge": "claude-ai",
+      "keyPrefixHint": "Anthropic keys start with 'sk-ant-'",
+      "status": "online",
+      "savedModels": [
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-haiku-4-5-20251001"
+      ],
+      "metadataEndpoint": "https://api.anthropic.com/v1/models",
+      "latency": 841
+    }
+  ],
+  "custom_endpoints": [],
+  "lmstudio_vault": {
+    "provider": "lmstudio",
+    "baseUrl": "http://100.64.55.65:1235/api/v1/",
+    "apiKey": "sk-lm- : ",
+    "model": "",
+    "status": "online",
+    "savedModels": [
+      "deepseek/deepseek-r1-0528-qwen3-8b",
+      "google/gemma-2-9b",
+      "google/gemma-4-12b-qat",
+      "liquid/lfm2.5-1.2b",
+      "nvidia-nemotron-3-nano-4b",
+      "qwen3-vl-8b-instruct",
+      "zai-org/glm-4.6v-flash"
+    ],
+    "badge": "lm-studio",
+    "metadataEndpoint": "http://100.64.55.65:1235/api/v1/models",
+    "latency": 591
+  },
+  "ollama_vault": {
+    "baseUrl": "http://127.0.0.1:11434",
+    "model": "deepseek-r1-8b:latest",
+    "status": "online",
+    "savedModels": [
+      "deepseek-r1-8b:latest",
+      "gemma2-9b:latest",
+      "lfm2-1.2b:latest",
+      "llama3.2:1b"
+    ],
+    "badge": "Ollama",
+    "metadataEndpoint": "http://127.0.0.1:11434/api/tags",
+    "latency": 570
+  },
+  "scanned_models": [
+    "deepseek/deepseek-r1-0528-qwen3-8b",
+    "google/gemma-2-9b",
+    "google/gemma-4-12b-qat",
+    "liquid/lfm2.5-1.2b",
+    "nvidia-nemotron-3-nano-4b",
+    "qwen3-vl-8b-instruct",
+    "zai-org/glm-4.6v-flash"
+  ],
+  "provider_certificates": {
+    "gigachat:russian_trusted_root_ca": {
+      "id": "gigachat:russian_trusted_root_ca",
+      "provider_package_id": "gigachat",
+      "certificate_id": "russian_trusted_root_ca",
+      "installed_path": "D:\\AI\\peldrun\\backend\\storage\\store\\providers\\gigachat\\certificates\\russian_trusted_root_ca.pem",
+      "sha256": " ",
+      "size_bytes": 4634,
+      "status": "installed",
+      "installed_at": "2026-11-04T20:08:35.583180+00:00",
+      "last_checked_at": "2026-11-07T21:37:51.743644+00:00",
+      "error_message": null
+    }
+  },
+  "provider_connections": [
+    {
+      "name": "GigaChat — Default",
+      "fields": {
+        "base_url": "https://gigachat.devices.sberbank.ru/api/v1",
+        "api_key": "01a0be44-5846-7b53-915e-055694751b9a",
+        "credentials": " ==",
+        "scope": "PERS",
+        "ca_bundle_path": "",
+        "verify_ssl": false
+      },
+      "is_active": true,
+      "id": "conn_9497f9dbfb694a1f",
+      "provider_package_id": "gigachat",
+      "enabled": true,
+      "created_at": "2026-11-07T21:20:39.037961+00:00",
+      "updated_at": "2026-11-07T21:20:41.107962+00:00"
+    },
+    {
+      "name": "Cloudflare AI — Default",
+      "fields": {
+        "base_url": "https://api.cloudflare.com",
+        "api_key": " ",
+        "account_id": " "
+      },
+      "is_active": true,
+      "id": "conn_ff498da68286474f",
+      "provider_package_id": "cloudflare-ai",
+      "badge": "cloudflare",
+      "enabled": true,
+      "created_at": "2026-11-08T17:27:26.043850+00:00",
+      "updated_at": "2026-11-08T17:27:26.043850+00:00"
+    }
+  ],
+  "provider_package_models": {
+    "gigachat": {
+      "savedModels": [
+        "GigaChat-2",
+        "GigaChat-2-Max",
+        "GigaChat-2-Pro",
+        "GigaChat-3-Lightning",
+        "GigaChat-3-Pro",
+        "GigaChat-3-Ultra"
+      ],
+      "model": "GigaChat-2"
+    },
+    "cloudflare-ai": {
+      "savedModels": [
+        "@cf/nvidia/nemotron-3-120b-a12b",
+        "@cf/qwen/qwen3.8-27b",
+        "@cf/qwen/qwen3-30b-a3b-fp8",
+        "@cf/qwen/qwen2.5-coder-32b-instruct",
+        "@cf/google/gemma-4-26b-a4b-it",
+        "@cf/zai-org/glm-5.2"
+      ],
+      "model": "@cf/nvidia/nemotron-3-120b-a12b"
+    }
+  }
+}

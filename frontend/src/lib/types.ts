@@ -408,6 +408,19 @@ export interface ModelCapabilities {
   vision: boolean;
   trained_for_tool_use: boolean;
   reasoning?: boolean;
+  /**
+   * Manual "memory" designation — set exclusively by the user via
+   * the Memory toggle button (`ModelItemCard`) or the discovery
+   * modal. Never auto-inferred from name patterns or provider
+   * payloads; the backend stores it with
+   * `capability_sources.memory = "manual"` and preserves it across
+   * rescans via `_merge_metadata_entries` rule 2.
+   *
+   * Optional (like `reasoning`) because the field did not exist in
+   * older metadata entries and remains absent until the user
+   * explicitly marks a model as a memory model.
+   */
+  memory?: boolean;
 }
 
 export interface ModelMetadata {

@@ -88,6 +88,11 @@ import {
   MAX_TAG_LENGTH,
   MemorySettingsBounds,
 } from './constants';
+import {
+  ALL_EXTRACTION_TRIGGERS,
+  MemoryAIBounds,
+  type ExtractionTrigger,
+} from '../types/ai';
 
 // ---------------------------------------------------------------------------
 // Enum schemas
@@ -335,6 +340,174 @@ const partialTokenBudgetSchema = z.object({
 // ---------------------------------------------------------------------------
 
 /**
+ * Schema for one per-task LLM configuration (`MemoryTaskModel`).
+ *
+ * Every field is optional: `computeEffectiveOverride` expands a
+ * partial override to a FULL object before sending, so the
+ * validator sees the complete shape. `.optional()` keeps the
+ * schema usable from `makeProjectOverrideSchema`'s `.strict()`
+ * context without forcing the caller to supply every field.
+ *
+ * `provider_id` and `model_id` are nullable because `null` means
+ * "not configured" (the backend's `Optional[str]`). `null` is
+ * distinct from `undefined` here: the caller may explicitly
+ * clear a model selection by sending `null`, whereas omitting
+ * the field preserves the current value.
+ */
+const memoryTaskModelSchema = z.object({
+  provider_id: z
+    .string()
+    .trim()
+    .min(1, { message: 'validation.required' })
+    .max(200, { message: 'validation.tooLong' })
+    .nullable()
+    .optional(),
+  model_id: z
+    .string()
+    .trim()
+    .min(1, { message: 'validation.required' })
+    .max(200, { message: 'validation.tooLong' })
+    .nullable()
+    .optional(),
+  max_output_tokens: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.max_output_tokens.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.max_output_tokens.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  timeout_seconds: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.timeout_seconds.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.timeout_seconds.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+});
+
+/**
+ * Schema for a partial `MemoryAISettings` patch.
+ *
+ * Every field optional. No cross-field checks are needed
+ * (unlike `token_budget`'s `reserved <= max` invariant): the
+ * AI settings have no such constraint. The backend's Pydantic
+ * validators run the same bounds again on the merged object,
+ * so this schema is a UI convenience, not the last line of
+ * defense.
+ *
+ * `extraction` and `consolidation` are NESTED and DEEP-MERGED
+ * by the backend router (see `_deep_merge_ai`), so a caller who
+ * sends only `{extraction: {provider_id: 'openai'}}` keeps the
+ * current `model_id`, `max_output_tokens`, and
+ * `timeout_seconds`. The schema accepts the same partial shape.
+ *
+ * `batch_auto_schedule_hours` is nullable (`null` = manual
+ * only). `.optional()` preserves the current value when omitted.
+ */
+const aiSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  extraction_enabled: z.boolean().optional(),
+  consolidation_enabled: z.boolean().optional(),
+  extraction_trigger: z
+    .enum(
+      [...ALL_EXTRACTION_TRIGGERS] as [
+        ExtractionTrigger,
+        ...ExtractionTrigger[],
+      ],
+    )
+    .optional(),
+  after_turn_batching: z.boolean().optional(),
+  extraction: memoryTaskModelSchema.optional(),
+  consolidation: memoryTaskModelSchema.optional(),
+  max_messages_per_job: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.max_messages_per_job.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.max_messages_per_job.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  max_input_tokens: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.max_input_tokens.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.max_input_tokens.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  max_candidates_per_job: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.max_candidates_per_job.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.max_candidates_per_job.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  min_confidence: z
+    .number({ message: 'validation.invalidType' })
+    .min(MemoryAIBounds.min_confidence.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.min_confidence.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  max_cost_nano_usd_per_day: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.max_cost_nano_usd_per_day.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.max_cost_nano_usd_per_day.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  batch_enabled: z.boolean().optional(),
+  batch_max_concurrent_jobs: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.batch_max_concurrent_jobs.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.batch_max_concurrent_jobs.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+  batch_auto_schedule_hours: z
+    .number({ message: 'validation.invalidType' })
+    .int({ message: 'validation.notInteger' })
+    .min(MemoryAIBounds.batch_auto_schedule_hours.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.batch_auto_schedule_hours.max, {
+      message: 'validation.numberMax',
+    })
+    .nullable()
+    .optional(),
+  snapshot_heartbeat_interval_seconds: z
+    .number({ message: 'validation.invalidType' })
+    .min(MemoryAIBounds.snapshot_heartbeat_interval_seconds.min, {
+      message: 'validation.numberMin',
+    })
+    .max(MemoryAIBounds.snapshot_heartbeat_interval_seconds.max, {
+      message: 'validation.numberMax',
+    })
+    .optional(),
+});
+
+/**
  * The static set of field schemas shared by the settings PATCH
  * and the project-override PUT. Factories below wrap this base
  * with cross-field refinements against the CURRENT settings.
@@ -376,6 +549,7 @@ const settingsFieldSchemas = {
     })
     .optional(),
   token_budget: partialTokenBudgetSchema.optional(),
+  ai: aiSettingsSchema.optional(),
   auto_extraction_enabled: z.boolean().optional(),
   auto_extraction_min_turns: z
     .number({ message: 'validation.invalidType' })

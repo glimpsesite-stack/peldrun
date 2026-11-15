@@ -15,7 +15,11 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/ToastNotification";
-import { inferModelCapabilities } from "@/lib/modelMetadata";
+import {
+  inferModelCapabilities,
+  getLocalMetadataVault,
+  toggleModelMemory,
+} from "@/lib/modelMetadata";
 import { ModelItemCard } from "./ModelItemCard";
 import { Icon } from '@/components/Icon/Icon'
 import type {
@@ -89,6 +93,30 @@ export function LocalEnginesTab({
   handleClearOllama,
   handleScanOllama,
 }: LocalEnginesTabProps) {
+  // ------------------------------------------------------------------
+  // Memory toggle — local re-render trigger.
+  //
+  // `toggleModelMemory` (from `@/lib/modelMetadata`) performs the
+  // complete write path: it merges `capabilities.memory = <next>` and
+  // `capability_sources.memory = "manual"` into the local vault, syncs
+  // the entry to `/api/config/models-metadata`, and dispatches the
+  // `omweb:metadata-updated` event so any listener can react.
+  //
+  // The parent's `metadataVault` prop MAY refresh through that event,
+  // but we cannot assume it — `LLMTab` is free to update at any
+  // cadence. Bumping a local counter forces this component to
+  // re-render immediately, and the render loops below read the
+  // metadata fresh from `getLocalMetadataVault()` on every pass. The
+  // result: the Memory badge appears (or disappears) on the very
+  // next paint, regardless of parent behavior.
+  // ------------------------------------------------------------------
+  const [, _bumpMemoryRefresh] = React.useState(0);
+
+  const handleToggleMemory = (modelId: string) => {
+    toggleModelMemory(modelId);
+    _bumpMemoryRefresh((n) => n + 1);
+  };
+
   /* ---------------------- LM Studio derived helpers --------------------- */
 
   const handleClearLMModels = () => {
@@ -356,9 +384,17 @@ export function LocalEnginesTab({
               {availableModels.map((m) => {
                 const isActive =
                   config.llm.provider === "lmstudio" && config.llm.model === m;
+                // Prefer the freshly-written localStorage entry (which
+                // `handleToggleMemory` just updated) over the parent's
+                // `metadataVault` prop, which may still be one render
+                // behind. Falling back to the prop keeps the initial
+                // load path (before any toggle) identical to before.
+                const freshMeta =
+                  (getLocalMetadataVault()[m] as InferenceMeta) ??
+                  (metadataVault[m] as InferenceMeta);
                 const caps: InferredCapabilities = inferModelCapabilities(
                   m,
-                  metadataVault[m] as InferenceMeta
+                  freshMeta
                 );
                 return (
                   <ModelItemCard
@@ -369,6 +405,7 @@ export function LocalEnginesTab({
                     capabilities={caps}
                     onSetPrimary={() => assignDetectedModel(m, "primary")}
                     onSetVision={() => assignDetectedModel(m, "vision")}
+                    onToggleMemory={() => handleToggleMemory(m)}
                     onRemove={() => handleRemoveLMModel(m)}
                     onOpenInfo={() => onOpenModelInfo(m)}
                   />
@@ -578,9 +615,14 @@ export function LocalEnginesTab({
               {ollamaSettings.savedModels.map((m) => {
                 const isActive =
                   config.llm.provider === "ollama" && config.llm.model === m;
+                // Same freshness rule as the LM Studio branch above:
+                // read from localStorage first, fall back to the prop.
+                const freshMeta =
+                  (getLocalMetadataVault()[m] as InferenceMeta) ??
+                  (metadataVault[m] as InferenceMeta);
                 const caps: InferredCapabilities = inferModelCapabilities(
                   m,
-                  metadataVault[m] as InferenceMeta
+                  freshMeta
                 );
                 return (
                   <ModelItemCard
@@ -603,6 +645,7 @@ export function LocalEnginesTab({
                         ""
                       );
                     }}
+                    onToggleMemory={() => handleToggleMemory(m)}
                     onRemove={() => handleRemoveOllamaModel(m)}
                     onOpenInfo={() => onOpenModelInfo(m)}
                   />

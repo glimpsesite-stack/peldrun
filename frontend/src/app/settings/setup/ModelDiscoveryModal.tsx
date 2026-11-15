@@ -21,6 +21,8 @@ import {
   Wrench,
   Database,
   Layers,
+  Hash,
+  Archive,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { inferModelCapabilities, fetchModelFacts } from "@/lib/modelMetadata";
@@ -144,7 +146,22 @@ export function ModelDiscoveryModal({
         if (data.models_metadata) setModelsMetadata(data.models_metadata);
         // Pre-select models if already saved, or select first 3 if none saved
         if (initialSavedModels.length === 0) {
-          const topFew = data.models.slice(0, 3);
+          // Auto-select up to three CHAT models. Embedding models
+          // cannot serve /chat/completions, so picking one as the
+          // default would break the very first message the user
+          // sends. We fall back to the unfiltered list only when the
+          // provider exposes nothing but embedding models (rare, but
+          // possible for a dedicated embedding endpoint).
+          const chatModels = (data.models as string[]).filter((m) => {
+            const meta = data.models_metadata?.[m] || {};
+            return (
+              meta.is_embedding !== true &&
+              meta.type !== "embeddings" &&
+              !m.toLowerCase().includes("embedding")
+            );
+          });
+          const pool = chatModels.length > 0 ? chatModels : data.models;
+          const topFew = pool.slice(0, 3);
           setSelectedModels(new Set(topFew));
           setDefaultModel(topFew[0] || "");
         }
@@ -206,6 +223,39 @@ export function ModelDiscoveryModal({
   const handleClearSelection = () => {
     setSelectedModels(new Set());
     setDefaultModel("");
+  };
+
+  // ------------------------------------------------------------------
+  // Manual "memory" capability toggle.
+  //
+  // Some models are kept in a provider's catalog purely to back the
+  // RAG / vector-memory subsystem. They cannot chat (or are wasteful
+  // to use for chat), so the user can explicitly designate them here.
+  // The designation is persisted in `capabilities.memory = true` with
+  // `capability_sources.memory = "manual"`, which
+  // `_merge_metadata_entries` then preserves across rescans — exactly
+  // like a manual Vision / Tools / Reasoning override.
+  //
+  // Unlike `isEmbedding` (auto-detected from the provider), this flag
+  // is USER-AUTHORED and requires no provider support. A regular chat
+  // model can also be marked as a memory model — for example, to route
+  // RAG traffic to a small/fast model while keeping a large one for
+  // chat.
+  // ------------------------------------------------------------------
+  const toggleMemoryCapability = (modelId: string) => {
+    setModelsMetadata((prev) => {
+      const next = { ...prev };
+      const entry = { ...(next[modelId] || {}) };
+      const caps = { ...(entry.capabilities || {}) };
+      const sources = { ...(entry.capability_sources || {}) };
+      const currentlyOn = caps.memory === true;
+      caps.memory = !currentlyOn;
+      sources.memory = "manual";
+      entry.capabilities = caps;
+      entry.capability_sources = sources;
+      next[modelId] = entry;
+      return next;
+    });
   };
 
   const handleSave = () => {
@@ -416,6 +466,22 @@ export function ModelDiscoveryModal({
               const isDefault = defaultModel === modelId;
               const meta = modelsMetadata[modelId] || {};
 
+              // Embedding detection — mirrors the backend flag added in
+              // `_parse_adapter_model_list` and `_parse_model_list`.
+              // The name-based fallback is defensive: entries persisted
+              // before the backend started writing `is_embedding` will
+              // still render the badge correctly.
+              const isEmbedding =
+                meta.is_embedding === true ||
+                meta.type === "embeddings" ||
+                modelId.toLowerCase().includes("embedding");
+
+              // Manual "memory" designation — user-authored flag,
+              // distinct from the auto-detected `isEmbedding`. Set via
+              // the Memory toggle button; persisted in metadata as
+              // `capabilities.memory` with source `manual`.
+              const isMemory = meta.capabilities?.memory === true;
+
               /* ---------------------------------------------------------- */
               /* Capability badges — read STRICTLY from metadata.           */
               /*                                                            */
@@ -495,7 +561,9 @@ export function ModelDiscoveryModal({
                   onClick={() => toggleModelSelection(modelId)}
                   className={`flex flex-col p-2.5 rounded-lg text-xs font-mono transition-all cursor-pointer border gap-2 ${
                     isSelected
-                      ? "bg-primary/5 border-primary/40 text-foreground shadow-2xs"
+                      ? isEmbedding
+                        ? "bg-slate-500/5 border-slate-500/40 text-foreground shadow-2xs"
+                        : "bg-primary/5 border-primary/40 text-foreground shadow-2xs"
                       : "bg-card/60 hover:bg-muted/60 border-border/40 text-muted-foreground"
                   }`}
                 >
@@ -534,24 +602,81 @@ export function ModelDiscoveryModal({
                       onClick={(e) => e.stopPropagation()}
                     >
                       {isSelected && (
-                        <button
-                          type="button"
-                          onClick={() => setDefaultModel(modelId)}
-                          className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all ${
-                            isDefault
-                              ? "bg-emerald-500 text-white shadow-2xs"
-                              : "bg-muted text-muted-foreground hover:text-foreground"
-                          }`}
-                          title="Set as Default Model for this Provider"
-                        >
-                          {isDefault ? "Default" : "Set Default"}
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => toggleMemoryCapability(modelId)}
+                            className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all flex items-center gap-1 ${
+                              isMemory
+                                ? "bg-cyan-600 text-white shadow-2xs"
+                                : "bg-muted text-muted-foreground hover:text-foreground"
+                            }`}
+                            title={
+                              isMemory
+                                ? "Marked as Memory model — click to unmark"
+                                : "Mark as Memory model (RAG / vector memory)"
+                            }
+                          >
+                            <Archive size={10} />
+                            <span>{isMemory ? "Memory" : "Mark Memory"}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              // Embedding models are never valid chat
+                              // defaults — clicking must be a no-op
+                              // rather than silently corrupting the
+                              // provider's default model.
+                              if (isEmbedding) return;
+                              setDefaultModel(modelId);
+                            }}
+                            disabled={isEmbedding}
+                            className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all ${
+                              isEmbedding
+                                ? "bg-muted text-muted-foreground/50 cursor-not-allowed"
+                                : isDefault
+                                ? "bg-emerald-500 text-white shadow-2xs"
+                                : "bg-muted text-muted-foreground hover:text-foreground"
+                            }`}
+                            title={
+                              isEmbedding
+                                ? "Embedding models cannot be used as the default chat model"
+                                : "Set as Default Model for this Provider"
+                            }
+                          >
+                            {isDefault ? "Default" : "Set Default"}
+                          </button>
+                        </>
                       )}
                     </div>
                   </div>
 
                   {/* Badges Row */}
                   <div className="flex flex-wrap items-center gap-1.5 pl-6 font-sans">
+                    {isEmbedding && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-orange-800 text-slate-100"
+                        title="Embedding model — not for chat. Use the /embeddings endpoint (RAG, semantic search). Cannot be set as the default chat model."
+                      >
+                        <Hash size={10} /> Embedding
+                      </span>
+                    )}
+                    {isMemory && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20"
+                        title="Designated Memory model — routed RAG / vector memory traffic. Manual override (source: manual)."
+                      >
+                        <Archive size={10} /> Memory
+                      </span>
+                    )}
+                    {isMemory && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20"
+                        title="Designated Memory model — routed RAG / vector memory traffic. Manual override (source: manual)."
+                      >
+                        <Archive size={10} /> Memory
+                      </span>
+                    )}
                     {isReasoning && (
                       <span
                         className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"

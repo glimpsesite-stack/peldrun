@@ -1992,6 +1992,57 @@ async def run_instrumented(
             # If the engine crashes before sending FINAL, the `except`
             # block below will handle it.
             pass
+
+            # ─────────────────────────────────────────────────────
+            # [PHASE 1-C] After-Turn extraction hook (agent mode).
+            #
+            # Symmetric with the chat-mode hook in ``run_direct_chat``.
+            # By the time we reach this branch, the engine has:
+            #
+            #   * called ``job_manager.complete_job(...)``, which
+            #     writes session.json with the completed turn,
+            #   * synced session.context.json (sidecar),
+            #   * dispatched its own FINAL SSE event.
+            #
+            # Without this hook, agent-mode conversations would NEVER
+            # trigger the After-Turn or After-Session extraction
+            # patterns -- only chat-mode dispatches would. Every agent
+            # chat would silently accumulate un-extracted turns until
+            # a manual batch run.
+            #
+            # Both hooks are self-guarding (see the chat-mode block in
+            # ``run_direct_chat`` for the full rationale). The hook is
+            # isolated in its OWN try/except so that a memory-subsystem
+            # failure cannot escape into the outer ``except Exception``
+            # block below -- which would call ``job_manager.fail_job``
+            # and overwrite the successfully-completed job status.
+            # ─────────────────────────────────────────────────────
+            try:
+                from omweb.memory import get_memory_service
+
+                _mem_svc = get_memory_service()
+                if _mem_svc is not None and _mem_svc.extraction_enabled:
+                    _chat_after = (
+                        project_manager.get_chat(job_id) or {}
+                    )
+                    _turns_after = _chat_after.get("turns") or []
+                    if _turns_after:
+                        await _mem_svc.notify_turn_completed(
+                            chat_id=chat_id,
+                            project_id=project_id,
+                            current_turn_index=len(_turns_after) - 1,
+                        )
+                        await _mem_svc.notify_session_updated(
+                            chat_id=chat_id,
+                            project_id=project_id,
+                        )
+            except Exception as _mem_hook_err:
+                logger.debug(
+                    "[BRIDGE] After-Turn memory hook skipped "
+                    "for agent job %s: %s",
+                    job_id,
+                    _mem_hook_err,
+                )
     except asyncio.CancelledError:
         print(f"[BRIDGE] Job was cancelled/aborted: {job_id}")
         _safe_monitor_cancel_run(job_id)
@@ -2998,6 +3049,63 @@ async def run_direct_chat(
             chat_storage_engine.sync_sidecar(chat_id, model_id=model_name)
         except Exception as sidecar_err:
             logger.debug(f"[BRIDGE DIRECT CHAT] Sidecar sync notice: {sidecar_err}")
+
+        # ─────────────────────────────────────────────────────────────
+        # [PHASE 1-C] After-Turn extraction hook (chat mode).
+        #
+        # Placement: AFTER ``complete_job`` (which persists session.json)
+        # AND ``sync_sidecar`` (which persists session.context.json).
+        # Both files must be on disk before this hook runs, because the
+        # extraction worker's scanner reads them from disk -- reading a
+        # half-written file would produce a stale snapshot hash and
+        # cause the worker's ``SESSION_CHANGED`` guard to fire
+        # spuriously on the very next heartbeat.
+        #
+        # Both hooks are self-guarding on ``extraction_trigger``:
+        #   * ``notify_turn_completed``  -> no-op unless trigger is
+        #                                    "after_turn" or "both".
+        #   * ``notify_session_updated`` -> no-op unless trigger is
+        #                                    "after_session" or "both"
+        #                                    AND the session status is
+        #                                    "completed".
+        #
+        # Safety: the entire block is wrapped in its OWN try/except.
+        # A memory-subsystem failure must NEVER reach the outer
+        # ``except Exception`` block below -- that path calls
+        # ``job_manager.fail_job(job_id, ...)`` and would overwrite
+        # the "completed" status we just persisted, leaving the user
+        # with a response they can see but a job marked as failed on
+        # the next refresh.
+        #
+        # Placement before FINAL: enqueue the job while the snapshot
+        # is stable. The user's next turn (if any) will produce a
+        # different snapshot hash and therefore its own job; the
+        # idempotency key prevents double-enqueuing the SAME turn.
+        # ─────────────────────────────────────────────────────────────
+        try:
+            from omweb.memory import get_memory_service
+
+            _mem_svc = get_memory_service()
+            if _mem_svc is not None and _mem_svc.extraction_enabled:
+                _chat_after = project_manager.get_chat(job_id) or {}
+                _turns_after = _chat_after.get("turns") or []
+                if _turns_after:
+                    await _mem_svc.notify_turn_completed(
+                        chat_id=chat_id,
+                        project_id=project_id,
+                        current_turn_index=len(_turns_after) - 1,
+                    )
+                    await _mem_svc.notify_session_updated(
+                        chat_id=chat_id,
+                        project_id=project_id,
+                    )
+        except Exception as _mem_hook_err:
+            logger.debug(
+                "[BRIDGE DIRECT CHAT] After-Turn memory hook "
+                "skipped for job %s: %s",
+                job_id,
+                _mem_hook_err,
+            )
 
         await dispatch_event(
             job_id,

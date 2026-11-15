@@ -202,6 +202,7 @@ _PATCHABLE_FIELDS: frozenset = frozenset(
         "min_relevance_score",
         "boost_pinned",
         "token_budget",
+        "ai",
         "auto_extraction_enabled",
         "auto_extraction_min_turns",
     }
@@ -261,6 +262,17 @@ class _SettingsPatch(BaseModel):
             "fields are inherited."
         ),
     )
+    ai: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Partial or complete MemoryAISettings. Nested "
+            "``extraction`` and ``consolidation`` objects are "
+            "deep-merged with the current values, so a caller "
+            "who sends only ``{extraction: {provider_id: 'x'}}`` "
+            "preserves the other extraction fields. See "
+            "``_deep_merge_ai`` for the merge semantics."
+        ),
+    )
     auto_extraction_enabled: Optional[bool] = Field(
         default=None,
         description="Enable post-run extraction",
@@ -305,6 +317,13 @@ class _ProjectSettingsBody(BaseModel):
         default=None, ge=1.0, le=10.0,
     )
     token_budget: Optional[Dict[str, Any]] = None
+    ai: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-project AI override. Same deep-merge "
+            "semantics as _SettingsPatch.ai."
+        ),
+    )
     auto_extraction_enabled: Optional[bool] = None
     auto_extraction_min_turns: Optional[int] = Field(
         default=None, ge=1, le=100,
@@ -443,6 +462,50 @@ def _pydantic_error_to_400(
     )
 
 
+def _deep_merge_ai(
+    current_ai: Dict[str, Any],
+    patch_ai: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Deep-merge a partial AI settings patch into current state.
+
+    Why this is needed
+    ------------------
+    ``MemorySettingsManager.update()`` merges the incoming kwargs
+    into the current settings via a SHALLOW ``dict.update()``. If
+    the caller sends ``{"ai": {"enabled": true}}``, the manager
+    replaces the ENTIRE ``ai`` dict with ``{"enabled": true}``,
+    and Pydantic's ``MemoryAISettings.model_validate`` then fills
+    every omitted field with its DEFAULT -- silently resetting
+    ``min_confidence``, ``max_cost_nano_usd_per_day``, the
+    extraction model, etc. to defaults.
+
+    The router fixes this by deep-merging BEFORE the manager sees
+    the value. The nested ``extraction`` and ``consolidation``
+    dicts are merged field-by-field, so a caller who changes only
+    ``extraction.provider_id`` keeps ``extraction.model_id``,
+    ``max_output_tokens``, and ``timeout_seconds`` from the
+    current state.
+
+    All other top-level fields on ``MemoryAISettings`` are
+    scalars or booleans, so a simple ``dict.update()`` on the
+    top level handles them correctly.
+
+    Returns a NEW dict; neither ``current_ai`` nor ``patch_ai``
+    is mutated.
+    """
+    merged = dict(current_ai)
+    for key, value in patch_ai.items():
+        if isinstance(value, dict) and isinstance(
+            merged.get(key), dict
+        ):
+            nested = dict(merged[key])
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Global settings endpoints
 # ---------------------------------------------------------------------------
@@ -524,6 +587,19 @@ async def patch_settings(body: _SettingsPatch) -> JSONResponse:
         service = _get_service_or_500()
     except HTTPException:
         raise
+
+    # ----- Deep-merge the AI patch into the current state -----
+    #
+    # Without this, sending {"ai": {"enabled": true}} would
+    # replace the entire ai object and reset every unspecified
+    # AI field to its default -- silently undoing the user's
+    # previous configuration. See ``_deep_merge_ai`` for the
+    # rationale.
+    if "ai" in update_dict and isinstance(update_dict["ai"], dict):
+        current_ai = service.settings.ai.model_dump(mode="json")
+        update_dict["ai"] = _deep_merge_ai(
+            current_ai, update_dict["ai"]
+        )
 
     try:
         # ----- Persist + validate -----
@@ -689,6 +765,26 @@ async def put_project_settings(
         service = _get_service_or_500()
     except HTTPException:
         raise
+
+    # ----- Deep-merge the AI override with the global state -----
+    #
+    # A project-level AI override must be a FULL MemoryAISettings
+    # object, because ``effective_for_project`` treats the whole
+    # ``ai`` field as one unit: if the override carries ``ai``,
+    # the whole value REPLACES the base -- there is no delta
+    # merge inside ``ai``. To let callers send a partial
+    # (``{ai: {enabled: false}}``) without losing the global
+    # ``min_confidence``, model choice, etc., we deep-merge the
+    # partial onto the CURRENT GLOBAL ai. The resulting full
+    # object is stored as the override; the project's effective
+    # view then reflects the intended "disable but keep the rest".
+    if "ai" in override_dict and isinstance(
+        override_dict["ai"], dict
+    ):
+        current_ai = service.settings.ai.model_dump(mode="json")
+        override_dict["ai"] = _deep_merge_ai(
+            current_ai, override_dict["ai"]
+        )
 
     # ----- Build the override MemorySettings -----
     #

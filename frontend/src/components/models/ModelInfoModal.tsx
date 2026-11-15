@@ -17,12 +17,14 @@ import {
   MinusCircle,
   RefreshCw,
   AlertCircle,
+  Archive,
 } from "lucide-react";
 import {
   fetchModelFacts,
   getModelMetadata,
   inferModelCapabilities,
   setModelReasoningEffort,
+  toggleModelMemory,
   toggleModelReasoning,
   toggleModelTools,
   toggleModelVision,
@@ -272,7 +274,7 @@ function ModelInfoModalContent({
   //      without refetching.
   // ------------------------------------------------------------------
   const updateLocalMeta = (
-    field: "vision" | "trained_for_tool_use" | "reasoning",
+    field: "vision" | "trained_for_tool_use" | "reasoning" | "memory",
     value: boolean
   ) => {
     setMeta((prev) => {
@@ -308,8 +310,19 @@ function ModelInfoModalContent({
     });
 
     // Mirror into facts so the UI reflects the change immediately.
+    //
+    // "memory" is intentionally a no-op here: `ModelFacts` carries
+    // only provider-observable capabilities (vision / tools /
+    // reasoning). Memory is a user-authored designation with no
+    // provider counterpart, so the `caps` useMemo already reflects
+    // it directly from `vaultCaps.memorySource`. Touching `facts`
+    // for memory would either need a new field on `ModelFacts`
+    // (unnecessary surface) or fall into the `else` branch above
+    // and corrupt `reasoning` — which is exactly the bug this
+    // explicit branch prevents.
     setFacts((prev) => {
       if (!prev) return prev;
+      if (field === "memory") return prev;
       const updated = { ...prev };
       if (field === "vision") {
         updated.vision = { value, source: "manual", known: true };
@@ -336,6 +349,11 @@ function ModelInfoModalContent({
   const handleToggleTools = () => {
     const next = toggleModelTools(modelKey);
     updateLocalMeta("trained_for_tool_use", next);
+  };
+
+  const handleToggleMemory = () => {
+    const next = toggleModelMemory(modelKey);
+    updateLocalMeta("memory", next);
   };
 
   const handleSetEffort = (effort: string) => {
@@ -453,6 +471,7 @@ function ModelInfoModalContent({
           />
           <VisionBox caps={caps} onToggle={handleToggleVision} />
           <ToolsBox caps={caps} onToggle={handleToggleTools} />
+          <MemoryBox caps={caps} onToggle={handleToggleMemory} />
         </div>
 
         {/* Technical Specs Grid */}
@@ -1276,6 +1295,97 @@ function ToolsBox({ caps, onToggle }: ToolsBoxProps) {
         className="px-3 py-1 rounded text-xs font-semibold bg-blue-500 text-white hover:bg-blue-600 cursor-pointer transition-colors shadow-xs shrink-0"
       >
         Enable
+      </button>
+    </div>
+  );
+}
+
+/* ========================================================================== */
+/* MemoryBox                                                                  */
+/* ========================================================================== */
+
+interface MemoryBoxProps {
+  caps: InferredCapabilities;
+  onToggle: () => void;
+}
+
+/**
+ * User-authored "memory" designation.
+ *
+ * Unlike Vision / Tools / Reasoning, this flag has NO provider-side
+ * counterpart: no model API reports "this model is a memory model".
+ * It exists purely so the user can route RAG / vector-memory traffic
+ * to a specific model. That is why the OFF state always uses the
+ * dashed "unknown" panel (there is nothing to confirm) rather than
+ * the muted "provider says no" panel.
+ */
+function MemoryBox({ caps, onToggle }: MemoryBoxProps) {
+  const isOn = caps.isMemory;
+
+  // ON — designated as a memory model.
+  if (isOn) {
+    return (
+      <div className="flex items-center justify-between p-2.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10">
+        <div className="flex items-start gap-2 min-w-0">
+          <Archive
+            size={16}
+            className="text-cyan-600 dark:text-cyan-400 shrink-0 mt-0.5"
+          />
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-xs font-semibold text-foreground">
+                Memory Model (RAG / Vector)
+              </span>
+              <StatusBadge variant="on-manual" />
+            </div>
+            <span className="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold block mt-0.5">
+              ✓ Designated by you for RAG / vector memory
+            </span>
+            <span
+              className="text-[9px] text-muted-foreground block truncate"
+              title="Set manually by you"
+            >
+              Set manually by you
+            </span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onToggle}
+          className="px-2.5 py-1 rounded text-[11px] font-semibold bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground cursor-pointer shrink-0 border border-border"
+          title="Remove memory designation for this model"
+        >
+          Unmark
+        </button>
+      </div>
+    );
+  }
+
+  // OFF — no provider declares this, so the panel is always the
+  // "user can enable manually" variant.
+  return (
+    <div className="flex items-center justify-between p-2.5 rounded-lg border border-dashed border-cyan-500/40 bg-cyan-500/5">
+      <div className="flex items-start gap-2 min-w-0">
+        <Archive size={16} className="text-cyan-500/70 shrink-0 mt-0.5" />
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-xs font-semibold text-foreground">
+              Memory Model (RAG / Vector)
+            </span>
+            <StatusBadge variant="unknown" />
+          </div>
+          <span className="text-[10px] text-muted-foreground block mt-0.5">
+            Not designated — mark this model to route RAG / vector-memory
+            traffic to it
+          </span>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="px-3 py-1 rounded text-xs font-semibold bg-cyan-600 text-white hover:bg-cyan-700 cursor-pointer transition-colors shadow-xs shrink-0"
+      >
+        Mark Memory
       </button>
     </div>
   );

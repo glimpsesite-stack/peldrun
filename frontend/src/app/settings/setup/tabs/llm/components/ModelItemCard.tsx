@@ -4,6 +4,7 @@
 import React from "react";
 import { motion } from "framer-motion";
 import {
+  Archive,
   Brain,
   Eye,
   HelpCircle,
@@ -83,12 +84,16 @@ export function ModelItemCard({
   capabilities,
   onSetPrimary,
   onSetVision,
+  onToggleMemory,
   onRemove,
   onOpenInfo,
 }: ModelItemCardProps) {
   const hasMetadata = capabilities.matchedMetadataKey !== null;
   const hasAnyCapability =
-    capabilities.isVision || capabilities.isTools || capabilities.isReasoning;
+    capabilities.isVision ||
+    capabilities.isTools ||
+    capabilities.isReasoning ||
+    capabilities.isMemory === true;
   const hasAnyInfoBadge =
     Boolean(capabilities.paramsDisplay) ||
     Boolean(capabilities.quantDisplay) ||
@@ -186,6 +191,25 @@ export function ModelItemCard({
             </button>
           )}
 
+          {onToggleMemory && (
+            <button
+              type="button"
+              onClick={onToggleMemory}
+              className={`px-1.5 py-0.5 rounded-sm text-[10px] font-semibold cursor-pointer transition-all hover:scale-105 ${
+                capabilities.isMemory === true
+                  ? "bg-cyan-600 text-white shadow-sm"
+                  : "bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-500/25"
+              }`}
+              title={
+                capabilities.isMemory === true
+                  ? "Marked as Memory model — click to unmark"
+                  : "Mark as Memory model (RAG / vector memory)"
+              }
+            >
+              Memory
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onRemove}
@@ -202,6 +226,15 @@ export function ModelItemCard({
           the source, so the user knows whether to trust it. */}
       {(hasAnyCapability || hasAnyInfoBadge) && (
         <div className="flex flex-wrap items-center gap-1 font-sans">
+          {capabilities.isMemory === true && (
+            <span
+              className="flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-sm bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20"
+              title={sourceLabel(capabilities.memorySource || "manual")}
+            >
+              <Archive size={9} /> Memory
+            </span>
+          )}
+
           {capabilities.isReasoning && (
             <span
               className="flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-sm bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"

@@ -74,14 +74,25 @@ export interface InferredCapabilities {
   isVision: boolean;
   isTools: boolean;
   isReasoning: boolean;
+  /**
+   * Manual "memory" designation — set exclusively by the user via
+   * the Memory toggle button (`ModelItemCard`) or the discovery
+   * modal. Never auto-inferred from name patterns or provider
+   * payloads; the backend stores it with
+   * `capability_sources.memory = "manual"` and preserves it across
+   * rescans via `_merge_metadata_entries` rule 2.
+   */
+  isMemory: boolean;
 
   visionState: "supported" | "unsupported" | "unknown";
   toolsState: "supported" | "unsupported" | "unknown";
   reasoningState: "supported" | "unsupported" | "unknown";
+  memoryState: "supported" | "unsupported" | "unknown";
 
   visionSource: CapabilitySource;
   toolsSource: CapabilitySource;
   reasoningSource: CapabilitySource;
+  memorySource: CapabilitySource;
 
   reasoningMode: string;
   reasoningEffortLevels: string[];
@@ -253,14 +264,18 @@ export async function fetchModelFacts(
 
 function toggleBooleanCapability(
   modelKey: string,
-  field: "vision" | "trained_for_tool_use",
+  field: "vision" | "trained_for_tool_use" | "memory",
   forceState?: boolean
 ): boolean {
   const vault = getLocalMetadataVault();
   const currentMeta = vault[modelKey] || { key: modelKey, type: "llm" };
   const currentCaps = inferModelCapabilities(modelKey, currentMeta);
   const currentBool =
-    field === "vision" ? currentCaps.isVision : currentCaps.isTools;
+    field === "vision"
+      ? currentCaps.isVision
+      : field === "memory"
+      ? currentCaps.isMemory
+      : currentCaps.isTools;
   const nextState = typeof forceState === "boolean" ? forceState : !currentBool;
 
   const currentSources =
@@ -299,6 +314,24 @@ export function toggleModelTools(
   if (typeof window === "undefined") return false;
   if (!modelKey || !modelKey.trim()) return false;
   return toggleBooleanCapability(modelKey, "trained_for_tool_use", forceState);
+}
+
+/**
+ * Toggle the manual "memory" designation for a model.
+ *
+ * Unlike vision / tools / reasoning, memory is NEVER inferred — it
+ * exists purely so the user can route RAG / vector-memory traffic to
+ * a specific model. The write path mirrors the other toggles:
+ * `capability_sources.memory = "manual"` ensures the value survives
+ * a subsequent Scan Models run (`_merge_metadata_entries` rule 2).
+ */
+export function toggleModelMemory(
+  modelKey: string | null | undefined,
+  forceState?: boolean
+): boolean {
+  if (typeof window === "undefined") return false;
+  if (!modelKey || !modelKey.trim()) return false;
+  return toggleBooleanCapability(modelKey, "memory", forceState);
 }
 
 export function toggleModelReasoning(
@@ -418,7 +451,8 @@ export async function fetchServerMetadata(): Promise<
           const hasManualOverride =
             localSources.vision === "manual" ||
             localSources.trained_for_tool_use === "manual" ||
-            localSources.reasoning === "manual";
+            localSources.reasoning === "manual" ||
+            localSources.memory === "manual";
           if (hasManualOverride) {
             merged[key] = {
               ...(merged[key] || {}),
@@ -508,12 +542,15 @@ export function inferModelCapabilities(
       isVision: false,
       isTools: false,
       isReasoning: false,
+      isMemory: false,
       visionState: "unknown",
       toolsState: "unknown",
       reasoningState: "unknown",
+      memoryState: "unknown",
       visionSource: "unknown",
       toolsSource: "unknown",
       reasoningSource: "unknown",
+      memorySource: "unknown",
       reasoningMode: "unreported",
       reasoningEffortLevels: [],
       reasoningDefaultEffort: null,
@@ -586,6 +623,14 @@ export function inferModelCapabilities(
     typeof meta.capabilities?.reasoning === "boolean"
       ? meta.capabilities.reasoning
       : undefined;
+  // Memory is NEVER provider-derived. It is written exclusively by
+  // `toggleModelMemory` (this file) and by the discovery modal, so
+  // the only legitimate source is `manual`. A false/undefined value
+  // simply means "not designated as a memory model".
+  const memoryBool: boolean | undefined =
+    typeof meta.capabilities?.memory === "boolean"
+      ? meta.capabilities.memory
+      : undefined;
 
   const asState = (
     v: boolean | undefined
@@ -595,6 +640,7 @@ export function inferModelCapabilities(
   const visionState = asState(visionBool);
   const toolsState = asState(toolsBool);
   const reasoningState = asState(reasoningBool);
+  const memoryState = asState(memoryBool);
 
   // ------------------------------------------------------------------
   // Reasoning mode resolution.
@@ -618,6 +664,7 @@ export function inferModelCapabilities(
   const isReasoning = reasoningBool === true;
   const isVision = visionBool === true;
   const isTools = toolsBool === true;
+  const isMemory = memoryBool === true;
 
   // ------------------------------------------------------------------
   // Source annotations — only meaningful when the value is known.
@@ -633,6 +680,7 @@ export function inferModelCapabilities(
   const visionSource = asSource(visionBool, explicitSources.vision);
   const toolsSource = asSource(toolsBool, explicitSources.trained_for_tool_use);
   const reasoningSource = asSource(reasoningBool, explicitSources.reasoning);
+  const memorySource = asSource(memoryBool, explicitSources.memory);
 
   // ------------------------------------------------------------------
   // Reasoning sub-config (from metadata only).
@@ -690,12 +738,15 @@ export function inferModelCapabilities(
     isVision,
     isTools,
     isReasoning,
+    isMemory,
     visionState,
     toolsState,
     reasoningState,
+    memoryState,
     visionSource,
     toolsSource,
     reasoningSource,
+    memorySource,
     reasoningMode,
     reasoningEffortLevels: effortLevels,
     reasoningDefaultEffort: defaultEffort,

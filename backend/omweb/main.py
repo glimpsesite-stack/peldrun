@@ -232,6 +232,80 @@ async def lifespan(app: FastAPI):
             exc_info=True,
         )
 
+    # 0c. Start the Memory Extraction Worker (Phase 1-C).
+    #
+    # Runs AFTER `initialize_memory_service()` because the worker
+    # depends on the extraction pipeline components the service
+    # constructed during its own init (outbox, scanner, router,
+    # orchestrator). When extraction is disabled in settings -- or
+    # the memory provider is not sqlite_fts -- the service never
+    # builds those components, so `start_extraction_worker()`
+    # returns False and this block is a no-op.
+    #
+    # Ordering within the block is load-bearing:
+    #
+    #   1. `recover_extractions()` FIRST. It re-enqueues sessions
+    #      that completed during a previous crash but were never
+    #      extracted. Doing this BEFORE the worker starts guarantees
+    #      that recovered work is queued before the worker begins
+    #      its claim loop, so FIFO ordering is preserved across
+    #      restarts.
+    #
+    #   2. `start_extraction_worker()` SECOND. The worker refuses
+    #      to start when no real LLM transport was supplied via
+    #      `transport_provider` -- this is the Phase 1-C graceful
+    #      degradation: jobs may be enqueued and inspected (Batch
+    #      UI, tests, diagnostics) but no LLM call is ever
+    #      attempted with the default stub transport.
+    #
+    # Failure handling: any exception here is logged at WARNING
+    # and NEVER blocks startup. The memory subsystem degrades to
+    # "extraction unavailable" without affecting any other service
+    # -- the P1 regression requirement (T1) is that the app must
+    # boot cleanly even when extraction is broken.
+    try:
+        from omweb.memory import get_memory_service
+
+        _mem_svc = get_memory_service()
+        if _mem_svc is not None and _mem_svc.extraction_enabled:
+            _recovered_jobs = await _mem_svc.recover_extractions()
+            if _recovered_jobs:
+                logger.info(
+                    "Memory extraction recovery: re-enqueued %d "
+                    "job(s) for completed sessions with pending "
+                    "turns.",
+                    _recovered_jobs,
+                )
+            _worker_started = await _mem_svc.start_extraction_worker()
+            if _worker_started:
+                logger.info(
+                    "MemoryExtractionWorker started; extraction "
+                    "will process queued jobs in the background "
+                    "using the configured LLM provider."
+                )
+            else:
+                logger.warning(
+                    "MemoryExtractionWorker NOT started. This is "
+                    "expected ONLY when transport_provider was "
+                    "explicitly set to return None (opt-out). In "
+                    "all other cases, check the log above for a "
+                    "gateway initialization error. Jobs may still "
+                    "be enqueued; they will remain pending until "
+                    "the worker starts."
+                )
+        else:
+            logger.debug(
+                "Memory extraction pipeline disabled; worker "
+                "startup skipped."
+            )
+    except Exception as exc:
+        logger.warning(
+            "Memory extraction worker startup failed "
+            "(non-fatal; extraction unavailable): %s",
+            exc,
+            exc_info=True,
+        )
+
     # 1. Start Resource Monitor subsystem
     try:
         from omweb.services.resource_monitor_service import (
@@ -467,6 +541,39 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(
             "Failed to close BrowserSessionManager on shutdown: %s", exc
+        )
+
+    # 3b. [PHASE 1-C] Stop the Memory Extraction Worker BEFORE the
+    # memory service shutdown below.
+    #
+    # Ordering criticality:
+    #
+    #   1. `stop_extraction_worker()` waits for the current job to
+    #      finish (up to 30s). During that wait the worker calls
+    #      ``outbox.complete()`` or ``outbox.fail()`` -- BOTH
+    #      require the outbox SQLite connection to still be open.
+    #
+    #   2. `shutdown_memory_service()` (block 4 below) closes the
+    #      outbox. If we reversed the order, a running worker would
+    #      hit "outbox is not open" on every heartbeat and, worse,
+    #      any in-flight complete() would raise -- the job would
+    #      stay in `running` until its lease expired, and the
+    #      cursor would never advance for that batch of turns.
+    #
+    # Both the worker stop and this wrapper are idempotent and
+    # never raise -- a shutdown failure here must not prevent the
+    # memory service (and the provider it holds) from closing.
+    try:
+        from omweb.memory import get_memory_service
+
+        _mem_svc = get_memory_service()
+        if _mem_svc is not None:
+            await _mem_svc.stop_extraction_worker(timeout_seconds=30)
+    except Exception as exc:
+        logger.warning(
+            "Memory extraction worker stop failed on shutdown "
+            "(non-fatal): %s",
+            exc,
         )
 
     # 4. Shutdown the Memory Subsystem (P1.7).

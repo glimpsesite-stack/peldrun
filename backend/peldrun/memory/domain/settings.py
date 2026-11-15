@@ -113,7 +113,7 @@ Design invariants
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -238,6 +238,365 @@ class MemoryTokenBudget(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MemoryAIExtractionSettings
+# ---------------------------------------------------------------------------
+
+
+class MemoryAIExtractionSettings(BaseModel):
+    """LLM configuration for one extraction or consolidation task.
+
+    Consumed by ``MemoryModelGateway.generate_structured``
+    (``omweb/memory/extraction/gateway.py``) to resolve credentials
+    from ``models_vault.json`` via ``provider_id``, dispatch to the
+    correct model via ``model_id``, bound cost via
+    ``max_output_tokens``, and bound wall-clock latency via
+    ``timeout_seconds``.
+
+    All fields are operator-tunable. No field is a secret -- the
+    actual API key lives in the model vault, keyed by
+    ``provider_id``, and is resolved lazily by the gateway at call
+    time. Storing a key here would leak it into
+    ``memory_settings.json``, which is not the vault.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    provider_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider id (e.g. 'openai', 'anthropic', 'lmstudio', "
+            "'ollama'). MUST match a provider entry in "
+            "models_vault.json. None means 'not yet configured' "
+            "-- the frontend populates this from a dropdown of "
+            "models the user marked as 'memory' in "
+            "Settings -> Models. At runtime, MemoryService falls "
+            "back to the first marked memory model "
+            "(get_memory_models()[0]) when this is None."
+        ),
+    )
+    model_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Model id understood by the provider (e.g. "
+            "'gpt-4o-mini', 'claude-3-haiku-20240307'). None "
+            "means 'not yet configured' -- same fallback "
+            "semantics as provider_id. Both fields must be set "
+            "together; setting only one is caught at runtime "
+            "(no jobs are enqueued until both are non-None)."
+        ),
+    )
+    max_output_tokens: int = Field(
+        default=1200,
+        ge=128,
+        le=32_000,
+        description=(
+            "Hard cap on completion tokens per extraction call. "
+            "1200 fits ~20 candidate memories with room for "
+            "JSON scaffolding; raising it increases cost but may "
+            "improve coverage on dense sessions."
+        ),
+    )
+    timeout_seconds: int = Field(
+        default=45,
+        ge=5,
+        le=180,
+        description=(
+            "Wall-clock timeout for one extraction LLM call, "
+            "enforced by the gateway's default transport via "
+            "``asyncio.wait_for``. 45s matches the plan's "
+            "default; the range allows 5s (very fast local "
+            "models) up to 180s (slow reasoning models)."
+        ),
+    )
+
+    @field_validator("provider_id", "model_id", mode="after")
+    @classmethod
+    def _validate_non_empty(cls, v: Optional[str]) -> Optional[str]:
+        """Allow None ('not configured'); reject empty strings.
+
+        Empty string is rejected because it is ambiguous with
+        None -- a caller who means "not configured" should send
+        None, not "". Allowing "" would create two
+        indistinguishable representations of the same state.
+        """
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError(
+                f"must be a string or None, got {type(v).__name__}"
+            )
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "must not be empty (use None to leave unset)"
+            )
+        return stripped
+
+
+# ---------------------------------------------------------------------------
+# MemoryAISettings
+# ---------------------------------------------------------------------------
+
+
+class MemoryAISettings(BaseModel):
+    """AI extraction subsystem configuration (Phase 1).
+
+    Controls whether and how the LLM-powered extraction pipeline
+    runs. Distinct from the legacy ``auto_extraction_enabled`` /
+    ``auto_extraction_min_turns`` fields on ``MemorySettings``:
+    those were Phase-0 placeholders for a heuristic extractor.
+    This class gates the LLM extractor.
+
+    Enabling the pipeline
+    ---------------------
+    All three conditions must hold for ``MemoryService`` to bring
+    up the extraction subsystem:
+
+      1. ``enabled`` is True,
+      2. ``extraction_enabled`` is True,
+      3. the current memory mode permits writes
+         (``mode.can_write`` -- extraction writes memories and
+         would fail on every persistence attempt in READ_ONLY or
+         DISABLED mode).
+
+    When any condition fails, the extraction pipeline is absent:
+    no outbox, no worker, no jobs. The rest of the memory
+    subsystem (retrieval, save, search) operates exactly as
+    Phase 0 -- no behavioral regression.
+
+    Two opt-in flags (not one)
+    --------------------------
+    ``enabled`` and ``extraction_enabled`` are intentionally
+    separate so an operator can pre-configure the model
+    (provider, model_id, limits) BEFORE turning extraction on.
+    With a single flag, saving ``provider_id='openai'`` and
+    ``enabled=True`` in the same request would risk the extractor
+    firing before the operator finished configuring sibling
+    fields. The two-step opt-in gives a clean "configure, then
+    arm" workflow without an artificial delay.
+
+    Trigger patterns
+    ----------------
+    See ``extraction_trigger`` for the three supported modes.
+    ``after_turn`` fires on every completed turn (with optional
+    batching); ``after_session`` fires only when the session's
+    status becomes 'completed'; ``both`` fires on either. The
+    actual routing decisions are made by ``TriggerRouter``
+    (``omweb/memory/extraction/trigger_router.py``).
+
+    Field ordering
+    --------------
+    Fields are grouped by concern for readability:
+
+      * toggles (enabled, extraction_enabled, consolidation_enabled)
+      * trigger policy (extraction_trigger, after_turn_batching)
+      * per-task LLM config (extraction, consolidation)
+      * cost and size bounds (max_*, min_confidence)
+      * batch scheduler (batch_*)
+      * worker heartbeat (snapshot_heartbeat_interval_seconds)
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    # ------------------------- toggles --------------------------------------
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the AI extraction subsystem. "
+            "See the class docstring for the three-condition "
+            "gating contract."
+        ),
+    )
+    extraction_enabled: bool = Field(
+        default=False,
+        description=(
+            "Second opt-in flag. Both ``enabled`` and "
+            "``extraction_enabled`` must be True for the "
+            "pipeline to initialize -- see the class docstring."
+        ),
+    )
+    consolidation_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the consolidation subsystem (Phase 5). "
+            "Consolidation merges similar memories into one "
+            "target and archives the sources. Runs in the same "
+            "worker as extraction; when both are enabled the "
+            "worker alternates between the two job types. When "
+            "disabled, consolidation jobs are rejected at the "
+            "orchestrator boundary."
+        ),
+    )
+
+    # ------------------------- trigger policy -------------------------------
+
+    extraction_trigger: Literal[
+        "after_turn", "after_session", "both"
+    ] = Field(
+        default="after_session",
+        description=(
+            "Which trigger pattern fires the extractor. "
+            "'after_turn' = every completed turn (batched by "
+            "default, see ``after_turn_batching``); "
+            "'after_session' = only when session.json.status "
+            "becomes 'completed'; 'both' = both."
+        ),
+    )
+    after_turn_batching: bool = Field(
+        default=True,
+        description=(
+            "When True, ``extraction_trigger='after_turn'`` "
+            "batches all pending turns into ONE job per "
+            "notification instead of one job per turn. "
+            "Batching is cheaper (1 LLM call instead of N) but "
+            "delays per-turn visibility. Only consulted when "
+            "the trigger is 'after_turn' or 'both'."
+        ),
+    )
+
+    # ------------------------- per-task LLM config --------------------------
+
+    extraction: MemoryAIExtractionSettings = Field(
+        default_factory=MemoryAIExtractionSettings,
+        description=(
+            "Model selection and per-call limits for the "
+            "extraction task. See ``MemoryAIExtractionSettings``."
+        ),
+    )
+    consolidation: MemoryAIExtractionSettings = Field(
+        default_factory=MemoryAIExtractionSettings,
+        description=(
+            "Model selection and per-call limits for the "
+            "consolidation task (Phase 5). Independent from "
+            "``extraction`` so an operator can use a stronger "
+            "(or cheaper) model for merging without changing "
+            "the extraction model."
+        ),
+    )
+
+    # ------------------------- size and confidence bounds -------------------
+
+    max_messages_per_job: int = Field(
+        default=40,
+        ge=1,
+        le=200,
+        description=(
+            "Maximum messages sent to the LLM per extraction "
+            "job. A longer conversation is truncated to the "
+            "LAST N messages (most recent context wins). "
+            "Bounds the per-job cost of the LLM call."
+        ),
+    )
+    max_input_tokens: int = Field(
+        default=12_000,
+        ge=512,
+        le=128_000,
+        description=(
+            "Maximum input tokens per extraction job. A second "
+            "cost bound applied AFTER ``max_messages_per_job``. "
+            "If the truncated message set still exceeds this, "
+            "the oldest messages are dropped."
+        ),
+    )
+    max_candidates_per_job: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Ceiling on candidate memories the LLM may propose "
+            "per job. Applied post-parse by "
+            "``ExtractionOrchestrator`` as a cost bound on "
+            "acceptance."
+        ),
+    )
+    min_confidence: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum LLM-reported confidence for a candidate "
+            "to be accepted WITHOUT human review. Candidates "
+            "below the threshold are queued for Pending Review "
+            "(Phase 5), not discarded -- the orchestrator "
+            "makes the accept/reject decision on the review "
+            "queue. 0.0 = accept everything (not recommended); "
+            "0.7 = the plan's default; 1.0 = accept only "
+            "maximum confidence."
+        ),
+    )
+
+    # ------------------------- cost ceiling ---------------------------------
+
+    max_cost_nano_usd_per_day: int = Field(
+        default=50_000_000,
+        ge=0,
+        le=10_000_000_000,
+        description=(
+            "Daily cost ceiling for extraction, in nano-USD. "
+            "When the sum of ``memory_jobs.cost_nano_usd`` for "
+            "the current UTC day exceeds this value, new jobs "
+            "are paused until the next UTC midnight. "
+            "50,000,000 nano = $0.05/day (the plan's default). "
+            "Set to 0 to disable extraction entirely "
+            "(equivalent to ``enabled=False`` but leaves the "
+            "configuration visible for diagnostics)."
+        ),
+    )
+
+    # ------------------------- batch scheduler ------------------------------
+
+    batch_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enable the batch retroactive extraction subsystem "
+            "(Phase 3). Manual batch runs use the "
+            "``/api/memory/extract/batch`` endpoint; automatic "
+            "runs are driven by ``batch_auto_schedule_hours``. "
+            "When False, both the UI button and the scheduler "
+            "refuse to start a new batch."
+        ),
+    )
+    batch_max_concurrent_jobs: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description=(
+            "Maximum concurrent batch jobs. The current "
+            "default (1) serializes batch work to avoid SQLite "
+            "lock contention on the shared ``memory_jobs`` "
+            "table. Raising this is only safe with a "
+            "non-SQLite provider or a properly-configured WAL "
+            "mode."
+        ),
+    )
+    batch_auto_schedule_hours: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=168,
+        description=(
+            "Auto-schedule a batch every N hours. ``None`` = "
+            "manual trigger only (the 'Run batch now' button "
+            "on ``/memory/batch``). Range: 1 hour (aggressive) "
+            ".. 168 hours (one week)."
+        ),
+    )
+
+    # ------------------------- worker heartbeat -----------------------------
+
+    snapshot_heartbeat_interval_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=60.0,
+        description=(
+            "Heartbeat interval for the worker's session-"
+            "snapshot re-check. Lower values detect mid-flight "
+            "session changes faster but consume more IO."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # MemorySettings
 # ---------------------------------------------------------------------------
 
@@ -359,6 +718,23 @@ class MemorySettings(BaseModel):
             "extractor from wasting CPU on trivial one-shot chats. "
             "Only consulted when ``auto_extraction_enabled`` is "
             "True."
+        ),
+    )
+
+    # ------------------------- ai extraction --------------------------------
+
+    ai: MemoryAISettings = Field(
+        default_factory=MemoryAISettings,
+        description=(
+            "AI extraction configuration (Phase 1). When "
+            "``ai.enabled`` and ``ai.extraction_enabled`` are "
+            "both True AND the current mode permits writes, "
+            "``MemoryService`` brings up the extraction pipeline "
+            "(outbox, scanner, trigger router, status watcher, "
+            "orchestrator, worker). When either flag is False "
+            "or the mode forbids writes, the pipeline is "
+            "entirely absent. See ``MemoryAISettings`` for the "
+            "full gating contract."
         ),
     )
 
@@ -578,6 +954,8 @@ def default_settings() -> MemorySettings:
 
 
 __all__ = [
+    "MemoryAIExtractionSettings",
+    "MemoryAISettings",
     "MemorySettings",
     "MemoryTokenBudget",
     "default_settings",

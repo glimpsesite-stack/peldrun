@@ -45,6 +45,10 @@
  */
 
 import type { MemoryMode } from './enums';
+import type {
+  MemoryAISettings,
+  MemoryAISettingsOverlay,
+} from './ai';
 
 // ---------------------------------------------------------------------------
 // Constraint constants
@@ -138,6 +142,19 @@ export interface MemorySettingsOverlay {
   min_relevance_score?: number;
   boost_pinned?: number;
   token_budget?: Partial<MemoryTokenBudget>;
+  /**
+   * AI extraction configuration overlay.
+   *
+   * `MemoryAISettingsOverlay` (deep partial) because a caller
+   * may supply only the fields they want to change -- including
+   * only PART of a nested `extraction` or `consolidation`
+   * object. `computeEffectiveOverride` and
+   * `mergeProjectSettings` expand it to a FULL
+   * `MemoryAISettings` via `mergeMemoryAISettings` -- see the
+   * helper's JSDoc for why sending the full object (not a
+   * partial) is mandatory on the wire.
+   */
+  ai?: MemoryAISettingsOverlay;
   auto_extraction_enabled?: boolean;
   auto_extraction_min_turns?: number;
 }
@@ -188,6 +205,14 @@ export interface MemoryProjectOverride {
   min_relevance_score?: number;
   boost_pinned?: number;
   token_budget?: Partial<MemoryTokenBudget>;
+  /**
+   * Per-project AI override. Same semantics as the global patch:
+   * fields present here win over the global values for this
+   * project only. Sent to the backend as a FULL
+   * `MemoryAISettings` (expanded via `mergeMemoryAISettings`),
+   * not as a partial.
+   */
+  ai?: MemoryAISettingsOverlay;
   auto_extraction_enabled?: boolean;
   auto_extraction_min_turns?: number;
 }
@@ -231,6 +256,33 @@ export interface MemorySettingsPatch {
   min_relevance_score?: number;
   boost_pinned?: number;
   token_budget?: Partial<MemoryTokenBudget>;
+  /**
+   * AI extraction configuration patch (Phase 1).
+   *
+   * IMPORTANT: on the wire, this MUST be the FULL
+   * `MemoryAISettings` object, not a partial. Reason: the
+   * backend's `MemorySettingsManager.update()` applies the
+   * patch via `merged_data.update(kwargs)` -- a SHALLOW
+   * replace. Sending a partial `ai` object would therefore
+   * cause Pydantic's `MemoryAISettings.model_validate` to
+   * fill every omitted field with its DEFAULT (not with the
+   * current value), silently resetting fields the caller did
+   * not intend to touch.
+   *
+   * `computeEffectiveOverride` enforces this by building the
+   * full object via `mergeMemoryAISettings` before including
+   * it in the returned patch. Do NOT construct a patch with
+   * a partial `ai` by hand -- always go through
+   * `computeEffectiveOverride`.
+   *
+   * The type is `MemoryAISettingsOverlay` (deep-partial) so
+   * that callers who go through `computeEffectiveOverride`
+   * can pass a partial nested object. On the wire, the field
+   * is always the FULL `MemoryAISettings` -- the compiler type
+   * is deliberately looser than the wire contract so the
+   * helper's job (expanding the partial) type-checks.
+   */
+  ai?: MemoryAISettingsOverlay;
   auto_extraction_enabled?: boolean;
   auto_extraction_min_turns?: number;
 }
@@ -297,7 +349,27 @@ export interface MemorySettings {
   min_relevance_score: number;
   boost_pinned: number;
   token_budget: MemoryTokenBudget;
+  /**
+   * AI extraction subsystem configuration (Phase 1).
+   *
+   * See `MemoryAISettings` in `./ai.ts` for the full gating
+   * contract. This field is ALWAYS present in the response
+   * (backend fills defaults), so UI code can read
+   * `settings.ai.enabled` without null checks.
+   */
+  ai: MemoryAISettings;
+  /**
+   * @deprecated Phase-0 placeholder for the heuristic extractor.
+   * Superseded by `ai.enabled` + `ai.extraction_enabled` for the
+   * LLM extractor. Kept for backward compatibility with
+   * `MemorySettingsManager`'s Pydantic schema and existing
+   * settings files; removed in a future cleanup once no
+   * deployments reference it.
+   */
   auto_extraction_enabled: boolean;
+  /**
+   * @deprecated See `auto_extraction_enabled`.
+   */
   auto_extraction_min_turns: number;
   project_overrides: Record<string, MemoryProjectOverride>;
 }
@@ -326,6 +398,7 @@ export const MEMORY_SETTINGS_PATCHABLE_FIELDS = [
   'min_relevance_score',
   'boost_pinned',
   'token_budget',
+  'ai',
   'auto_extraction_enabled',
   'auto_extraction_min_turns',
 ] as const satisfies readonly (keyof MemorySettingsPatch)[];
@@ -355,6 +428,46 @@ void _patchableFieldsAreExhaustive;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Merge a partial AI settings override onto a complete base.
+ *
+ * Used by `computeEffectiveOverride` and `mergeProjectSettings`
+ * to expand a `Partial<MemoryAISettings>` into a full
+ * `MemoryAISettings` before comparison or transmission.
+ *
+ * Why deep merge for `extraction` and `consolidation`
+ * ---------------------------------------------------
+ * These two sub-objects are `MemoryTaskModel` instances with
+ * multiple fields. A caller who changes only
+ * `extraction.provider_id` should NOT lose
+ * `extraction.max_output_tokens` in the merged result -- the
+ * shallow spread `{...base, ...override}` would lose the nested
+ * fields when `override.extraction` is present. Merging
+ * field-by-field inside each nested object preserves the
+ * unchanged fields.
+ *
+ * All other fields on `MemoryAISettings` are scalars or
+ * booleans, so the shallow spread handles them correctly.
+ *
+ * Returns a NEW object; neither `base` nor `override` is
+ * mutated.
+ */
+function mergeMemoryAISettings(
+  base: MemoryAISettings,
+  override: MemoryAISettingsOverlay,
+): MemoryAISettings {
+  return {
+    ...base,
+    ...override,
+    extraction: override.extraction
+      ? { ...base.extraction, ...override.extraction }
+      : base.extraction,
+    consolidation: override.consolidation
+      ? { ...base.consolidation, ...override.consolidation }
+      : base.consolidation,
+  };
+}
 
 /**
  * Deep-partial compare: return only the fields of ``override``
@@ -458,6 +571,16 @@ export function computeEffectiveOverride(
     effective.auto_extraction_min_turns =
       override.auto_extraction_min_turns;
   }
+  // ai: expand the partial override to a FULL MemoryAISettings,
+  // then compare against the current full object. The full
+  // object (not the partial) is what gets included in the patch
+  // -- see MemorySettingsPatch's JSDoc for the reason.
+  if (override.ai !== undefined) {
+    const mergedAi = mergeMemoryAISettings(base.ai, override.ai);
+    if (JSON.stringify(mergedAi) !== JSON.stringify(base.ai)) {
+      effective.ai = mergedAi;
+    }
+  }
 
   return effective;
 }
@@ -527,6 +650,13 @@ export function mergeProjectSettings(
       override.min_relevance_score ?? base.min_relevance_score,
     boost_pinned: override.boost_pinned ?? base.boost_pinned,
     token_budget,
+    // ai: when the override supplies any sub-field, deep-merge it
+    // onto the base; otherwise inherit the base ai verbatim. The
+    // result is always a FULL MemoryAISettings (never partial) --
+    // consumers can rely on every field being present.
+    ai: override.ai
+      ? mergeMemoryAISettings(base.ai, override.ai)
+      : base.ai,
     auto_extraction_enabled:
       override.auto_extraction_enabled ?? base.auto_extraction_enabled,
     auto_extraction_min_turns:

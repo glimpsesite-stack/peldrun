@@ -104,6 +104,7 @@ from peldrun.memory.domain import (
     MemoryUnavailableError,
     MemoryValidationError,
 )
+from peldrun.memory.domain.extraction_meta import ExtractionMeta
 
 from omweb.memory.storage.migrations import (
     apply_schema,
@@ -399,7 +400,28 @@ class SqliteMemoryRepository:
         Field order MUST match the ``INSERT`` statement in
         ``_create_sync``. Both places carry a comment listing the
         order so a future edit to one obviously needs the other.
+
+        The LAST parameter is ``extraction_meta_json``:
+
+          * ``None`` for every non-EXTRACTION entry (source_type
+            in {EXPLICIT_USER, AGENT_TOOL, IMPORT}),
+          * the JSON serialization of the ``ExtractionMeta``
+            object for every EXTRACTION-sourced entry.
+
+        The ``extraction_job_id`` column (added by Migration v2)
+        is a VIRTUAL GENERATED column derived from this JSON --
+        the application must NEVER write it directly. SQLite
+        populates it automatically from
+        ``json_extract(extraction_meta_json, '$.job_id')``.
         """
+        extraction_meta_json: Optional[str]
+        if entry.extraction_meta is not None:
+            extraction_meta_json = (
+                entry.extraction_meta.model_dump_json()
+            )
+        else:
+            extraction_meta_json = None
+
         return (
             entry.memory_id,
             entry.memory_type.value,
@@ -422,6 +444,7 @@ class SqliteMemoryRepository:
             self._dt_to_epoch(entry.updated_at),
             self._dt_to_epoch(entry.last_used_at),
             self._dt_to_epoch(entry.expires_at),
+            extraction_meta_json,
         )
 
     def _row_to_entry(self, row: sqlite3.Row) -> Optional[MemoryEntry]:
@@ -429,15 +452,51 @@ class SqliteMemoryRepository:
 
         Returns ``None`` (with a logged warning) when the row's
         stored values cannot be reconstructed -- a corrupt enum
-        value, malformed ``tags_json``, or a missing required field.
-        Callers filter ``None`` and continue serving the rest of the
-        result set. One corrupt row does not break retrieval.
+        value, malformed ``tags_json``/``extraction_meta_json``,
+        or a missing required field. Callers filter ``None`` and
+        continue serving the rest of the result set. One corrupt
+        row does not break retrieval.
+
+        Extraction provenance
+        ---------------------
+        ``extraction_meta_json`` is:
+
+          * ``NULL`` for every non-EXTRACTION row (source_type in
+            {EXPLICIT_USER, AGENT_TOOL, IMPORT}),
+          * a JSON string of ``ExtractionMeta`` for every
+            EXTRACTION row.
+
+        ``MemoryEntry``'s model validator enforces the same rule
+        in the reverse direction:
+
+          * EXTRACTION row with ``NULL`` extraction_meta_json
+            -> REJECTED (this is a corrupt row),
+          * non-EXTRACTION row with non-NULL extraction_meta_json
+            -> REJECTED (also corrupt).
+
+        Both rejections land here as ``None`` (skipped + logged).
+        Silently coercing ``NULL`` -> ``None`` for an EXTRACTION
+        row would defeat the whole audit-trail guarantee: a
+        missing trail is exactly the state the validator exists
+        to catch.
         """
         try:
             tags_raw = row["tags_json"]
             tags = json.loads(tags_raw) if tags_raw else []
             if not isinstance(tags, list):
                 tags = []
+
+            # Extraction provenance: NULL -> None (non-extraction
+            # entry); JSON string -> ExtractionMeta. Malformed
+            # JSON is caught by the outer except (skip + warn).
+            extraction_meta_raw = row["extraction_meta_json"]
+            extraction_meta_obj: Optional[ExtractionMeta] = None
+            if extraction_meta_raw:
+                extraction_meta_obj = (
+                    ExtractionMeta.model_validate_json(
+                        extraction_meta_raw
+                    )
+                )
 
             return MemoryEntry(
                 memory_id=row["memory_id"],
@@ -458,6 +517,7 @@ class SqliteMemoryRepository:
                     source_turn_id=row["source_turn_id"],
                     imported_from=row["imported_from"],
                 ),
+                extraction_meta=extraction_meta_obj,
                 created_at=self._epoch_to_dt(row["created_at"]),
                 updated_at=self._epoch_to_dt(row["updated_at"]),
                 last_used_at=self._epoch_to_dt(row["last_used_at"]),
@@ -508,7 +568,8 @@ class SqliteMemoryRepository:
                         source_type, source_chat_id, source_run_id,
                         source_turn_id, imported_from,
                         content_hash, created_at, updated_at,
-                        last_used_at, expires_at
+                        last_used_at, expires_at,
+                        extraction_meta_json
                     ) VALUES (
                         ?, ?, ?, ?,
                         ?, ?, ?,
@@ -516,7 +577,8 @@ class SqliteMemoryRepository:
                         ?, ?, ?,
                         ?, ?,
                         ?, ?, ?,
-                        ?, ?
+                        ?, ?,
+                        ?
                     )
                     """,
                     self._entry_to_params(entry),
@@ -982,20 +1044,37 @@ class SqliteMemoryRepository:
 
         try:
             with conn:
+                # Extraction provenance is updated alongside every
+                # other field. The entry came from `_row_to_entry`
+                # (correct extraction_meta state) or was built by
+                # the extraction pipeline itself (also correct).
+                # Preserving it here means a user editing an
+                # EXTRACTION entry via `update` does NOT lose the
+                # audit trail -- which would fail validation on
+                # the next read and drop the row as corrupt.
+                extraction_meta_json_update: Optional[str]
+                if entry.extraction_meta is not None:
+                    extraction_meta_json_update = (
+                        entry.extraction_meta.model_dump_json()
+                    )
+                else:
+                    extraction_meta_json_update = None
+
                 cursor = conn.execute(
                     """
                     UPDATE memories SET
-                        memory_type        = ?,
-                        content            = ?,
-                        normalized_content = ?,
-                        tags_json          = ?,
-                        importance         = ?,
-                        confidence         = ?,
-                        status             = ?,
-                        is_pinned          = ?,
-                        content_hash       = ?,
-                        updated_at         = ?,
-                        expires_at         = ?
+                        memory_type          = ?,
+                        content              = ?,
+                        normalized_content   = ?,
+                        tags_json            = ?,
+                        importance           = ?,
+                        confidence           = ?,
+                        status               = ?,
+                        is_pinned            = ?,
+                        content_hash         = ?,
+                        updated_at           = ?,
+                        expires_at           = ?,
+                        extraction_meta_json = ?
                     WHERE memory_id = ?
                       AND scope_type = ?
                       AND scope_id = ?
@@ -1012,6 +1091,7 @@ class SqliteMemoryRepository:
                         entry.content_hash,
                         self._dt_to_epoch(entry.updated_at),
                         self._dt_to_epoch(entry.expires_at),
+                        extraction_meta_json_update,
                         entry.memory_id,
                         entry.scope_type.value,
                         entry.scope_id,

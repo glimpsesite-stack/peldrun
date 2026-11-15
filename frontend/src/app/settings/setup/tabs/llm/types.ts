@@ -305,6 +305,22 @@ export interface ModelItemCardProps {
   capabilities: InferredCapabilitiesType;
   onSetPrimary: () => void;
   onSetVision?: () => void;
+  /**
+   * Optional handler for the "Memory" toggle button.
+   *
+   * Optional (not required) because the same card is reused by call
+   * sites that do not yet expose the memory designation (e.g. future
+   * read-only summaries). When omitted, the button is not rendered —
+   * `ModelItemCard` guards on this prop before drawing the button,
+   * so existing call sites continue to compile without changes.
+   *
+   * When provided, the handler toggles the model's `capabilities.memory`
+   * flag. Persistence is the caller's responsibility: the standard
+   * path writes `capability_sources.memory = "manual"` and POSTs the
+   * updated metadata to `/api/config/models-metadata`, which
+   * `_merge_metadata_entries` then preserves across rescans.
+   */
+  onToggleMemory?: () => void;
   onRemove: () => void;
   onOpenInfo: () => void;
 }

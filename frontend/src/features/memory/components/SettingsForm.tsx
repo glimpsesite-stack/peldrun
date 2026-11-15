@@ -43,7 +43,6 @@ import {
   Power,
   Save,
   SlidersHorizontal,
-  Sparkles,
   Wallet,
 } from 'lucide-react';
 
@@ -72,6 +71,8 @@ import {
   MemoryField,
   MEMORY_FIELD_INPUT_CLASS,
 } from './MemoryField';
+import { MemoryAISettingsSection } from './MemoryAISettingsSection';
+import { DEFAULT_MEMORY_AI_SETTINGS } from '../types/ai';
 import type { MemorySectionAccent } from './MemorySection';
 
 // ---------------------------------------------------------------------------
@@ -320,7 +321,7 @@ export function SettingsForm({ className }: { className?: string }) {
               value={form.min_relevance_score}
               min={MemorySettingsBounds.min_relevance_score.min}
               max={MemorySettingsBounds.min_relevance_score.max}
-              step={0.05}
+              step="any"
               onChange={(e) =>
                 updateField('min_relevance_score', Number(e.target.value))
               }
@@ -340,7 +341,7 @@ export function SettingsForm({ className }: { className?: string }) {
               value={form.boost_pinned}
               min={MemorySettingsBounds.boost_pinned.min}
               max={MemorySettingsBounds.boost_pinned.max}
-              step={0.1}
+              step="any"
               onChange={(e) =>
                 updateField('boost_pinned', Number(e.target.value))
               }
@@ -372,7 +373,7 @@ export function SettingsForm({ className }: { className?: string }) {
               value={form.token_budget.max_tokens}
               min={MemorySettingsBounds.token_budget_max_tokens.min}
               max={MemorySettingsBounds.token_budget_max_tokens.max}
-              step={64}
+              step={1}
               onChange={(e) =>
                 updateBudgetField('max_tokens', Number(e.target.value))
               }
@@ -392,7 +393,7 @@ export function SettingsForm({ className }: { className?: string }) {
               value={form.token_budget.reserved_for_user_scope}
               min={0}
               max={form.token_budget.max_tokens}
-              step={64}
+              step={1}
               onChange={(e) =>
                 updateBudgetField(
                   'reserved_for_user_scope',
@@ -415,7 +416,7 @@ export function SettingsForm({ className }: { className?: string }) {
               value={form.token_budget.warn_threshold}
               min={MemorySettingsBounds.token_budget_warn_threshold.min}
               max={MemorySettingsBounds.token_budget_warn_threshold.max}
-              step={0.05}
+              step="any"
               onChange={(e) =>
                 updateBudgetField('warn_threshold', Number(e.target.value))
               }
@@ -426,61 +427,22 @@ export function SettingsForm({ className }: { className?: string }) {
         </div>
       </MemorySection>
 
-      {/* ============ Auto extraction ============ */}
-      <MemorySection
-        icon={Sparkles}
-        title={t('settings.sections.autoExtraction')}
-        subtitle={t('settings.fields.autoExtractionEnabled')}
-        accent="amber"
-        delay={0.2}
-      >
-        <div className="space-y-3">
-          <label
-            className={cn(
-              'inline-flex items-center gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-xs cursor-pointer',
-              'hover:bg-muted/40 transition-colors',
-              isPending && 'cursor-not-allowed opacity-60',
-            )}
-          >
-            <input
-              type="checkbox"
-              checked={form.auto_extraction_enabled}
-              onChange={(e) =>
-                updateField('auto_extraction_enabled', e.target.checked)
-              }
-              disabled={isPending}
-              className="h-3.5 w-3.5 rounded border-border text-primary focus:ring-2 focus:ring-primary focus:ring-offset-0 cursor-pointer"
-            />
-            <span className="font-medium text-foreground">
-              {t('settings.fields.autoExtractionEnabled')}
-            </span>
-          </label>
-          <MemoryField
-            label={t('settings.fields.autoExtractionMinTurns')}
-            htmlFor={`${formId}-min-turns`}
-            help={t('settings.help.autoExtractionMinTurns')}
-            error={errors.auto_extraction_min_turns}
-            disabled={!form.auto_extraction_enabled}
-          >
-            <input
-              id={`${formId}-min-turns`}
-              type="number"
-              value={form.auto_extraction_min_turns}
-              min={MemorySettingsBounds.auto_extraction_min_turns.min}
-              max={MemorySettingsBounds.auto_extraction_min_turns.max}
-              step={1}
-              onChange={(e) =>
-                updateField(
-                  'auto_extraction_min_turns',
-                  Number(e.target.value),
-                )
-              }
-              disabled={isPending || !form.auto_extraction_enabled}
-              className={MEMORY_FIELD_INPUT_CLASS}
-            />
-          </MemoryField>
-        </div>
-      </MemorySection>
+      {/* ============ Automatic memory (Phase 3) ============ */}
+      {/*
+        Replaces the pre-Phase-1 "Auto extraction" block. The
+        legacy fields (``auto_extraction_enabled``,
+        ``auto_extraction_min_turns``) remain on ``MemorySettings``
+        for backward compatibility with older settings files, but
+        are no longer surfaced in the UI. The AI extraction
+        pipeline is now governed entirely by ``settings.ai``,
+        which this section edits.
+      */}
+      <MemoryAISettingsSection
+        value={form.ai ?? DEFAULT_MEMORY_AI_SETTINGS}
+        onChange={(ai) => updateField('ai', ai)}
+        disabled={isPending}
+        errors={errors}
+      />
 
       {/* ============ Footer ============ */}
       <div className="flex items-center justify-end gap-3 pt-2">

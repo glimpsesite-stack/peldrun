@@ -29,6 +29,7 @@
 
 'use client';
 
+import { useTranslation } from 'react-i18next';
 import { AlertCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 
@@ -71,6 +72,12 @@ export function MemoryField({
   children,
   className,
 }: MemoryFieldProps) {
+  // Translate the error if it is an i18n key (all Zod issues are
+  // keys like "validation.numberMin"). Non-key strings pass
+  // through unchanged -- i18next returns the input verbatim when
+  // no translation is found.
+  const { t } = useTranslation('memory');
+  const displayError = error ? t(error) : undefined;
   return (
     <div
       className={cn(
@@ -95,13 +102,13 @@ export function MemoryField({
           {help}
         </p>
       )}
-      {error && (
+      {displayError && (
         <p
           className="text-[10px] font-medium text-rose-600 dark:text-rose-400 flex items-center gap-1"
           role="alert"
         >
           <AlertCircle size={10} aria-hidden="true" />
-          <span>{error}</span>
+          <span>{displayError}</span>
         </p>
       )}
     </div>

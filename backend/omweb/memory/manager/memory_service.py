@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, List, Optional
 
 from peldrun.memory.domain import (
     MemoryContext,
@@ -75,6 +75,7 @@ from peldrun.memory.domain import (
     MemorySettings,
     default_settings,
 )
+from peldrun.memory.domain.enums import ExtractionTrigger
 from peldrun.memory.domain.scope import resolve_scope_refs
 from peldrun.memory.services import (
     build_empty_context,
@@ -93,6 +94,25 @@ from omweb.memory.manager.memory_settings_manager import (
 logger = logging.getLogger("omweb.memory.manager.service")
 
 
+# ---------------------------------------------------------------------------
+# Extraction subsystem: forward-declared imports
+# ---------------------------------------------------------------------------
+#
+# The extraction subsystem (Phase 1-C) is imported LAZILY inside the
+# lifecycle methods (see `_initialize_extraction` / `_close_extraction`)
+# rather than at module level. Rationale:
+#
+#   * `MemoryService` is imported by the P1 regression test suite,
+#     which does NOT need the extraction pipeline. Deferring the
+#     imports keeps that test path free of extraction-related
+#     transitive imports (faster, fewer failure surfaces).
+#   * A future refactor that decouples extraction into its own
+#     optional package must not break `MemoryService`'s import.
+#
+# The type hints below are declared as strings (`"MemoryOutbox"`,
+# etc.) so mypy still resolves them without the runtime import.
+
+
 class MemoryService:
     """Façade for the memory subsystem.
 
@@ -104,6 +124,14 @@ class MemoryService:
         self,
         db_path: Optional[Path] = None,
         settings_path: Optional[Path] = None,
+        *,
+        outbox_db_path: Optional[Path] = None,
+        extraction_settings_provider: Optional[
+            Callable[[], Optional[object]]
+        ] = None,
+        transport_provider: Optional[
+            Callable[[], Optional[object]]
+        ] = None,
     ) -> None:
         """Construct an uninitialized ``MemoryService``.
 
@@ -121,6 +149,46 @@ class MemoryService:
             Override for the settings JSON file. ``None`` uses
             ``<storage_root>/memory_settings.json``. Tests pass a
             temp path.
+        outbox_db_path
+            Override for the extraction outbox's SQLite file.
+            ``None`` (default) reuses ``db_path`` -- the outbox
+            and the memory repository share ONE database file
+            (the schema for both was created by
+            ``migrations.apply_schema``). Only override this in
+            tests that need physically separated DBs.
+        extraction_settings_provider
+            Callable returning the extraction settings object
+            (typically ``MemoryAISettings`` from Phase 3), or
+            ``None`` when the extraction pipeline is not
+            configured. The returned object is duck-typed: it
+            MUST expose ``enabled``, ``extraction_enabled``,
+            ``extraction_trigger``, and an ``extraction``
+            attribute with ``provider_id`` and ``model_id``.
+
+            When this parameter is ``None`` (the backward-
+            compatible default), extraction is entirely disabled
+            -- no outbox, no worker, no session watcher. Every
+            extraction-related method on the service returns
+            ``None`` immediately.
+        transport_provider
+            Optional callable returning a real LLM transport
+            function (the same callable ``MemoryModelGateway``
+            accepts as its ``transport=`` argument). This is
+            the production injection point through which the
+            ``peldrun.llm`` wiring supplies the real transport.
+
+            When ``None`` (the default), the extraction pipeline
+            is still BUILT -- outbox, scanner, router, watcher,
+            orchestrator, and worker instances all exist and are
+            accessible via their public properties -- but
+            ``start_extraction_worker()`` REFUSES to start the
+            worker. This preserves the safe default: jobs can be
+            enqueued and inspected (for Batch UI, tests, and
+            diagnostics), but no LLM call is ever attempted with
+            the default stub transport.
+
+            Tests inject a mock transport through this parameter
+            to exercise the full extraction pipeline end-to-end.
         """
         self._settings_manager = MemorySettingsManager(path=settings_path)
         self._lifecycle = MemoryLifecycleManager(
@@ -128,6 +196,33 @@ class MemoryService:
             db_path=db_path,
         )
         self._initialized = False
+
+        # --- Extraction subsystem (Phase 1-C) ---
+        # All references are ``None`` until ``_initialize_extraction``
+        # succeeds. Every public extraction entry point must check for
+        # ``None`` before delegating.
+        self._outbox_db_path: Optional[Path] = outbox_db_path
+        self._extraction_settings_provider: Optional[
+            Callable[[], Optional[object]]
+        ] = extraction_settings_provider
+        self._outbox: Optional["MemoryOutbox"] = None
+        self._scanner: Optional["MemorySessionScanner"] = None
+        self._trigger_router: Optional["TriggerRouter"] = None
+        self._status_watcher: Optional["SessionStatusWatcher"] = None
+        self._orchestrator: Optional["ExtractionOrchestrator"] = None
+        self._worker: Optional["MemoryExtractionWorker"] = None
+
+        # --- Transport (production LLM wiring) ---
+        # ``_has_real_transport`` becomes True only when the caller
+        # supplied a ``transport_provider`` AND it returned a non-None
+        # object. ``start_extraction_worker`` uses this to refuse
+        # starting the worker in "no real LLM" configurations --
+        # which prevents queued jobs from failing repeatedly with
+        # ``NotImplementedError`` from the default stub transport.
+        self._transport_provider: Optional[
+            Callable[[], Optional[object]]
+        ] = transport_provider
+        self._has_real_transport: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -141,15 +236,36 @@ class MemoryService:
         Failures during provider open degrade gracefully to a null
         provider -- the service stays "available" (initialized) but
         every ``retrieve`` returns an empty context.
+
+        After the provider is ready, initializes the extraction
+        pipeline (Phase 1-C) if the extraction settings say it is
+        enabled AND the provider is a SQLite provider. Extraction
+        failures are logged but never block startup -- a broken
+        extraction subsystem degrades to "no auto-extraction",
+        which is safer than failing the whole memory service.
         """
         if self._initialized:
             return
         await self._lifecycle.ainitialize()
         self._initialized = True
+
+        # Phase 1-C: bring up extraction if configured.
+        try:
+            await self._initialize_extraction()
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: extraction initialization failed "
+                "(auto-extraction will be unavailable): %s",
+                exc,
+                exc_info=True,
+            )
+
         logger.info(
-            "MemoryService initialized (mode=%s, provider=%s).",
+            "MemoryService initialized (mode=%s, provider=%s, "
+            "extraction=%s).",
             self._lifecycle.settings.mode.value,
             self._lifecycle.settings.provider_id,
+            "enabled" if self._outbox is not None else "disabled",
         )
 
     async def aclose(self) -> None:
@@ -158,9 +274,15 @@ class MemoryService:
         Safe to call before ``ainitialize()`` -- FastAPI's lifespan
         hook runs this from a ``finally`` block that may execute
         after a failed startup.
+
+        Closes the extraction subsystem FIRST (outbox, then
+        lifecycle) so that no in-flight job can attempt to write
+        to a provider being torn down underneath it.
         """
         if not self._initialized and not self._lifecycle.is_ready:
             return
+
+        await self._close_extraction()
         await self._lifecycle.aclose()
         self._initialized = False
         logger.info("MemoryService closed.")
@@ -202,6 +324,85 @@ class MemoryService:
         which is exactly the semantics DISABLED mode promises.
         """
         return self._lifecycle.provider
+
+    # ------------------------------------------------------------------
+    # Extraction subsystem (Phase 1-C)
+    # ------------------------------------------------------------------
+
+    @property
+    def extraction_enabled(self) -> bool:
+        """True when the extraction pipeline is initialized and running.
+
+        ``False`` when:
+          * ``extraction_settings_provider`` was not supplied,
+          * extraction is disabled in settings,
+          * the provider is not SQLite (extraction requires SQLite),
+          * initialization failed.
+        """
+        return self._outbox is not None
+
+    @property
+    def outbox(self) -> Optional["MemoryOutbox"]:
+        """The extraction outbox, or ``None`` when extraction is off."""
+        return self._outbox
+
+    @property
+    def trigger_router(self) -> Optional["TriggerRouter"]:
+        """The extraction trigger router, or ``None``."""
+        return self._trigger_router
+
+    @property
+    def status_watcher(self) -> Optional["SessionStatusWatcher"]:
+        """The extraction status watcher, or ``None``."""
+        return self._status_watcher
+
+    @property
+    def session_scanner(self) -> Optional["MemorySessionScanner"]:
+        """The extraction session scanner, or ``None``."""
+        return self._scanner
+
+    @property
+    def orchestrator(self) -> Optional["ExtractionOrchestrator"]:
+        """The extraction orchestrator, or ``None``."""
+        return self._orchestrator
+
+    @property
+    def worker(self) -> Optional["MemoryExtractionWorker"]:
+        """The extraction worker instance, or ``None``.
+
+        The worker is CREATED during ``_initialize_extraction``
+        but only STARTED by an explicit ``start_extraction_worker``
+        call. This separation gives ``main.py``'s lifespan full
+        control over when the worker begins polling -- after
+        recovery completes, after every other subsystem is up,
+        etc. -- while still exposing the instance for inspection.
+        """
+        return self._worker
+
+    def get_extraction_trigger(self) -> Optional[str]:
+        """Return the current ``extraction_trigger`` mode or ``None``.
+
+        Used by the dispatcher's After-Turn hook (Phase 1-C) to
+        decide whether to fire the per-turn trigger. Returns
+        ``None`` when extraction is disabled, which the dispatcher
+        treats as "do nothing".
+        """
+        if self._extraction_settings_provider is None:
+            return None
+        try:
+            settings = self._extraction_settings_provider()
+        except Exception:
+            return None
+        if settings is None:
+            return None
+        if not getattr(settings, "enabled", False):
+            return None
+        if not getattr(settings, "extraction_enabled", False):
+            return None
+        trigger = getattr(settings, "extraction_trigger", None)
+        if trigger in ("after_turn", "after_session", "both"):
+            return trigger
+        return None
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -411,32 +612,619 @@ class MemoryService:
         return new_settings
 
     # ------------------------------------------------------------------
-    # Extraction queue (P1.6 stub)
+    # Extraction queue (Phase 1-C)
     # ------------------------------------------------------------------
 
     async def enqueue_extraction(
         self,
         *,
-        run_id: str,
+        trigger_type: ExtractionTrigger,
         chat_id: str,
-        project_id: str,
-    ) -> None:
-        """Enqueue a post-run extraction job. NOT IMPLEMENTED YET.
+        project_id: Optional[str],
+        start_turn_index: int,
+        end_turn_index: int,
+    ) -> Optional["MemoryJob"]:
+        """Enqueue an extraction job with an EXPLICIT turn range.
 
-        Will land with ``WritePipeline`` + ``Outbox`` in P1.6. Until
-        then this method logs and returns -- the dispatcher's
-        auto-extraction call site (which is also deferred) is
-        already prepared for this no-op behavior: it only invokes
-        this method when ``auto_extraction_enabled`` is True, and
-        that flag defaults to False in ``MemorySettings``.
+        Used by callers that already know exactly which turns
+        need processing -- typically the dispatcher's After-Turn
+        hook (per-turn range) or the operator's "extract these
+        turns" UI action.
+
+        Returns the created ``MemoryJob``, or ``None`` when:
+
+          * extraction is not initialized (disabled in settings,
+            non-SQLite provider, or init failed),
+          * the range is empty / invalid,
+          * the session file cannot be read,
+          * the idempotency key matches an existing job
+            (duplicate suppression).
+
+        Never raises for expected failure modes. A redundant
+        call is a safe no-op.
         """
-        logger.debug(
-            "enqueue_extraction called (run=%s, chat=%s, project=%s) "
-            "-- not implemented yet (P1.6).",
-            run_id,
-            chat_id,
-            project_id,
+        if self._trigger_router is None:
+            logger.debug(
+                "enqueue_extraction: extraction disabled; skipping "
+                "(chat=%r, trigger=%r).",
+                chat_id, trigger_type.value,
+            )
+            return None
+
+        jobs = await self._trigger_router.route_explicit(
+            chat_id=chat_id,
+            project_id=project_id,
+            trigger_type=trigger_type,
+            start_turn_index=start_turn_index,
+            end_turn_index=end_turn_index,
         )
+        return jobs[0] if jobs else None
+
+    async def enqueue_extraction_from_session(
+        self,
+        *,
+        trigger_type: ExtractionTrigger,
+        chat_id: str,
+        project_id: Optional[str],
+    ) -> Optional["MemoryJob"]:
+        """Enqueue an extraction job whose range is derived from the
+        session's current state.
+
+        Range derivation depends on the trigger type:
+
+          * ``AFTER_SESSION``: pending tail (cursor+1 .. total-1).
+            Skipped if already extracted (cursor is caught up).
+          * ``MANUAL``:          whole session (0 .. total-1).
+            Used by the "Extract from this chat" button, which
+            intentionally re-processes the whole chat.
+
+        Returns the created ``MemoryJob`` or ``None``. Same
+        non-raising contract as ``enqueue_extraction``.
+        """
+        if self._trigger_router is None:
+            logger.debug(
+                "enqueue_extraction_from_session: extraction "
+                "disabled; skipping (chat=%r, trigger=%r).",
+                chat_id, trigger_type.value,
+            )
+            return None
+
+        if trigger_type == ExtractionTrigger.MANUAL:
+            jobs = await self._trigger_router.route_on_demand(
+                chat_id=chat_id,
+                project_id=project_id,
+            )
+        else:
+            jobs = await self._trigger_router.route_after_session(
+                chat_id=chat_id,
+                project_id=project_id,
+            )
+        return jobs[0] if jobs else None
+
+    async def notify_turn_completed(
+        self,
+        *,
+        chat_id: str,
+        project_id: Optional[str],
+        current_turn_index: int,
+    ) -> None:
+        """Fire the After-Turn extraction hook. Called by the
+        dispatcher after each successful turn.
+
+        Respects the ``extraction_trigger`` setting:
+          * ``after_turn`` / ``both``  -> fire the route,
+          * ``after_session``          -> no-op.
+
+        Never raises -- the caller has just completed a user turn
+        and cannot afford a memory-subsystem failure to abort it.
+        """
+        if self._trigger_router is None:
+            return
+        trigger = self.get_extraction_trigger()
+        if trigger not in ("after_turn", "both"):
+            return
+
+        try:
+            jobs = await self._trigger_router.route_after_turn(
+                chat_id=chat_id,
+                project_id=project_id,
+                current_turn_index=current_turn_index,
+            )
+            if jobs:
+                logger.info(
+                    "notify_turn_completed: enqueued %d After-Turn "
+                    "job(s) for chat=%r at turn %d.",
+                    len(jobs), chat_id, current_turn_index,
+                )
+        except Exception as exc:
+            logger.warning(
+                "notify_turn_completed failed for chat=%r "
+                "(non-fatal): %s",
+                chat_id, exc,
+            )
+
+    async def notify_session_updated(
+        self,
+        *,
+        chat_id: str,
+        project_id: Optional[str] = None,
+    ) -> None:
+        """Fire the After-Session hook. Called by the dispatcher after
+        each turn (in addition to ``notify_turn_completed``) and by
+        any code that observes a completed session.
+
+        Delegates to ``SessionStatusWatcher``, which enforces the
+        trigger-mode check, the ``status == 'completed'`` check,
+        and idempotency. Never raises.
+        """
+        if self._status_watcher is None:
+            return
+        try:
+            await self._status_watcher.notify_session_updated(
+                chat_id=chat_id,
+                project_id=project_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "notify_session_updated failed for chat=%r "
+                "(non-fatal): %s",
+                chat_id, exc,
+            )
+
+    async def recover_extractions(self) -> int:
+        """Re-enqueue completed-but-unprocessed sessions at startup.
+
+        Called once by ``main.py`` lifespan AFTER ``ainitialize``
+        succeeds. Returns the number of jobs enqueued (0 when
+        extraction is off or nothing needs recovery).
+        """
+        if self._status_watcher is None:
+            return 0
+        try:
+            return await self._status_watcher.recover()
+        except Exception as exc:
+            logger.warning(
+                "recover_extractions failed (non-fatal): %s", exc,
+            )
+            return 0
+
+    async def start_extraction_worker(self) -> bool:
+        """Start the extraction worker if the transport is real.
+
+        Returns
+        -------
+        bool
+            True when the worker is running after this call.
+            False when the worker was NOT started for any of
+            these reasons:
+
+              * extraction pipeline was not initialized (settings
+                disabled, provider not SQLite, or init failed),
+              * no real transport was injected via
+                ``transport_provider`` -- the default gateway
+                uses a stub transport that raises
+                ``NotImplementedError``; starting the worker
+                would only produce failed jobs,
+              * ``worker.start()`` itself raised (logged at
+                ERROR; state is consistent).
+
+            Idempotent: calling on an already-running worker is a
+            no-op that returns True.
+
+        Never raises. All failure modes are logged and reported
+        as ``False``.
+        """
+        if self._worker is None:
+            logger.debug(
+                "start_extraction_worker: extraction pipeline not "
+                "initialized; nothing to start."
+            )
+            return False
+        if not self._has_real_transport:
+            logger.warning(
+                "start_extraction_worker: no real transport "
+                "configured (transport_provider is None or it "
+                "returned None). The worker will NOT start. Jobs "
+                "may still be enqueued and will remain in "
+                "'pending' status until a real transport is "
+                "wired."
+            )
+            return False
+        if self._worker.is_running:
+            logger.debug(
+                "start_extraction_worker: worker already running."
+            )
+            return True
+        try:
+            await self._worker.start()
+            logger.info(
+                "MemoryExtractionWorker started (worker_id=%s).",
+                self._worker.worker_id,
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "start_extraction_worker: worker.start() failed: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    async def stop_extraction_worker(
+        self, *, timeout_seconds: int = 30
+    ) -> None:
+        """Stop the extraction worker gracefully.
+
+        Idempotent: safe to call when the worker is not running
+        or was never created. Never raises -- a shutdown path
+        must not throw, because that would skip subsequent
+        cleanup steps in the lifespan hook.
+        """
+        if self._worker is None or not self._worker.is_running:
+            return
+        try:
+            await self._worker.stop(timeout_seconds=timeout_seconds)
+            logger.info("MemoryExtractionWorker stopped.")
+        except Exception as exc:
+            logger.warning(
+                "stop_extraction_worker failed (non-fatal): %s", exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Internal: extraction lifecycle
+    # ------------------------------------------------------------------
+
+    async def _initialize_extraction(self) -> None:
+        """Bring up the extraction subsystem when it is applicable.
+
+        Preconditions checked IN ORDER:
+          1. ``extraction_settings_provider`` was supplied,
+          2. it returns a non-None settings object,
+          3. ``settings.enabled`` and ``settings.extraction_enabled``
+             are both True,
+          4. the current provider is ``sqlite_fts`` (extraction
+             requires the ``memory_jobs`` table, which only exists
+             in the SQLite schema),
+          5. an extraction model is configured.
+
+        Any failure leaves ``self._outbox`` and friends at ``None``
+        -- extraction is simply unavailable, which is the correct
+        degradation.
+        """
+        if self._extraction_settings_provider is None:
+            return
+
+        settings = self._extraction_settings_provider()
+        if settings is None:
+            return
+        if not getattr(settings, "enabled", False):
+            return
+        if not getattr(settings, "extraction_enabled", False):
+            return
+
+        # [PHASE 1-C FIX — T2] Extraction writes memories, which
+        # requires a WRITABLE provider. In DISABLED mode the lifecycle
+        # manager installed a NullMemoryProvider whose create/update
+        # raise ``MemoryUnavailableError``. In READ_ONLY mode the
+        # provider exists but ``MemoryWritePipeline._enforce_can_write``
+        # raises on every ``save`` / ``save_many`` call.
+        #
+        # In BOTH cases the extraction pipeline would enqueue jobs
+        # that fail on every persistence attempt -- visible noise in
+        # the jobs list with ZERO chance of success. The correct
+        # degradation is to skip extraction initialization entirely:
+        # no outbox, no worker, no jobs. When the operator later
+        # switches to ``read_write`` mode, ``reload_settings`` plus
+        # the next ``ainitialize`` cycle will bring extraction up
+        # cleanly.
+        #
+        # Two distinct settings objects gate extraction, and both
+        # must pass:
+        #
+        #   1. ``self._lifecycle.settings``         — the MEMORY
+        #      lifecycle settings. Its ``mode`` decides whether
+        #      writes are physically possible (``can_write``).
+        #
+        #   2. ``settings`` (the local variable above) — the AI
+        #      extraction settings (``MemoryAISettings``). Its
+        #      ``enabled`` / ``extraction_enabled`` flags decide
+        #      whether extraction is *wanted*.
+        #
+        # The check below is the "wanted AND possible" gate.
+        if not self._lifecycle.settings.mode.can_write:
+            logger.info(
+                "MemoryService: extraction skipped -- memory mode "
+                "%r does not permit writes (extraction would enqueue "
+                "jobs that fail on every persistence attempt).",
+                self._lifecycle.settings.mode.value,
+            )
+            return
+
+        provider_id = self._lifecycle.settings.provider_id
+        if provider_id != "sqlite_fts":
+            logger.info(
+                "Extraction enabled but provider %r is not "
+                "sqlite_fts; skipping extraction pipeline init.",
+                provider_id,
+            )
+            return
+
+        # Lazy imports (see module docstring).
+        from omweb.memory.extraction.session_scanner import (
+            MemorySessionScanner,
+        )
+        from omweb.memory.extraction.status_watcher import (
+            SessionStatusWatcher,
+        )
+        from omweb.memory.extraction.trigger_router import (
+            ExtractionModelConfig,
+            TriggerRouter,
+        )
+        from omweb.memory.jobs.outbox import MemoryOutbox
+
+        # Resolve the outbox DB path (defaults to provider's DB).
+        db_path = self._outbox_db_path or self._lifecycle.db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Open the outbox.
+        outbox = MemoryOutbox(db_path)
+        await outbox.open()
+
+        # Build the pipeline components.
+        scanner = MemorySessionScanner(outbox)
+
+        # Model config provider: converts the extraction settings'
+        # ``extraction`` sub-object into an ``ExtractionModelConfig``.
+        def _model_config_provider():
+            s = (
+                self._extraction_settings_provider()
+                if self._extraction_settings_provider else None
+            )
+            if s is None:
+                return None
+            if not getattr(s, "enabled", False):
+                return None
+            if not getattr(s, "extraction_enabled", False):
+                return None
+            extraction = getattr(s, "extraction", None)
+            if extraction is None:
+                return None
+            pid = getattr(extraction, "provider_id", None)
+            mid = getattr(extraction, "model_id", None)
+            if not pid or not mid:
+                return None
+            return ExtractionModelConfig(
+                provider_id=str(pid),
+                model_id=str(mid),
+            )
+
+        # Batching flag (defaults to True per plan §12).
+        after_turn_batching = bool(
+            getattr(settings, "after_turn_batching", True)
+        )
+
+        router = TriggerRouter(
+            scanner,
+            outbox,
+            model_config_provider=_model_config_provider,
+            after_turn_batching=after_turn_batching,
+        )
+        watcher = SessionStatusWatcher(
+            scanner,
+            router,
+            settings_provider=self._extraction_settings_provider,
+        )
+
+        # ------------------------------------------------------------------
+        # Build the extraction orchestrator with a gateway whose transport
+        # is either the caller-supplied real transport (via
+        # ``transport_provider``) or the default stub. The stub is
+        # intentional and safe: ``start_extraction_worker`` checks
+        # ``_has_real_transport`` and refuses to launch the worker when
+        # the stub is in use. This is the Phase 1-C "graceful degradation"
+        # contract -- the pipeline is fully built and inspectable, but
+        # it cannot accidentally burn LLM cost or corrupt the cursor
+        # without a real transport.
+        # ------------------------------------------------------------------
+        from omweb.memory.extraction.orchestrator import (
+            ExtractionOrchestrator,
+        )
+        from omweb.memory.extraction.gateway import (
+            MemoryModelGateway,
+        )
+
+        # ------------------------------------------------------------------
+        # Build the extraction gateway. Three configuration modes:
+        #
+        #   1. ``transport_provider`` supplied AND returns a transport
+        #      -> use that transport verbatim (test mock or custom
+        #      production wiring). Worker starts.
+        #
+        #   2. ``transport_provider`` supplied BUT returns None
+        #      -> explicit "no transport" signal. Gateway still gets
+        #      the real default (so it is constructible), but the
+        #      worker is prevented from starting. This is the
+        #      operator's opt-out path.
+        #
+        #   3. ``transport_provider`` NOT supplied
+        #      -> Phase 1-C complete: default transport is now REAL
+        #      (peldrun.llm-backed, reads models_vault.json). Worker
+        #      starts automatically. This is the production path.
+        # ------------------------------------------------------------------
+        transport = None
+        if self._transport_provider is not None:
+            try:
+                transport = self._transport_provider()
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: transport_provider raised; "
+                    "extraction worker will not start in production "
+                    "mode: %s",
+                    exc,
+                )
+                transport = None
+
+        if transport is not None:
+            gateway = MemoryModelGateway(transport=transport)
+            self._has_real_transport = True
+            logger.info(
+                "MemoryService: extraction gateway wired with "
+                "caller-supplied transport."
+            )
+        elif self._transport_provider is not None:
+            # Provider supplied but returned None -> explicit opt-out.
+            gateway = MemoryModelGateway()
+            self._has_real_transport = False
+            logger.info(
+                "MemoryService: transport_provider returned None -- "
+                "worker will not start (explicit opt-out)."
+            )
+        else:
+            # No provider supplied. Default transport is REAL
+            # (peldrun.llm-backed). Worker starts.
+            gateway = MemoryModelGateway()
+            self._has_real_transport = True
+            logger.info(
+                "MemoryService: extraction gateway using DEFAULT "
+                "REAL transport (peldrun.llm-backed, reads "
+                "models_vault.json). Worker will start when "
+                "start_extraction_worker() is called."
+            )
+
+        extraction_cfg = getattr(settings, "extraction", None)
+        orchestrator = ExtractionOrchestrator(
+            gateway=gateway,
+            max_candidates_per_job=int(
+                getattr(settings, "max_candidates_per_job", 20)
+            ),
+            min_confidence=float(
+                getattr(settings, "min_confidence", 0.0)
+            ),
+            max_output_tokens=(
+                int(getattr(extraction_cfg, "max_output_tokens", 1200))
+                if extraction_cfg is not None
+                else 1200
+            ),
+            timeout_seconds=(
+                int(getattr(extraction_cfg, "timeout_seconds", 45))
+                if extraction_cfg is not None
+                else 45
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # Build the extraction worker. The write-pipeline provider is a
+        # CALLABLE (not a fixed instance) so that a settings reload
+        # between jobs is observed automatically -- see
+        # ``MemoryExtractionWorker``'s module docstring, invariant #3.
+        # ------------------------------------------------------------------
+        from omweb.memory.jobs.worker import (
+            MemoryExtractionWorker,
+        )
+        from omweb.memory.manager.write_pipeline import (
+            MemoryWritePipeline,
+        )
+
+        def _write_pipeline_provider() -> "MemoryWritePipeline":
+            return MemoryWritePipeline(
+                port=self._lifecycle.provider,
+                settings=self._lifecycle.settings,
+            )
+
+        heartbeat_seconds = float(
+            getattr(
+                settings,
+                "snapshot_heartbeat_interval_seconds",
+                5,
+            )
+        )
+        worker = MemoryExtractionWorker(
+            outbox,
+            scanner=scanner,
+            orchestrator=orchestrator,
+            write_pipeline_provider=_write_pipeline_provider,
+            heartbeat_interval_seconds=heartbeat_seconds,
+        )
+
+        # Commit the subsystem state ONLY after all steps succeed.
+        self._outbox = outbox
+        self._scanner = scanner
+        self._trigger_router = router
+        self._status_watcher = watcher
+        self._orchestrator = orchestrator
+        self._worker = worker  # created but NOT started
+
+        logger.info(
+            "MemoryService: extraction pipeline initialized "
+            "(outbox_db=%s, after_turn_batching=%s, "
+            "real_transport=%s, heartbeat=%ss).",
+            db_path,
+            after_turn_batching,
+            self._has_real_transport,
+            heartbeat_seconds,
+        )
+
+    async def _close_extraction(self) -> None:
+        """Tear down the extraction subsystem. Idempotent.
+
+        Shutdown ordering matters here:
+
+          1. Stop the worker FIRST. ``worker.stop()`` waits for the
+             current job to finish (up to its own timeout), ensuring
+             no job attempts to write to the outbox or the provider
+             after this method returns.
+
+          2. Only THEN null out the state fields and close the
+             outbox. If we closed the outbox first, a still-running
+             worker would hit "outbox is not open" errors on every
+             heartbeat / complete() call until its lease expired.
+        """
+        # --- Step 1: stop the worker ---
+        worker = self._worker
+        self._worker = None
+        if worker is not None and worker.is_running:
+            try:
+                await worker.stop(timeout_seconds=30)
+                logger.info(
+                    "MemoryService: extraction worker stopped."
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: worker stop failed "
+                    "(non-fatal): %s", exc,
+                )
+
+        # Clear orchestrator alongside worker -- both are useless
+        # after the worker stops, and nulling them prevents any
+        # in-flight call from accidentally using a stale reference.
+        self._orchestrator = None
+        self._has_real_transport = False
+
+        # --- Step 2: stop the rest of the pipeline ---
+        # Capture and null-out first so a re-entrant call
+        # (should never happen, but defense in depth) sees the
+        # fields as already-cleared.
+        watcher = self._status_watcher
+        router = self._trigger_router
+        scanner = self._scanner
+        outbox = self._outbox
+
+        self._status_watcher = None
+        self._trigger_router = None
+        self._scanner = None
+        self._outbox = None
+
+        # Watcher / router / scanner are stateless; nothing to close.
+        # Only the outbox holds a live SQLite connection.
+        if outbox is not None:
+            try:
+                await outbox.close()
+                logger.info("MemoryService: extraction outbox closed.")
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: extraction outbox close "
+                    "failed (non-fatal): %s", exc,
+                )
 
     # ------------------------------------------------------------------
     # Internal: usage recording

@@ -268,7 +268,7 @@ def save_metadata_cache(new_meta: dict) -> None:
 # Merge-aware persistence (used by /fetch-models)
 # ---------------------------------------------------------------------------
 
-_CAPABILITY_FIELDS = ("vision", "trained_for_tool_use", "reasoning")
+_CAPABILITY_FIELDS = ("vision", "trained_for_tool_use", "reasoning", "memory")
 
 _SCALAR_FIELDS = (
     "max_context_length",
@@ -716,46 +716,34 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         if not isinstance(mid, str) or not mid:
             continue
 
-        # Generic embedding filter.
+        # ------------------------------------------------------------------
+        # Embedding detection — flag, do NOT skip.
         #
-        # Some providers (GigaChat, and any future provider whose
-        # /models endpoint does not declare a type discriminator)
-        # return chat AND embedding models in the same list. Embedding
-        # models cannot serve /chat/completions — selecting one in the
-        # UI would produce a provider error on the first message.
+        # Embedding models ARE surfaced in the UI so users can save
+        # them for non-chat workloads (RAG, semantic search,
+        # /v1/embeddings). They are tagged with ``is_embedding: True``
+        # and ``type: "embeddings"`` so that:
         #
-        # Detection is by name pattern only because no provider-side
-        # signal exists. This is a heuristic; it matches every
-        # GigaChat embedding variant (Embeddings, Embeddings-2,
-        # EmbeddingsGigaR, GigaEmbeddings-3B-*) and OpenAI-style
-        # embeddings (text-embedding-3-small, etc.) while never
-        # matching a real chat model.
+        #   * the frontend renders a distinct "Embedding" badge;
+        #   * auto-selection skips them (an embedding cannot serve
+        #     /chat/completions, so picking one as default would
+        #     fail on the first user message);
+        #   * the runtime can refuse them for chat dispatch.
         #
-        # Adapters that DO emit an explicit ``type: "embeddings"``
-        # field (like LM Studio) are also caught by the second
-        # condition, so this filter is safe to leave in place even
-        # after future adapter improvements.
-        if "embedding" in mid.lower():
-            logger.debug(
-                "[fetch-models] Skipping embedding model %r", mid
-            )
-            continue
-        if item.get("type") == "embeddings":
-            logger.debug(
-                "[fetch-models] Skipping embedding model %r (type)",
-                mid,
-            )
-            continue
+        # Detection sources (any match sets the flag):
+        #   * name pattern    — "text-embedding-3-small", "Embeddings",
+        #                       "GigaEmbeddings-3B-*", "bge-large-en";
+        #   * ``type`` field  — LM Studio / OpenAI-compat: "embeddings";
+        #   * Google methods  — no ``generateContent`` in
+        #                       ``supported_generation_methods``.
+        # ------------------------------------------------------------------
+        is_embedding = False
 
-        # Google-only filter: skip embeddings-only models. The
-        # ``supported_generation_methods`` field is only present on
-        # Google responses; other adapters don't set it, so this
-        # branch is a no-op for them.
-        #
-        # Accept multiple shapes: plain strings ("generateContent"),
-        # and enums (which may stringify to "GenerationMethod.GENERATE_CONTENT"
-        # in some Python/SDK versions). Check both the raw and the
-        # camelCase form.
+        if "embedding" in mid.lower():
+            is_embedding = True
+        if item.get("type") == "embeddings":
+            is_embedding = True
+
         methods = item.get("supported_generation_methods")
         if isinstance(methods, list) and methods:
             has_generate = False
@@ -766,7 +754,7 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
                     has_generate = True
                     break
             if not has_generate:
-                continue
+                is_embedding = True
 
         model_ids.append(mid)
 
@@ -900,6 +888,13 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         model_type = item.get("type")
         if isinstance(model_type, str) and model_type:
             entry["type"] = model_type
+
+        # The embedding flag takes precedence over the provider's own
+        # ``type`` value — guarantees the frontend badge is shown even
+        # when a provider mislabels an embedding model as "llm".
+        if is_embedding:
+            entry["is_embedding"] = True
+            entry["type"] = "embeddings"
 
         # ------------------------------------------------------------------
         # [FIX-LMSTUDIO-CAPS-V2] Extract the provider's capabilities.
@@ -1094,6 +1089,175 @@ def save_metadata_cache_merge(new_meta: dict) -> None:
         tmp.replace(METADATA_CACHE)
     except Exception as e:
         logger.warning(f"Error saving merged metadata cache: {e}")
+
+
+def get_memory_models() -> list:
+    """Return the model IDs designated by the user as memory models.
+
+    A memory model is an entry in ``models_metadata.json`` whose
+    ``capabilities.memory == True`` AND
+    ``capability_sources.memory == "manual"``.
+
+    The source check is deliberate: it filters out any hypothetical
+    automated writer that might set ``memory`` in the future,
+    keeping the designation strictly user-authored.
+
+    Used by:
+
+      * ``GET /api/config/memory-models`` (this module's endpoint,
+        consumed by the frontend's ``MemoryModelSelector``).
+      * ``MemoryService._initialize_extraction`` (fallback when
+        ``MemoryAISettings.extraction.provider_id`` is None).
+
+    Returns
+    -------
+    list[str]
+        Model keys as they appear in ``models_metadata.json``.
+        May be composite (``"openai::gpt-4o-mini"``,
+        ``"provider::connection::model"``) or plain
+        (``"gpt-4o-mini"``) -- callers split on ``"::"`` when they
+        need the provider separately.
+        Empty list when the cache is missing, unreadable, or no
+        model has been marked.
+    """
+    data: dict = {}
+    if METADATA_CACHE.exists():
+        try:
+            with open(METADATA_CACHE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            return []
+
+    result: list = []
+    for key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        caps = entry.get("capabilities")
+        if not isinstance(caps, dict):
+            continue
+        # ``is True`` (not truthy) -- rejects manually-edited values
+        # like "yes" or 1. The marking UI always writes a JSON
+        # boolean, so any non-boolean truthy value is a corruption
+        # and should not be treated as a valid designation.
+        if caps.get("memory") is not True:
+            continue
+        sources = entry.get("capability_sources") or {}
+        if not isinstance(sources, dict):
+            continue
+        if sources.get("memory") == "manual":
+            result.append(key)
+    return result
+
+
+@router.get("/memory-models")
+async def get_memory_models_endpoint():
+    """Return the models the user designated as memory models.
+
+    Consumed by the frontend's ``MemoryModelSelector``
+    (``/memory/settings`` -> AI section) to populate the
+    extraction/consolidation model dropdowns AND to pre-fill
+    per-task limits (``max_output_tokens``, ``context_window``)
+    so the user does not have to copy them by hand from
+    Settings -> Models.
+
+    Response shape
+    --------------
+    Each model entry is an OBJECT, not a bare string, so the
+    frontend can render the model's known limits as hints and
+    auto-fill the settings fields on selection::
+
+        {
+          "key": "openai::gpt-4o-mini",
+          "provider_id": "openai",      # null for plain keys
+          "model_id": "gpt-4o-mini",
+          "is_embedding": false,
+          "context_window": 128000,     # nullable
+          "max_output_tokens": 4096     # nullable
+        }
+
+    Data sources for the limit fields
+    ---------------------------------
+    * ``models_budget.json``  -> authoritative; reflects what
+      the engine actually loaded/configured.
+    * ``models_metadata.json`` -> fallback when the budget is
+      missing (e.g. a model marked manually but never scanned).
+
+    Both sources are keyed by the model id (either bare
+    ``"gpt-4o-mini"`` or namespaced ``"models/gemini-2.5-flash"``).
+    We look up by BOTH the composite key and the bare model id
+    so the budget is found regardless of how it was stored.
+
+    Returns ``{"ok": true, "models": [...]}``. The list may be
+    empty -- the UI MUST render a "no memory models" warning
+    with a link to Settings -> Models in that case, rather
+    than a broken dropdown.
+    """
+    raw_keys = get_memory_models()
+
+    # Load metadata (for `is_embedding` + fallback limits).
+    metadata: dict = {}
+    if METADATA_CACHE.exists():
+        try:
+            with open(METADATA_CACHE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except Exception:
+            metadata = {}
+
+    # Load per-model budgets (authoritative limits).
+    budgets = load_model_budgets_from_disk()
+    if not isinstance(budgets, dict):
+        budgets = {}
+
+    def _pick_int(value) -> Optional[int]:
+        """Return ``value`` if it is a positive int, else ``None``."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
+
+    models = []
+    for key in raw_keys:
+        entry = metadata.get(key) or {}
+
+        # Split a composite key into provider + model.
+        parts = key.split("::")
+        provider_id = parts[0] if len(parts) >= 2 else None
+        model_id = parts[-1]
+
+        # Resolve limits. Budget wins over metadata (budget is
+        # the engine's actual answer; metadata is the scan's guess).
+        budget = (
+            budgets.get(key)
+            or budgets.get(model_id)
+            or {}
+        )
+        if not isinstance(budget, dict):
+            budget = {}
+
+        context_window = (
+            _pick_int(budget.get("context_window"))
+            or _pick_int(entry.get("max_context_length"))
+        )
+        max_output_tokens = (
+            _pick_int(budget.get("max_output_tokens"))
+            or _pick_int(entry.get("max_output_tokens"))
+        )
+
+        models.append({
+            "key": key,
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "is_embedding": bool(entry.get("is_embedding", False)),
+            "context_window": context_window,
+            "max_output_tokens": max_output_tokens,
+        })
+
+    return {"ok": True, "models": models}
 
 
 @router.get("")
@@ -1378,6 +1542,29 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
             mid_str = str(mid)
             ids.append(mid_str)
 
+            # Embedding detection — mirrors ``_parse_adapter_model_list``
+            # so HTTP-fallback providers (DeepSeek, OpenRouter, custom
+            # OpenAI-compatible endpoints) also surface embedding models
+            # with the correct flag and type. The Google-style
+            # ``supported_generation_methods`` check is applied here
+            # too, so embedding-only Google models discovered via the
+            # generic /models branch are flagged identically.
+            is_embedding = (
+                "embedding" in mid_str.lower()
+                or m.get("type") == "embeddings"
+            )
+            _methods = m.get("supported_generation_methods")
+            if isinstance(_methods, list) and _methods:
+                _has_generate = False
+                for _m in _methods:
+                    if not isinstance(_m, str):
+                        _m = str(_m)
+                    if "generatecontent" in _m.lower().replace("_", ""):
+                        _has_generate = True
+                        break
+                if not _has_generate:
+                    is_embedding = True
+
             if "/" in mid_str:
                 short = mid_str.rsplit("/", 1)[-1]
                 if short and short != mid_str:
@@ -1408,6 +1595,9 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
                 or m.get("displayName")
                 or mid_str,
             }
+            if is_embedding:
+                entry["is_embedding"] = True
+                entry["type"] = "embeddings"
             if ctx:
                 entry["max_context_length"] = int(ctx)
             if out:
