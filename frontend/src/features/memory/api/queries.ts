@@ -60,7 +60,8 @@ import {
 } from '@tanstack/react-query';
 
 import { memoryClient } from './client';
-import { memoryKeys } from './keys';
+import { configClient } from './config-client';
+import { configKeys, memoryKeys } from './keys';
 import type {
   BatchesListParams,
   EntryListParams,
@@ -69,7 +70,11 @@ import type {
   UsageSummaryParams,
   UsageTimeseriesParams,
 } from './keys';
-import type { MemoryApiError } from '../types/errors';
+// `MemoryApiError` is imported as a VALUE (not type-only) so
+// `useEmbeddingStats` can call `err instanceof MemoryApiError`
+// in its graceful-degradation path. `MemoryErrorType` is a
+// const-object at runtime, so it MUST be a value import.
+import { MemoryApiError, MemoryErrorType } from '../types/errors';
 import type {
   AISettingsGetResponse,
   BatchEstimateResponse,
@@ -87,8 +92,10 @@ import type {
   UsageSummaryResponse,
   UsageTimeseriesResponse,
   ImportAdaptersResponse,
+  EmbeddingStatsResponse,
 } from '../types/responses';
 import type { MemorySettings } from '../types/settings';
+import type { EmbeddingModel } from '../types/embedding';
 
 // ---------------------------------------------------------------------------
 // Default stale times (milliseconds)
@@ -143,6 +150,25 @@ export const MEMORY_STALE_TIMES = {
   batches: 3_000,
   batchDetail: 3_000,
   batchEstimate: 0,
+  // Phase 4 additions:
+  //
+  //   * `embeddingStats` -- 15s. The snapshot updates after
+  //     a reindex (mutation) or when the worker drains a job
+  //     (background). 15s keeps the "N of M embedded" count
+  //     close-to-live during an active reindex without
+  //     hammering the endpoint. When the reindex panel is
+  //     actively watching progress, the caller combines this
+  //     hook with a short `refetchInterval` -- see the
+  //     ReindexPanel component's polling.
+  //
+  //   * `embeddingModels` -- 60s, same cadence as `settings`.
+  //     The catalog only changes when the user toggles a
+  //     capability in Settings -> Models, which is a
+  //     deliberate, low-frequency action. 60s gives fast
+  //     re-reads without caching stale capabilities for a
+  //     user who just changed them in another tab.
+  embeddingStats: 15_000,
+  embeddingModels: 60_000,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -749,6 +775,169 @@ export function useBatchEstimate(
     enabled: options.enabled ?? true,
     select: options.select as
       | ((data: BatchEstimateResponse) => BatchEstimateResponse)
+      | undefined,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 -- Embedding & retrieval
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the embedding coverage snapshot
+ * (`GET /api/memory/embedding-stats`).
+ *
+ * Returns `EmbeddingStatsResponse | null` -- the `null` case
+ * is CRITICAL to this hook's contract:
+ *
+ *   * `data === null` means the endpoint is NOT AVAILABLE on
+ *     this deployment. The plan (§9) marks the endpoint as
+ *     OPTIONAL, so a 404 here is a legitimate deployment
+ *     choice, not an error. The consumer (ReindexPanel,
+ *     diagnostics) must gracefully degrade -- hide the
+ *     "N of M embedded" summary and fall back to client-side
+ *     counters from the last `reindex` response.
+ *
+ *   * `data !== null` means a normal snapshot. `data.with_embeddings`
+ *     / `data.total_memories` drive the coverage summary.
+ *
+ * Why swallow 404 but rethrow everything else
+ * -------------------------------------------
+ * A 404 from this endpoint is a KNOWN AND EXPECTED outcome on
+ * a deployment that chose not to implement the optional
+ * endpoint. Surfacing it as a user-facing error would be
+ * misleading ("something broke") when nothing actually broke.
+ * Any OTHER error (network failure, 500, 503) is a real
+ * problem the user should see.
+ *
+ * The `AbortError` path is untouched -- the catch block only
+ * matches `MemoryApiError` with `errorType === 'not_found'`.
+ * Aborts are re-thrown verbatim (they are not
+ * `MemoryApiError`s) so React Query's cancellation logic
+ * continues to work.
+ *
+ * Enabled by default. Callers who know the endpoint is
+ * unavailable on their backend (e.g. a deployment-config
+ * flag) can pass `enabled: false` to skip the request
+ * entirely and avoid the wasted round trip.
+ *
+ * Refresh policy: stale time is 15s by default. During an
+ * active reindex, the reindex panel overrides `refetchInterval`
+ * (via a custom `useQuery` call) so `with_embeddings` /
+ * `pending_reindex` stay close-to-live without hammering
+ * the endpoint.
+ */
+export function useEmbeddingStats(
+  options: HookOptions<EmbeddingStatsResponse> = {},
+): UseQueryResult<EmbeddingStatsResponse | null, MemoryApiError> {
+  return useQuery<EmbeddingStatsResponse | null, MemoryApiError>({
+    queryKey: memoryKeys.embedding.stats(),
+    queryFn: async ({ signal }) => {
+      try {
+        return await memoryClient.embedding.stats({ signal });
+      } catch (err) {
+        // Graceful degradation for missing endpoints.
+        //
+        //   * 404 (`not_found`) -- the endpoint is genuinely
+        //     absent on this deployment (plan §9 marks it as
+        //     optional).
+        //
+        //   * 400 (`request_validation`) -- the backend does
+        //     NOT have a route for `/embedding-stats`, so
+        //     FastAPI's generic memory router matched it as
+        //     `GET /memory/{memory_id}` and rejected the
+        //     request because `scope_type`/`scope_id` were
+        //     missing. The error message reads "this endpoint
+        //     requires explicit scope", which is nonsense
+        //     from the UI's perspective -- the UI asked for
+        //     STATS, not a specific memory. Same net effect
+        //     as a 404: the endpoint does not exist.
+        //
+        //   * 405 (`method_not_allowed`) -- another shape a
+        //     missing route can surface as (e.g. if a route
+        //     with the same prefix exists for POST only).
+        //
+        // All three cases return `null` so the consumer
+        // (`ReindexPanel`) renders the "stats unavailable"
+        // info banner instead of a scary error.
+        if (err instanceof MemoryApiError) {
+          if (
+            err.errorType === MemoryErrorType.NotFound ||
+            err.statusCode === 404 ||
+            err.statusCode === 400 ||
+            err.statusCode === 405
+          ) {
+            return null;
+          }
+        }
+        // Any other error (network, 500, 503) is a real
+        // failure the user should see. Rethrow.
+        throw err;
+      }
+    },
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.embeddingStats,
+    enabled: options.enabled ?? true,
+    select: options.select as
+      | ((data: EmbeddingStatsResponse | null) =>
+          EmbeddingStatsResponse | null)
+      | undefined,
+  });
+}
+
+/**
+ * Fetch the embedding-models catalog
+ * (`GET /api/config/embedding-models`).
+ *
+ * Powers the `EmbeddingModelSelector` dropdown -- the list of
+ * models the user can choose as `MemorySettings.embedding.model_key`.
+ *
+ * Return type is `EmbeddingModel[]`, NOT an envelope. The
+ * underlying `configClient.getEmbeddingModels()` already
+ * unwraps the `{ok, models, by_provider}` wire shape and
+ * returns the array directly (see `config-client.ts`). The
+ * `by_provider` grouping is intentionally dropped at the
+ * client layer -- the selector groups CLIENT-SIDE by
+ * `provider_name` (which gives it the human-readable label
+ * "OpenAI" instead of just the id "openai"). If a future
+ * consumer needs `by_provider`, a sibling hook can call the
+ * client differently, but nothing today needs it.
+ *
+ * ERROR TYPE -- IMPORTANT
+ * ------------------------
+ * This hook's `error` is `Error` (not `MemoryApiError`).
+ * Reason: `configClient` deliberately does NOT use the memory
+ * error classifier -- `/api/config/*` is a different surface
+ * with a different error contract (plain `{ok: false, error,
+ * message}` on 200, HTTP errors only for transport failures).
+ * Every other hook in this module throws `MemoryApiError`;
+ * this one is the exception. Call sites that build a
+ * discriminated error UI must handle BOTH shapes when they
+ * display a mix of memory + config data. In practice, the
+ * selector's error state is a simple banner ("Could not load
+ * embedding models. Retry."), so the distinction does not
+ * matter to the UI -- it only matters to the type signature.
+ *
+ * The `ok: false` case (catalog scan failed on the backend)
+ * reaches this hook as a SUCCESS with an EMPTY array -- the
+ * client unwraps `models` regardless of the `ok` flag, and
+ * `[]` is a valid response. The selector's empty state
+ * ("No embedding models available. Scan models first.")
+ * covers both "no models marked" and "scan failed" -- a
+ * distinction the user cannot act on differently anyway.
+ *
+ * Empty list (`[]`) is a VALID response and the selector
+ * MUST render the empty state rather than a broken dropdown.
+ */
+export function useEmbeddingModels(
+  options: HookOptions<EmbeddingModel[]> = {},
+): UseQueryResult<EmbeddingModel[], Error> {
+  return useQuery<EmbeddingModel[], Error>({
+    queryKey: configKeys.embeddingModels(),
+    queryFn: ({ signal }) => configClient.getEmbeddingModels(signal),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.embeddingModels,
+    enabled: options.enabled ?? true,
+    select: options.select as
+      | ((data: EmbeddingModel[]) => EmbeddingModel[])
       | undefined,
   });
 }

@@ -127,7 +127,14 @@ import type {
   JobCancelResponse,
   JobRetryResponse,
   TestModelResponse,
+  ReindexResponse,
 } from '../types/responses';
+
+// Phase 4 -- reindex request body type. Grouped separately so
+// the Phase 4 surface (single mutation, single type) is
+// obvious. `ReindexResponse` lives in the block above because
+// it is a response envelope (import locality with siblings).
+import type { ReindexRequest } from '../types/embedding';
 
 // ---------------------------------------------------------------------------
 // Shared hook-options base
@@ -173,6 +180,20 @@ function invalidateSettingsCascade(
   queryClient.invalidateQueries({ queryKey: memoryKeys.settings.global() });
   queryClient.invalidateQueries({ queryKey: memoryKeys.settings.all() });
   queryClient.invalidateQueries({ queryKey: memoryKeys.usage.all() });
+  // Phase 4: the embedding-stats snapshot is SCOPED to the
+  // current `embedding.model_key`. Changing that key (via
+  // PATCH /settings {embedding: {model_key: "..."}}) means
+  // the previous "with_embeddings" / "vec0_dimension" numbers
+  // no longer describe the active model. Invalidating here
+  // (rather than in a hypothetical embedding-specific cascade)
+  // keeps the coherence rule in ONE place -- every settings
+  // change already goes through this function.
+  //
+  // The extra refetch is essentially free: the endpoint is
+  // small, and `invalidateQueries` only refetches queries
+  // that are CURRENTLY OBSERVED. If the ReindexPanel is not
+  // mounted, no network call happens.
+  queryClient.invalidateQueries({ queryKey: memoryKeys.embedding.stats() });
 }
 
 /**
@@ -1523,6 +1544,157 @@ export function useCancelBatch(
       memoryClient.automation.batch.cancel(batchId),
     onSuccess: (data, variables) => {
       invalidateBatchCascade(queryClient, variables.batchId);
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ===========================================================================
+// Embedding (Phase 4)
+// ===========================================================================
+
+/**
+ * Variables for `useReindexEmbeddings`.
+ *
+ * Extracted from the client method's first parameter so the
+ * hook cannot drift from the signature -- `ReindexRequest` (or
+ * `undefined`, since the client has a `= {}` default).
+ *
+ * Callers may invoke `mutate()` with no argument (reindex every
+ * active memory), or `mutate({ memory_ids: [...] })` to restrict
+ * to specific memories. `memory_ids` has a backend-enforced max
+ * of 1000 per request -- exceeding it returns HTTP 422 with
+ * Pydantic validation errors, which surface as
+ * `MemoryApiError` with `errorType: 'request_validation'` and
+ * populated `fields`.
+ */
+type ReindexEmbeddingsVariables = Parameters<
+  typeof memoryClient.embedding.reindex
+>[0];
+
+/**
+ * `POST /api/memory/reindex` -- enqueue embedding jobs.
+ *
+ * Enqueues embedding jobs for the currently-selected
+ * `embedding.model_key`. Idempotent for jobs already pending or
+ * running under the same `(memory_id, model_key,
+ * content_version)` tuple -- a repeated call shifts counts from
+ * `enqueued` to `skipped` without creating duplicates.
+ *
+ * ERROR CONTRACT (all surface as `MemoryApiError` via
+ * `classifyMemoryError`):
+ *
+ *   * `errorType: 'embedding_not_enabled'` (503)
+ *     → `MemorySettings.embedding.enabled` is `false`. The UI
+ *       should toast "Enable semantic search first" and focus
+ *       the Section A toggle.
+ *
+ *   * `errorType: 'model_key_not_set'` (503)
+ *     → `embedding.enabled === true` but `model_key === null`.
+ *       Toast "Select an embedding model first" and focus the
+ *       EmbeddingModelSelector.
+ *
+ *   * `errorType: 'model_key_not_in_snapshot'` (503)
+ *     → the stored `model_key` no longer exists in the config
+ *       catalog (provider rotated/removed the model). Toast
+ *       "Selected model is no longer available" and prompt the
+ *       user to re-select.
+ *
+ *   * `errorType: 'internal_error'` (500)
+ *     → server-side bug (e.g. sqlite-vec write error). Generic
+ *       "Reindex failed. Check server logs." -- do NOT retry
+ *       automatically.
+ *
+ *   * `errorType: 'request_validation'` (422)
+ *     → malformed `memory_ids` (too many, empty list,
+ *       non-strings). Should not occur in normal UI flows --
+ *       the caller builds the array from typed memory rows.
+ *
+ * Note on the response `ok` field: the endpoint uses the
+ * boolean `{ok: true}` envelope (Phase 4 convention), not the
+ * `{status: 'ok'}` envelope from Phase 1-3. `memoryFetch`
+ * treats any non-2xx status as a throw, so a 200 always means
+ * `ok: true` -- callers do not need to check the field.
+ *
+ * INVALIDATION CASCADE
+ * --------------------
+ * On success (`enqueued > 0` OR `enqueued === 0` with
+ * `skipped > 0` -- both mean "jobs will be processed"):
+ *
+ *   * `memoryKeys.embedding.stats()` -- `pending_reindex`
+ *     increases by `enqueued`; the next stats fetch reflects
+ *     the new pending count. Consumers (ReindexPanel) poll
+ *     this to render progress.
+ *
+ *   * `memoryKeys.automation.jobs.lists()` -- the new jobs
+ *     appear in the extraction-jobs list with
+ *     `job_type: 'embedding'`. The jobs list is the canonical
+ *     place to inspect in-flight work.
+ *
+ * Does NOT invalidate:
+ *   * `memoryKeys.settings.*` -- reindex READS the settings,
+ *     it does not write them. (The model_key is validated
+ *     server-side before any job is enqueued, so a successful
+ *     response guarantees consistency with the current
+ *     settings.)
+ *   * `memoryKeys.entries.*` -- reindex does not modify
+ *     entry content or membership, only adds embedding
+ *     metadata.
+ *   * `configKeys.embeddingModels()` -- the catalog is a
+ *     static list of available models; populating embeddings
+ *     for some of them does not change availability.
+ *
+ * TYPICAL FLOW
+ * ------------
+ *     const reindex = useReindexEmbeddings({
+ *       onSuccess: (data) => {
+ *         showToast.success(
+ *           `Reindex queued: ${data.enqueued} enqueued, ` +
+ *           `${data.skipped} skipped`
+ *         );
+ *       },
+ *       onError: (err) => {
+ *         const hint = uxHintFor(err);   // from types/errors.ts
+ *         showToast.error(err.message);
+ *         if (hint.suggestSettings) focusSectionA();
+ *       },
+ *     });
+ *     // ...
+ *     reindex.mutate({});   // reindex everything
+ *     // or:
+ *     reindex.mutate({ memory_ids: ['mem_abc', 'mem_def'] });
+ */
+export function useReindexEmbeddings(
+  options: BaseMutationOptions<
+    ReindexResponse,
+    ReindexEmbeddingsVariables
+  > = {},
+): UseMutationResult<
+  ReindexResponse,
+  MemoryApiError,
+  ReindexEmbeddingsVariables
+> {
+  const queryClient = useQueryClient();
+  return useMutation<
+    ReindexResponse,
+    MemoryApiError,
+    ReindexEmbeddingsVariables
+  >({
+    // `body ?? {}` -- the client already defaults its `body`
+    // parameter to `{}`, but being explicit here keeps the
+    // call site behavior unambiguous even if that default is
+    // ever removed from the client signature.
+    mutationFn: (body) =>
+      memoryClient.embedding.reindex(body ?? {}),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.embedding.stats(),
+      });
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
       options.onSuccess?.(data, variables);
     },
     onError: options.onError,

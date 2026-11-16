@@ -144,6 +144,28 @@ def build_embedding_model_snapshot(
 ) -> Dict[str, ResolvedEmbeddingModel]:
     """Build a snapshot of every embedding-capable model on disk.
 
+    Two sources contribute to the snapshot, and BOTH are consulted on
+    every call:
+
+    **Source 1 -- ``models_metadata.json`` entries marked as embedding.**
+    Any entry whose ``capabilities.is_embedding`` (or legacy top-level
+    ``is_embedding``) is ``True`` produces one resolved model, keyed
+    by the composite ``{provider_id}::{model_id}`` form. The raw
+    metadata identifier is also registered as an alias so older
+    callers that key by the bare identifier still work.
+
+    **Source 2 -- ``models_vault.json`` -> ``embedding_models``.**
+    This is the per-provider index that ``GET /embedding-models``
+    serves to the frontend's model picker. It is the authoritative
+    "user has designated this model as an embedding model" signal --
+    a model appears there because the user explicitly selected it
+    AND the metadata flagged it as embedding at the time of
+    selection. Including it here means the snapshot recognises every
+    key the frontend can produce, even when ``models_metadata.json``
+    has since lost or never carried a matching entry (common after a
+    metadata reset, a manual vault edit, or a reindex triggered
+    before the first Scan Models run for that provider).
+
     Parameters
     ----------
     models_metadata_path
@@ -156,34 +178,39 @@ def build_embedding_model_snapshot(
     Returns
     -------
     Dict[str, ResolvedEmbeddingModel]
-        A mapping from ``model_key`` to the fully-resolved
-        embedding model. Empty when:
+        A mapping from ``model_key`` to the fully-resolved embedding
+        model. The canonical key form is always the composite
+        ``{provider_id}::{model_id}`` -- the exact string the
+        frontend emits from the ``/embedding-models`` dropdown and
+        the exact string the reindex caller looks up. Source 1 also
+        registers the raw metadata identifier as an alias when it
+        differs from the composite key.
 
-          * no model has been marked as an embedding model yet,
-          * the metadata file is missing or unreadable,
+        Empty when:
+
+          * no model has been marked as an embedding model in
+            either the metadata cache or the vault index,
+          * both files are missing or unreadable,
           * the vault is missing (models appear with
             ``base_url=None`` / ``api_key=None`` -- the caller
             decides whether that is acceptable),
-          * every entry lacks a resolvable ``provider_id`` (see
-            design invariant 5).
+          * every metadata entry lacks a resolvable
+            ``provider_id`` (see design invariant 5) AND the
+            vault index is empty.
 
-        The dict is safe to mutate -- it is a fresh construction
-        on every call. ``ResolvedEmbeddingModel`` values are
-        frozen, so a caller passing the dict to
-        ``EmbeddingModelResolver`` cannot accidentally corrupt
-        the values.
+        The dict is safe to mutate -- it is a fresh construction on
+        every call. ``ResolvedEmbeddingModel`` values are frozen, so
+        a caller passing the dict to ``EmbeddingModelResolver``
+        cannot accidentally corrupt the values.
     """
     metadata = _read_metadata(models_metadata_path)
-    if not metadata:
-        logger.debug(
-            "build_embedding_model_snapshot: no metadata at %s",
-            models_metadata_path or METADATA_CACHE,
-        )
-        return {}
-
     vault = _read_vault(models_vault_path)
 
     snapshot: Dict[str, ResolvedEmbeddingModel] = {}
+
+    # ------------------------------------------------------------------
+    # Source 1: metadata entries explicitly marked as embedding.
+    # ------------------------------------------------------------------
     for key, entry in metadata.items():
         if not isinstance(entry, dict):
             continue
@@ -212,31 +239,129 @@ def build_embedding_model_snapshot(
             )
             continue
 
-        base_url, api_key = _resolve_credentials(provider_id, vault)
-        model_version = _extract_model_version(entry, model_id)
-        known_dimensions = _extract_known_dimensions(entry)
-        extra_headers = _extract_extra_headers(entry)
-
-        snapshot[key] = ResolvedEmbeddingModel(
-            model_key=key,
+        composite_key = f"{provider_id}::{model_id}"
+        resolved = _build_resolved_model(
+            entry=entry,
+            model_key=composite_key,
             model_id=model_id,
             provider_id=provider_id,
-            base_url=base_url,
-            api_key=api_key,
-            model_version=model_version,
-            known_dimensions=known_dimensions,
             source=source,
-            extra_headers=extra_headers,
+            vault=vault,
         )
+        snapshot[composite_key] = resolved
+        # NOTE: The raw metadata key is NOT registered as an alias.
+        #
+        # EmbeddingModelResolver -- the primary consumer of this
+        # snapshot -- enforces key-to-model_key consistency in its
+        # constructor: every entry's ``model_key`` field MUST equal
+        # the dict key it is registered under. Registering the SAME
+        # frozen instance under a second (bare) key violates that
+        # invariant and crashes resolver construction with
+        # ``ValueError: snapshot key ... does not match
+        # ResolvedEmbeddingModel.model_key ...``.
+        #
+        # Callers (POST /api/memory/reindex, EmbeddingWorker) always
+        # use composite keys -- the exact format the frontend emits
+        # from ``GET /api/config/embedding-models`` -- so no compat
+        # alias is needed here.
+
+    # ------------------------------------------------------------------
+    # Source 2: vault -> embedding_models index.
+    #
+    # ``/embedding-models`` serves this exact index to the frontend,
+    # so every model the user can select in the picker MUST be
+    # resolvable here. A model can be present in the index without a
+    # matching metadata entry (e.g. metadata was reset, or the user
+    # hand-picked a model before Scan Models ever ran for its
+    # provider). Trusting the index closes that gap.
+    # ------------------------------------------------------------------
+    vault_embeddings = vault.get("embedding_models")
+    if isinstance(vault_embeddings, dict):
+        for raw_provider_id, model_ids in vault_embeddings.items():
+            if not isinstance(raw_provider_id, str):
+                continue
+            provider_id = raw_provider_id.strip()
+            if not provider_id:
+                continue
+            if not isinstance(model_ids, list):
+                continue
+
+            for raw_model_id in model_ids:
+                if not isinstance(raw_model_id, str):
+                    continue
+                model_id = raw_model_id.strip()
+                if not model_id:
+                    continue
+
+                composite_key = f"{provider_id}::{model_id}"
+                if composite_key in snapshot:
+                    # Already produced from metadata -- nothing to do.
+                    continue
+
+                # Best-effort metadata lookup. The entry may exist
+                # without being marked as embedding (so Source 1
+                # skipped it) while still carrying a known dimension
+                # or version from a previous probe. Pull whatever we
+                # can find; fall back to vault-only defaults.
+                meta_entry = metadata.get(composite_key)
+                if not isinstance(meta_entry, dict):
+                    meta_entry = metadata.get(model_id)
+                if not isinstance(meta_entry, dict):
+                    meta_entry = {}
+
+                snapshot[composite_key] = _build_resolved_model(
+                    entry=meta_entry,
+                    model_key=composite_key,
+                    model_id=model_id,
+                    provider_id=provider_id,
+                    source="manual",
+                    vault=vault,
+                )
 
     logger.debug(
         "build_embedding_model_snapshot: built snapshot of %d "
-        "embedding model(s) from %d metadata entr%s.",
+        "embedding model(s) from metadata (%d entries) + vault "
+        "embedding_models index.",
         len(snapshot),
         len(metadata),
-        "y" if len(metadata) == 1 else "ies",
     )
     return snapshot
+
+
+def _build_resolved_model(
+    *,
+    entry: Dict[str, Any],
+    model_key: str,
+    model_id: str,
+    provider_id: str,
+    source: str,
+    vault: Dict[str, Any],
+) -> ResolvedEmbeddingModel:
+    """Construct a single ``ResolvedEmbeddingModel``.
+
+    ``entry`` may be an empty dict -- every field is extracted on a
+    best-effort basis and a missing value resolves to ``None`` (or a
+    sane default), never to an exception. Credentials are looked up
+    in the vault keyed by ``provider_id``; a missing vault entry
+    yields ``(None, None)`` and the caller decides whether that is
+    acceptable.
+    """
+    base_url, api_key = _resolve_credentials(provider_id, vault)
+    model_version = _extract_model_version(entry, model_id)
+    known_dimensions = _extract_known_dimensions(entry)
+    extra_headers = _extract_extra_headers(entry)
+
+    return ResolvedEmbeddingModel(
+        model_key=model_key,
+        model_id=model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+        api_key=api_key,
+        model_version=model_version,
+        known_dimensions=known_dimensions,
+        source=source,
+        extra_headers=extra_headers,
+    )
 
 
 # ---------------------------------------------------------------------------

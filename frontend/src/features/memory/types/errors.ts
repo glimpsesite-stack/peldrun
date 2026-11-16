@@ -326,6 +326,26 @@ export const MemoryErrorType = {
   ServiceNotInitialized: 'service_not_initialized',
   RequestValidation: 'request_validation',
 
+  // --- Phase 4 -- Embedding & retrieval configuration ---
+  //
+  // Emitted by POST /api/memory/reindex (HTTP 503) when the
+  // embedding subsystem is not ready. The three "not ready"
+  // variants are all USER-FIXABLE -- the fix is always to
+  // visit Section A of the settings page (embedding config).
+  //
+  // `InternalErrorReindex` is the snake_case internal-error
+  // code specific to the reindex endpoint (HTTP 500). It is
+  // DELIBERATELY distinct from `InternalError` (the CamelCase
+  // `InternalError` Python class name used elsewhere) -- the
+  // two come from different backend modules with different
+  // envelope conventions. Consumers that switch on the exact
+  // code for reindex should compare against
+  // `InternalErrorReindex`, not `InternalError`.
+  EmbeddingNotEnabled: 'embedding_not_enabled',
+  ModelKeyNotSet: 'model_key_not_set',
+  ModelKeyNotInSnapshot: 'model_key_not_in_snapshot',
+  InternalErrorReindex: 'internal_error',
+
   // --- Python exception class names (from _error_response) ---
   MemoryValidationError: 'MemoryValidationError',
   MemoryNotFoundError: 'MemoryNotFoundError',
@@ -702,6 +722,34 @@ export function classifyMemoryError(
     });
   }
 
+  // --- Shape 5: Boolean Ok envelope error (Phase 4) ----------
+  //
+  // Used by the reindex endpoint and embedding-stats endpoint
+  // (`{ok: false, error: "...", message: "..."}`). The error
+  // codes here are specific to those endpoints; without this
+  // branch they would hit the generic fallback below and lose
+  // both the exact `error` code AND the backend-provided
+  // `message` -- which is what caused the "temporarily
+  // unavailable" placeholder to be shown for a solvable
+  // configuration problem.
+  if (isObject(rawBody) && rawBody.ok === false) {
+    const errorType = isNonEmptyString(rawBody.error)
+      ? rawBody.error
+      : defaultErrorTypeForStatus(statusCode);
+    const message = isNonEmptyString(rawBody.message)
+      ? rawBody.message
+      : defaultMessageForStatus(statusCode);
+    return new MemoryApiError({
+      operation: fallbackOperation,
+      errorType,
+      statusCode,
+      message,
+      fields: [],
+      context: {},
+      rawBody,
+    });
+  }
+
   // --- Fallback: no recognizable body ------------------------
   return new MemoryApiError({
     operation: fallbackOperation,
@@ -902,6 +950,48 @@ const KNOWN_UX_HINTS: Partial<Record<KnownMemoryErrorType, MemoryErrorUxHint>> =
     showRetry: false,
     suggestSettings: false,
     inlineFieldTarget: 'field-from-loc',
+    tone: 'error',
+  },
+
+  // --- Phase 4 -- Embedding configuration not ready ------------
+  //
+  // All three "config not ready" cases share the same UX
+  // policy: a toast with a "Go to settings" link that deep-
+  // links to Section A of the memory settings page. The user
+  // is expected to fix the config, then retry the reindex
+  // manually -- we do NOT offer an inline retry button
+  // because retrying before fixing the config always fails
+  // the same way.
+  //
+  // Tone is `warning` (not `error`): the failure is a missing
+  // prerequisite, not a bug. Nothing is broken; the user
+  // simply has not finished wiring the feature up yet.
+  [MemoryErrorType.EmbeddingNotEnabled]: {
+    behavior: 'toast',
+    showRetry: false,
+    suggestSettings: true,
+    tone: 'warning',
+  },
+  [MemoryErrorType.ModelKeyNotSet]: {
+    behavior: 'toast',
+    showRetry: false,
+    suggestSettings: true,
+    tone: 'warning',
+  },
+  [MemoryErrorType.ModelKeyNotInSnapshot]: {
+    behavior: 'toast',
+    showRetry: false,
+    suggestSettings: true,
+    tone: 'warning',
+  },
+  // Reindex internal errors are 500s -- consistent with the
+  // general InternalError policy above: no retry button, no
+  // settings link, `error` tone. The user cannot fix a
+  // server-side bug; they should check logs.
+  [MemoryErrorType.InternalErrorReindex]: {
+    behavior: 'toast',
+    showRetry: false,
+    suggestSettings: false,
     tone: 'error',
   },
 

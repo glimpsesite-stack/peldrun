@@ -40,6 +40,23 @@
 const CONFIG_API_BASE = '/api/config';
 
 // ---------------------------------------------------------------------------
+// Domain type imports (Phase 4)
+// ---------------------------------------------------------------------------
+//
+// The embedding catalog response mirrors `EmbeddingModel` from
+// `../types/embedding.ts` one-to-one (same field names, same
+// nullability). Unlike `MemoryModelOption` -- which SPLITS the
+// composite key into `providerId` + `modelId` because the AI
+// settings store them as separate fields -- embedding settings
+// store the composite `key` VERBATIM in `embedding.model_key`,
+// so no split is needed. Reusing `EmbeddingModel` directly
+// avoids a redundant parallel type.
+import type {
+  EmbeddingModel,
+  EmbeddingModelsByProvider,
+} from '../types/embedding';
+
+// ---------------------------------------------------------------------------
 // Response shape
 // ---------------------------------------------------------------------------
 
@@ -67,6 +84,49 @@ interface MemoryModelsResponse {
     context_window: number | null;
     max_output_tokens: number | null;
   }>;
+}
+
+/**
+ * The wire shape of `GET /api/config/embedding-models`.
+ *
+ * Mirrors the backend's response from `config_rtr.py`'s
+ * `get_embedding_models` endpoint. The `models` array uses
+ * `EmbeddingModel` VERBATIM (snake_case fields matching the
+ * JSON payload) because no transformation is needed -- the
+ * embedding settings store the composite `key` directly, so
+ * there is nothing to split.
+ *
+ * `by_provider` is a convenience grouping the backend
+ * provides (`{ "openai": ["text-embedding-3-small", ...] }`).
+ * The Phase 4 `EmbeddingModelSelector` does NOT read it --
+ * it groups by `provider_name` from each `models` entry, which
+ * gives it the human-readable provider label ("OpenAI") rather
+ * than just the id. `by_provider` is preserved in the type for
+ * fidelity to the wire; future consumers may use it.
+ *
+ * `ok` is BOOLEAN (not literal `true`) because `/api/config/*`
+ * returns `{ok: false, error, message}` on failure with HTTP
+ * 200. `configFetch` only throws on HTTP errors, so a 200
+ * with `ok: false` reaches here -- `getEmbeddingModels` treats
+ * that as an empty catalog (see the method's JSDoc).
+ *
+ * KNOWN BACKEND BUG (documented for the UI):
+ * ---------------------------------------------------------
+ * `provider_id` and `provider_name` may BOTH be `null` on some
+ * entries due to an old bug in `_read_models_vault` (it reads
+ * from `STORAGE_ROOT` while some deployments store the vault
+ * at `backend/data/`). The Phase 4 selector MUST:
+ *
+ *   1. Render such models without crashing (no non-null
+ *      assertion on `provider_name`).
+ *   2. Group them under an "Unknown provider" heading.
+ *   3. NOT filter them out -- they may be the only models
+ *      available.
+ */
+interface EmbeddingModelsResponse {
+  ok: boolean;
+  models: EmbeddingModel[];
+  by_provider: EmbeddingModelsByProvider;
 }
 
 /**
@@ -154,10 +214,22 @@ async function configFetch<T>(
 /**
  * The typed config API client.
  *
- * Currently exposes only `getMemoryModels()` -- the single
- * endpoint the memory settings page needs. Future additions
- * (e.g. a `getModelBudgets()` for the AI cost ceiling) belong
- * here, not in `memoryClient`.
+ * Exposes two methods today:
+ *
+ *   * `getMemoryModels()`    -- Phase 3, chat models for the
+ *                                extraction / consolidation
+ *                                tasks. Filtered to exclude
+ *                                embedding models.
+ *   * `getEmbeddingModels()` -- Phase 4, embedding models for
+ *                                semantic search. The full
+ *                                catalog, including provider
+ *                                information so the selector can
+ *                                group by provider.
+ *
+ * Future config endpoints (e.g. a `getModelBudgets()` for the
+ * AI cost ceiling) belong here, not in `memoryClient` -- the
+ * memory client is scoped to `/api/memory/*` and must not
+ * grow config endpoints.
  */
 export const configClient = {
   /**
@@ -193,5 +265,62 @@ export const configClient = {
           ? m.max_output_tokens
           : null,
     }));
+  },
+
+  /**
+   * `GET /api/config/embedding-models`.
+   *
+   * Returns the models the user has marked as embedding models
+   * (either explicitly in Settings -> Models, or auto-detected
+   * from the provider's `/v1/models` scan), parsed into
+   * `EmbeddingModel[]`.
+   *
+   * The `models` array is returned VERBATIM (no split, no
+   * camelCase normalization). The composite `key` is stored in
+   * `MemorySettings.embedding.model_key` on selection, and
+   * every field is already the shape the Phase 4 selector
+   * needs. Unlike `getMemoryModels`, no transformation is
+   * warranted -- there is no `provider_id` + `model_id` split
+   * to do.
+   *
+   * Response contract:
+   *
+   *   * `{ok: true, models: [...], by_provider: {...}}` -- the
+   *     normal case. `models` is an array (possibly empty).
+   *
+   *   * `{ok: false, error: '...', message: '...'}` -- the
+   *     backend reports a catalog-scan failure. `models` is
+   *     absent. We return `[]` (the caller's empty state
+   *     triggers a "no models available" banner with a link
+   *     to Settings -> Models).
+   *
+   *   * HTTP 4xx/5xx -- `configFetch` throws a plain `Error`.
+   *     React Query surfaces it as `error` state; the
+   *     selector renders an error banner with a retry link.
+   *
+   * The `by_provider` field is NOT returned to the caller
+   * because the Phase 4 selector groups client-side by
+   * `provider_name` (which gives it the human-readable label
+   * "OpenAI" instead of just the id "openai"). If a future
+   * consumer needs `by_provider`, this method can grow a
+   * sibling that returns the full response -- do NOT change
+   * this method's return type, since callers already assume
+   * an array (matching `getMemoryModels`).
+   */
+  async getEmbeddingModels(
+    signal?: AbortSignal,
+  ): Promise<EmbeddingModel[]> {
+    const data = await configFetch<EmbeddingModelsResponse>(
+      '/embedding-models',
+      { signal },
+    );
+
+    // Defensive `Array.isArray` -- matches `getMemoryModels`.
+    // Handles both the `{ok: false}` case (where `models` is
+    // absent) and the theoretically-malformed case (where the
+    // backend sends a non-array). The UI's empty state handles
+    // both.
+    const raw = Array.isArray(data.models) ? data.models : [];
+    return raw;
   },
 };

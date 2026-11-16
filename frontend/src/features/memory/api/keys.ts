@@ -562,6 +562,70 @@ export const memoryKeys = {
   },
 
   // -------------------------------------------------------------------------
+  // Embedding (Phase 4)
+  // -------------------------------------------------------------------------
+  //
+  // The Phase 4 embedding surface under `/api/memory/*` is
+  // deliberately NARROW:
+  //
+  //   * `stats` -- read-only coverage snapshot from
+  //                `GET /api/memory/embedding-stats`.
+  //
+  //   * reindex  -- `POST /api/memory/reindex` is a MUTATION.
+  //                 Mutations do not own query keys -- they
+  //                 invalidate the queries whose data they
+  //                 affect. The reindex mutation invalidates
+  //                 `embedding.stats()` and `settings.all()`
+  //                 (see mutations.ts).
+  //
+  // The jobs endpoint used to monitor in-flight embedding work
+  // (`GET /api/memory/automation/jobs`) already lives under
+  // `automation.jobs` -- no new key is needed; reindex jobs are
+  // regular MemoryJob rows with `job_type: 'embedding'`.
+  //
+  // The model catalog (`GET /api/config/embedding-models`) is
+  // NOT here -- see `configKeys` at the bottom of this file.
+  // Its root is `'config'` (not `'memory'`), so invalidating
+  // `memoryKeys.all` does NOT clear it, which is correct: the
+  // catalog is provider-scoped and shared across subsystems.
+
+  embedding: {
+    /**
+     * Prefix for every Phase 4 embedding query under
+     * `/api/memory/*`.
+     *
+     * Invalidating this resets the stats snapshot but leaves
+     * the model catalog (`configKeys.all`) and the jobs list
+     * (`memoryKeys.automation.jobs.all()`) untouched --
+     * exactly the scope a `POST /api/memory/reindex` failure
+     * should touch.
+     */
+    all: () => [...memoryKeys.all, 'embedding'] as const,
+
+    /**
+     * The single coverage snapshot
+     * (`GET /api/memory/embedding-stats`).
+     *
+     * No parameters -- the endpoint returns the state under
+     * the CURRENT `embedding.model_key`. Switching models
+     * invalidates the cache via a `settings.all()`
+     * invalidation (from the settings PATCH mutation), so two
+     * coexisting "current model" snapshots can never exist
+     * in cache.
+     *
+     * OPTIONAL ENDPOINT (plan §9): some deployments may return
+     * 404. The consumer hook (`useEmbeddingStats`) treats a
+     * 404 as a graceful degradation (returns `null` data, no
+     * error banner) rather than a user-facing failure. The
+     * key still exists so the mutation can invalidate it
+     * regardless of whether the endpoint actually responds
+     * -- an invalidation of a non-existent cache entry is a
+     * no-op, not an error.
+     */
+    stats: () => [...memoryKeys.embedding.all(), 'stats'] as const,
+  },
+
+  // -------------------------------------------------------------------------
   // Automation (Phase 3)
   // -------------------------------------------------------------------------
   //
@@ -732,4 +796,101 @@ export function isMemoryQueryKey(
   key: readonly unknown[] | undefined,
 ): key is MemoryQueryKey {
   return Array.isArray(key) && key.length > 0 && key[0] === 'memory';
+}
+
+// ---------------------------------------------------------------------------
+// Config query keys
+// ---------------------------------------------------------------------------
+//
+// A SEPARATE factory (root `'config'`, not `'memory'`) for the
+// `/api/config/*` endpoints the memory feature consumes.
+//
+// Why a separate factory and not a `memoryKeys.config` sub-tree
+// ------------------------------------------------------------------
+// `/api/config/*` responses are PROVIDER-SCOPED, not memory-
+// scoped. They are shared with other frontend features
+// (chat, generation, model settings) that also read from
+// `/api/config/*`. Putting them under `'memory'` would cause:
+//
+//   1. Over-invalidation. `queryClient.invalidateQueries({
+//      queryKey: memoryKeys.all })` (e.g. on logout, or after
+//      "disable memory") would clear the model catalog used
+//      by the chat UI -- a cross-subsystem surprise.
+//
+//   2. Cache-key collisions if a future consumer reads the
+//      same endpoint from a different subsystem and the two
+//      call sites disagree on the key path.
+//
+// A separate `'config'` root means invalidating one subsystem
+// leaves the other's cache intact, which matches the actual
+// data dependency graph.
+//
+// MIGRATION NOTE (Phase 3 legacy)
+// -------------------------------
+// `MemoryModelSelector.tsx` (Phase 3) currently uses a raw
+// `['config', 'memory-models']` array inline at its useQuery
+// call site. That predates this factory. The keys are
+// STRUCTURALLY IDENTICAL -- `configKeys.memoryModels()` would
+// return the same tuple -- so existing Phase 3 caching
+// behavior is preserved byte-for-byte. A future cleanup can
+// migrate `MemoryModelSelector` to use `configKeys.memoryModels()`
+// without changing runtime behavior. Not done here to avoid
+// touching a working Phase 3 component.
+
+export const configKeys = {
+  /**
+   * Root prefix for every `/api/config/*` query the memory
+   * feature reads. Matches the raw `['config', ...]` array
+   * `MemoryModelSelector` already uses for its
+   * `memory-models` key.
+   */
+  all: ['config'] as const,
+
+  /**
+   * The user's marked "memory models" catalog
+   * (`GET /api/config/memory-models`).
+   *
+   * Structurally equal to the inline `['config', 'memory-models']`
+   * used by `MemoryModelSelector` -- preserved as a builder
+   * for future migration of that call site without a
+   * cache-behavior change.
+   */
+  memoryModels: () =>
+    [...configKeys.all, 'memory-models'] as const,
+
+  /**
+   * The embedding-models catalog
+   * (`GET /api/config/embedding-models`).
+   *
+   * Consumed by `useEmbeddingModels` (queries.ts), which
+   * delegates to `configClient.getEmbeddingModels()`.
+   *
+   * Invalidated by:
+   *   * The models-settings page when the user marks or
+   *     unmarks an embedding model (via its own mutation,
+   *     not ours -- the memory feature just picks up the
+   *     refreshed cache).
+   *   * NOT by `POST /api/memory/reindex` -- the catalog
+   *     does not change when a reindex runs.
+   */
+  embeddingModels: () =>
+    [...configKeys.all, 'embedding-models'] as const,
+} as const;
+
+/**
+ * The type of a "fully-built" config query key.
+ *
+ * Sibling of `MemoryQueryKey` for the `/api/config/*` surface.
+ */
+export type ConfigQueryKey = readonly ['config', ...readonly unknown[]];
+
+/**
+ * Detects whether a query key belongs to the config feature.
+ *
+ * Mirror of `isMemoryQueryKey` for the `'config'` root.
+ */
+export function isConfigQueryKey(
+  key: readonly unknown[] | undefined,
+): key is ConfigQueryKey {
+  return Array.isArray(key) && key.length > 0 && key[0] === 'config';
 }

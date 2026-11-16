@@ -504,6 +504,191 @@ async def reindex_endpoint(body: _ReindexBody) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Embedding coverage snapshot
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/embedding-stats",
+    summary="Embedding coverage snapshot",
+    response_model=None,
+)
+async def embedding_stats_endpoint() -> JSONResponse:
+    """Return a read-only snapshot of embedding coverage.
+
+    Powers the Reindex panel's "N of M memories have embeddings"
+    summary and the diagnostics page's vector-health section.
+
+    Read-only. No mutation. Safe to poll.
+
+    All DB queries are best-effort -- a missing table or a
+    schema mismatch degrades to a zero-value field instead of a
+    500. This matches the frontend's "optional endpoint,
+    gracefully degrade" contract (the endpoint may not exist on
+    older deployments).
+
+    Shape (see ``EmbeddingStatsResponse`` in the frontend):
+        {
+          "ok": true,
+          "model_key": str | null,
+          "model_id": str | null,
+          "total_memories": int,
+          "with_embeddings": int,
+          "pending_reindex": int,
+          "last_reindex_at": int | null,
+          "vec0_dimension": int | null,
+          "vec0_row_count": int,
+        }
+    """
+    service = get_memory_service()
+
+    # ---- 1. Read the current embedding settings ----
+    model_key: Optional[str] = None
+    model_id: Optional[str] = None
+    try:
+        embedding_settings = service.settings.embedding
+        model_key = getattr(embedding_settings, "model_key", None)
+        # Parse "provider::model" -- the model_id is the part
+        # after the first "::". The provider part is not
+        # returned by this endpoint (it is derived again from
+        # the config catalog on the frontend when needed).
+        if isinstance(model_key, str) and "::" in model_key:
+            _, model_id_part = model_key.split("::", 1)
+            stripped = model_id_part.strip()
+            if stripped:
+                model_id = stripped
+    except Exception as exc:
+        logger.warning(
+            "embedding-stats: settings read failed: %s", exc
+        )
+
+    # ---- 2. Resolve the DB path ----
+    try:
+        db_path = service._lifecycle.db_path  # noqa: SLF001
+    except Exception:
+        db_path = None
+
+    # ---- 3. Compute the counts (best-effort) ----
+    total_memories = 0
+    with_embeddings = 0
+    pending_reindex = 0
+    last_reindex_at: Optional[int] = None
+    vec0_dimension: Optional[int] = None
+    vec0_row_count = 0
+
+    if db_path is not None and db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=30.0)
+            try:
+                conn.execute("PRAGMA busy_timeout = 30000")
+
+                # Total ACTIVE memories (denominator).
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM memories
+                    WHERE status = 'active'
+                      AND (expires_at IS NULL
+                           OR expires_at > strftime('%s','now'))
+                    """
+                ).fetchone()
+                if row is not None:
+                    total_memories = int(row[0])
+
+                # Embedded under the CURRENT model.
+                # ``model_id = NULL`` (no model selected) skips
+                # the query -- there is nothing to count against.
+                if model_id is not None:
+                    try:
+                        row = conn.execute(
+                            """
+                            SELECT COUNT(DISTINCT me.memory_id)
+                            FROM memory_embeddings me
+                            INNER JOIN memories m
+                                ON m.memory_id = me.memory_id
+                            WHERE m.status = 'active'
+                              AND (m.expires_at IS NULL
+                                   OR m.expires_at > strftime('%s','now'))
+                              AND me.model_id = ?
+                            """,
+                            (model_id,),
+                        ).fetchone()
+                        if row is not None:
+                            with_embeddings = int(row[0])
+                    except sqlite3.OperationalError:
+                        # memory_embeddings table missing.
+                        # Legitimate on a fresh Phase-1 deployment.
+                        pass
+
+                # Pending reindex jobs (pending + running, per
+                # the frontend contract).
+                try:
+                    row = conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM memory_embedding_jobs
+                        WHERE status IN ('pending', 'running')
+                        """
+                    ).fetchone()
+                    if row is not None:
+                        pending_reindex = int(row[0])
+                except sqlite3.OperationalError:
+                    pass
+
+                # Last reindex timestamp (epoch seconds).
+                try:
+                    row = conn.execute(
+                        """
+                        SELECT MAX(created_at)
+                        FROM memory_embedding_jobs
+                        """
+                    ).fetchone()
+                    if row is not None and row[0] is not None:
+                        last_reindex_at = int(row[0])
+                except sqlite3.OperationalError:
+                    pass
+
+                # Vec0 raw row count (best-effort).
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM memory_vectors"
+                    ).fetchone()
+                    if row is not None:
+                        vec0_row_count = int(row[0])
+                except sqlite3.OperationalError:
+                    pass
+
+                # vec0_dimension: sqlite-vec does not expose
+                # dimension through a portable PRAGMA. Leaving
+                # this null is the documented "unknown" state --
+                # the frontend renders it as "—" in diagnostics.
+                # A future version can read it from sqlite-vec's
+                # metadata table if/when the schema is stable.
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "embedding-stats: DB query failed (returning "
+                "partial snapshot): %s", exc,
+            )
+
+    # ---- 4. Respond ----
+    return JSONResponse(
+        status_code=http_status.HTTP_200_OK,
+        content={
+            "ok": True,
+            "model_key": model_key,
+            "model_id": model_id,
+            "total_memories": total_memories,
+            "with_embeddings": with_embeddings,
+            "pending_reindex": pending_reindex,
+            "last_reindex_at": last_reindex_at,
+            "vec0_dimension": vec0_dimension,
+            "vec0_row_count": vec0_row_count,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

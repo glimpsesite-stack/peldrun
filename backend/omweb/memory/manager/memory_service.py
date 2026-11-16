@@ -230,6 +230,28 @@ class MemoryService:
         # ``_close_extraction``. None until then.
         self._batch_service: Optional["MemoryBatchService"] = None
 
+        # --- Embedding subsystem (Phase 4) ---
+        # All references are ``None`` until ``_initialize_embedding``
+        # succeeds. Every public embedding entry point must check for
+        # ``None`` before delegating.
+        #
+        # Unlike extraction, the embedding pipeline DOES NOT depend on
+        # a real transport being injected -- embeddings always talk to
+        # a real HTTP endpoint (LM Studio, OpenAI, Ollama, etc.). The
+        # gate is instead "user has enabled embedding in settings AND
+        # a model_key is configured".
+        #
+        # ``_embedding_active_model_key`` records the model_key used
+        # to build the current resolver. ``reload_settings`` compares
+        # it against the freshly loaded model_key to decide whether a
+        # full pipeline rebuild is required.
+        self._embedding_outbox: Optional["EmbeddingOutbox"] = None
+        self._embedding_resolver: Optional["EmbeddingModelResolver"] = None
+        self._embedding_worker: Optional["EmbeddingWorker"] = None
+        self._vec_repository: Optional["SqliteVecRepository"] = None
+        self._memory_repository: Optional["SqliteMemoryRepository"] = None
+        self._embedding_active_model_key: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -266,12 +288,31 @@ class MemoryService:
                 exc_info=True,
             )
 
+        # Phase 4: bring up embedding pipeline if configured.
+        #
+        # Runs AFTER extraction so that the shared SqliteMemoryRepository
+        # schema (memories + FTS) is guaranteed to be applied by the
+        # extraction pipeline's first connection. In practice the schema
+        # is applied lazily on the first _get_conn() call, but ordering
+        # extraction first gives a warm schema for the embedding path.
+        try:
+            await self._initialize_embedding()
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: embedding initialization failed "
+                "(semantic search / reindex will be unavailable "
+                "until restart): %s",
+                exc,
+                exc_info=True,
+            )
+
         logger.info(
             "MemoryService initialized (mode=%s, provider=%s, "
-            "extraction=%s).",
+            "extraction=%s, embedding=%s).",
             self._lifecycle.settings.mode.value,
             self._lifecycle.settings.provider_id,
             "enabled" if self._outbox is not None else "disabled",
+            "enabled" if self._embedding_worker is not None else "disabled",
         )
 
     async def aclose(self) -> None:
@@ -288,6 +329,13 @@ class MemoryService:
         if not self._initialized and not self._lifecycle.is_ready:
             return
 
+        # Stop embedding FIRST -- it only depends on the SQLite
+        # repositories and the embedding outbox, both of which are
+        # owned exclusively by this pipeline. Stopping it before
+        # extraction is a matter of ordering discipline: if a future
+        # refactor adds a shared resource, this is the correct
+        # dependency direction (embedding -> extraction -> lifecycle).
+        await self._close_embedding()
         await self._close_extraction()
         await self._lifecycle.aclose()
         self._initialized = False
@@ -397,6 +445,64 @@ class MemoryService:
         wires together.
         """
         return self._batch_service
+
+    # ------------------------------------------------------------------
+    # Embedding subsystem (Phase 4)
+    # ------------------------------------------------------------------
+
+    @property
+    def embedding_enabled(self) -> bool:
+        """True when the embedding pipeline is initialized.
+
+        ``False`` when:
+          * ``settings.embedding.enabled`` is ``False``,
+          * no ``model_key`` is configured,
+          * the memory mode does not permit writes,
+          * the provider is not ``sqlite_fts``,
+          * initialization failed.
+
+        Note that ``embedding_enabled == True`` does NOT guarantee
+        the worker is RUNNING -- use ``embedding_worker.is_running``
+        to check the run-loop state. The worker is created at init
+        but only started by ``start_embedding_worker()``.
+        """
+        return self._embedding_worker is not None
+
+    @property
+    def embedding_outbox(self) -> Optional["EmbeddingOutbox"]:
+        """The embedding jobs outbox, or ``None`` when disabled."""
+        return self._embedding_outbox
+
+    @property
+    def embedding_resolver(self) -> Optional["EmbeddingModelResolver"]:
+        """The resolver built from the current vault + metadata snapshot.
+
+        Exposed for diagnostics endpoints and tests. Production code
+        should not need to look inside -- the worker owns the only
+        consumer contract (``list_models()`` for reverse lookup).
+        """
+        return self._embedding_resolver
+
+    @property
+    def embedding_worker(self) -> Optional["EmbeddingWorker"]:
+        """The embedding worker instance, or ``None``.
+
+        Created during ``_initialize_embedding`` but only STARTED by
+        an explicit ``start_embedding_worker`` call. This separation
+        mirrors the extraction worker's design (see ``worker``
+        property above) and gives the lifespan hook full control
+        over when the worker begins claiming jobs.
+        """
+        return self._embedding_worker
+
+    @property
+    def vec_repository(self) -> Optional["SqliteVecRepository"]:
+        """The sqlite-vec repository, or ``None``.
+
+        Exposed so reindex / reembed admin endpoints can call
+        ``reindex_namespace`` without needing a live worker.
+        """
+        return self._vec_repository
 
     def get_extraction_trigger(self) -> Optional[str]:
         """Return the current ``extraction_trigger`` mode or ``None``.
@@ -740,6 +846,119 @@ class MemoryService:
                 "(non-fatal): %s", reload_err,
             )
 
+        # --- Phase 4: re-evaluate embedding pipeline --------------
+        #
+        # Three cases drive action:
+        #
+        #   1. off -> on:  initialize fresh pipeline.
+        #   2. on  -> off: tear down pipeline.
+        #   3. on  -> on WITH model_key change: full rebuild --
+        #      the resolver must be reconstructed against the new
+        #      model so that _resolve_model() finds jobs whose
+        #      model_id matches the newly-selected model.
+        #
+        # The "on -> on with no change" case is a no-op. Changing
+        # unrelated settings (batch size, min relevance, etc.)
+        # does not require rebuilding the embedding pipeline.
+        #
+        # All failure paths are logged and swallowed -- a broken
+        # embedding reload must not prevent the caller (PATCH
+        # /api/memory/settings) from returning the successfully-
+        # reloaded settings.
+        try:
+            emb = getattr(new_settings, "embedding", None)
+            want_embedding_enabled = (
+                emb is not None
+                and getattr(emb, "enabled", False)
+                and isinstance(
+                    getattr(emb, "model_key", None), str
+                )
+                and bool(getattr(emb, "model_key", "").strip())
+                and new_settings.mode.can_write
+                and new_settings.provider_id == "sqlite_fts"
+            )
+            have_embedding_enabled = (
+                self._embedding_worker is not None
+            )
+            new_model_key = (
+                getattr(emb, "model_key", None) if emb else None
+            )
+            new_model_key_clean = (
+                new_model_key.strip()
+                if isinstance(new_model_key, str)
+                else None
+            )
+            model_key_changed = (
+                have_embedding_enabled
+                and new_model_key_clean
+                != self._embedding_active_model_key
+            )
+
+            if want_embedding_enabled and not have_embedding_enabled:
+                logger.info(
+                    "MemoryService: embedding enabled via "
+                    "settings reload; initializing pipeline."
+                )
+                try:
+                    await self._initialize_embedding()
+                    logger.info(
+                        "MemoryService: embedding pipeline "
+                        "started via reload."
+                    )
+                except Exception as init_err:
+                    logger.warning(
+                        "MemoryService: embedding init during "
+                        "reload failed (non-fatal): %s",
+                        init_err,
+                    )
+            elif (
+                not want_embedding_enabled
+                and have_embedding_enabled
+            ):
+                logger.info(
+                    "MemoryService: embedding disabled via "
+                    "settings reload; stopping pipeline."
+                )
+                try:
+                    await self._close_embedding()
+                    logger.info(
+                        "MemoryService: embedding pipeline "
+                        "stopped via reload."
+                    )
+                except Exception as close_err:
+                    logger.warning(
+                        "MemoryService: embedding close during "
+                        "reload failed (non-fatal): %s",
+                        close_err,
+                    )
+            elif (
+                want_embedding_enabled
+                and have_embedding_enabled
+                and model_key_changed
+            ):
+                logger.info(
+                    "MemoryService: embedding model_key changed "
+                    "(%r -> %r) via settings reload; rebuilding "
+                    "pipeline.",
+                    self._embedding_active_model_key,
+                    new_model_key_clean,
+                )
+                try:
+                    await self._close_embedding()
+                    await self._initialize_embedding()
+                except Exception as rebuild_err:
+                    logger.warning(
+                        "MemoryService: embedding rebuild during "
+                        "reload failed (non-fatal): %s",
+                        rebuild_err,
+                    )
+            # else: state unchanged -> nothing to do.
+        except Exception as emb_reload_err:
+            logger.warning(
+                "MemoryService: embedding reload check failed "
+                "(non-fatal): %s", emb_reload_err,
+            )
+
         return new_settings
 
     # ------------------------------------------------------------------
@@ -999,6 +1218,97 @@ class MemoryService:
         except Exception as exc:
             logger.warning(
                 "stop_extraction_worker failed (non-fatal): %s", exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Embedding queue (Phase 4)
+    # ------------------------------------------------------------------
+
+    async def start_embedding_worker(self) -> bool:
+        """Start the embedding worker.
+
+        Unlike ``start_extraction_worker``, no "real transport" gate
+        is required: embeddings always talk to a real HTTP endpoint
+        (LM Studio, OpenAI, Ollama, etc.). The worker is created
+        during ``_initialize_embedding`` ONLY when the operator has
+        enabled embedding AND a model_key is configured -- if it
+        exists here, it is ready to run.
+
+        Returns
+        -------
+        bool
+            True when the worker is running after this call.
+            False when:
+
+              * the embedding pipeline was not initialized
+                (embedding disabled, no model_key, mode not
+                writable, provider not sqlite_fts, or init
+                failed),
+              * ``worker.start()`` itself raised (logged at
+                ERROR; state is consistent).
+
+            Idempotent: calling on an already-running worker is
+            a no-op that returns True.
+
+        Never raises. All failure modes are logged and reported
+        as ``False``.
+        """
+        if self._embedding_worker is None:
+            logger.debug(
+                "start_embedding_worker: embedding pipeline not "
+                "initialized; nothing to start."
+            )
+            return False
+        if self._embedding_worker.is_running:
+            logger.debug(
+                "start_embedding_worker: worker already running."
+            )
+            return True
+        try:
+            await self._embedding_worker.start()
+            logger.info(
+                "EmbeddingWorker started (worker_id=%s, "
+                "models_in_snapshot=%d).",
+                self._embedding_worker.worker_id,
+                len(self._embedding_resolver)
+                if self._embedding_resolver is not None
+                else 0,
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "start_embedding_worker: worker.start() failed: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    async def stop_embedding_worker(
+        self, *, timeout_seconds: int = 30
+    ) -> None:
+        """Stop the embedding worker gracefully.
+
+        Idempotent: safe to call when the worker is not running
+        or was never created. Never raises -- a shutdown path
+        must not throw, because that would skip subsequent
+        cleanup steps in the lifespan hook.
+
+        The current in-flight job's row will be recovered by
+        ``recover_stale_running`` on the next startup.
+        """
+        if (
+            self._embedding_worker is None
+            or not self._embedding_worker.is_running
+        ):
+            return
+        try:
+            await self._embedding_worker.stop(
+                timeout_seconds=timeout_seconds
+            )
+            logger.info("EmbeddingWorker stopped.")
+        except Exception as exc:
+            logger.warning(
+                "stop_embedding_worker failed (non-fatal): %s", exc,
             )
 
     # ------------------------------------------------------------------
@@ -1693,6 +2003,243 @@ class MemoryService:
             return None
         return (pid, mid)
 
+    async def _initialize_embedding(self) -> None:
+        """Bring up the embedding pipeline when it is applicable.
+
+        Preconditions (all must pass, otherwise return early with a
+        DEBUG/INFO log explaining why):
+
+          1. ``settings.embedding`` exists and is a dict/object.
+          2. ``settings.embedding.enabled`` is True.
+          3. ``settings.embedding.model_key`` is a non-empty string.
+          4. ``mode.can_write`` is True -- the worker writes
+             embeddings (vectors) to ``memory_embeddings`` and
+             ``memory_vectors``. Read-only or disabled mode cannot
+             support that.
+          5. ``provider_id == "sqlite_fts"`` -- the only provider
+             that exposes the ``memory_embeddings`` / ``memory_vectors``
+             tables this pipeline depends on.
+
+        Construction order (matches the worker's dependency graph):
+
+          1. ``build_embedding_model_snapshot`` -- read vault +
+             metadata, produce the typed snapshot. Fail-soft.
+          2. ``EmbeddingModelResolver(snapshot)`` -- typed registry.
+             This WILL raise ``ValueError`` if the snapshot contains
+             any key/model_key mismatch, which is why the
+             ``snapshot_builder`` module must never register the
+             same instance under a second (bare) key.
+          3. ``EmbeddingOutbox(db_path).open()`` -- durable job
+             queue for embedding work (separate from extraction).
+          4. ``SqliteMemoryRepository(db_path)`` -- reads memories'
+             content for embedding. Lazy connection (no open()
+             needed).
+          5. ``SqliteVecRepository(db_path)`` -- writes vectors into
+             ``memory_embeddings`` + the vec0 index. Lazy connection
+             (no open() needed).
+          6. ``EmbeddingWorker(...)`` -- created but NOT started.
+
+        The worker is intentionally NOT started here. ``main.py``'s
+        lifespan hook calls ``start_embedding_worker()`` after this
+        returns, which gives the shutdown hook the same explicit
+        ordering control that the extraction worker already has.
+
+        Any exception during construction is logged at WARNING and
+        leaves every ``self._embedding_*`` field at ``None`` --
+        embedding is simply unavailable, and the memory subsystem
+        continues to serve retrieval / extraction normally. This is
+        the correct degradation: a broken embedding pipeline must
+        never block startup.
+        """
+        # ---- 1. Settings gate --------------------------------
+        settings = self._lifecycle.settings
+        embedding_cfg = getattr(settings, "embedding", None)
+        if embedding_cfg is None:
+            logger.debug(
+                "MemoryService: no embedding settings; embedding "
+                "pipeline disabled."
+            )
+            return
+        if not getattr(embedding_cfg, "enabled", False):
+            logger.debug(
+                "MemoryService: embedding.enabled=False; "
+                "embedding pipeline disabled."
+            )
+            return
+        model_key = getattr(embedding_cfg, "model_key", None)
+        if not isinstance(model_key, str) or not model_key.strip():
+            logger.info(
+                "MemoryService: embedding.enabled=True but no "
+                "model_key configured. Embedding pipeline will "
+                "NOT start until the operator selects a model "
+                "via PATCH /api/memory/settings."
+            )
+            return
+
+        # ---- 2. Mode + provider gate -------------------------
+        if not settings.mode.can_write:
+            logger.info(
+                "MemoryService: embedding skipped -- memory mode "
+                "%r does not permit writes (embedding writes "
+                "vectors to the DB).",
+                settings.mode.value,
+            )
+            return
+        if settings.provider_id != "sqlite_fts":
+            logger.info(
+                "MemoryService: embedding skipped -- provider %r "
+                "is not sqlite_fts.",
+                settings.provider_id,
+            )
+            return
+
+        # ---- 3. Lazy imports --------------------------------
+        from omweb.memory.jobs.embedding_worker import (
+            EmbeddingWorker,
+        )
+        from omweb.memory.jobs.outbox import EmbeddingOutbox
+        from omweb.memory.manager.snapshot_builder import (
+            build_embedding_model_snapshot,
+        )
+        from omweb.memory.storage.repository import (
+            SqliteMemoryRepository,
+        )
+        from omweb.memory.storage.vector_repository import (
+            SqliteVecRepository,
+        )
+        from peldrun.memory.embeddings.model_resolver import (
+            EmbeddingModelResolver,
+        )
+
+        # ---- 4. Snapshot + resolver -------------------------
+        try:
+            snapshot = build_embedding_model_snapshot()
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: build_embedding_model_snapshot() "
+                "raised; embedding pipeline will not start: %s",
+                exc,
+                exc_info=True,
+            )
+            return
+
+        if not snapshot:
+            logger.info(
+                "MemoryService: embedding snapshot is EMPTY "
+                "(no embedding models marked in metadata or in "
+                "the vault's embedding_models index). Pipeline "
+                "will not start until at least one model is "
+                "configured. model_key=%r",
+                model_key,
+            )
+            return
+
+        if model_key not in snapshot:
+            # Configured model_key does not resolve. This is NOT a
+            # fatal error -- the operator may simply have hit
+            # PATCH before running Scan Models on the provider.
+            # Jobs enqueued by /reindex will fail with
+            # MODEL_NOT_CONFIGURED at claim time, which is
+            # diagnosable from the jobs table.
+            logger.warning(
+                "MemoryService: embedding model_key %r does not "
+                "resolve in the snapshot (known keys: %s). The "
+                "worker will start but every job for this model "
+                "will fail with MODEL_NOT_CONFIGURED until the "
+                "model is re-scanned and re-selected.",
+                model_key,
+                list(snapshot.keys())[:5],
+            )
+
+        try:
+            resolver = EmbeddingModelResolver(snapshot)
+        except Exception as exc:
+            # This is the exact failure mode our snapshot_builder
+            # fix prevents. If it fires, the snapshot_builder still
+            # has a key/model_key mismatch bug -- log loudly.
+            logger.error(
+                "MemoryService: EmbeddingModelResolver "
+                "construction failed -- the snapshot contains a "
+                "key/model_key mismatch. See snapshot_builder.py "
+                "for the key invariant. Cause: %s",
+                exc,
+                exc_info=True,
+            )
+            return
+
+        # ---- 5. Open outbox --------------------------------
+        db_path = self._outbox_db_path or self._lifecycle.db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            embedding_outbox = EmbeddingOutbox(db_path)
+            await embedding_outbox.open()
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: EmbeddingOutbox open failed; "
+                "embedding pipeline will not start: %s",
+                exc,
+                exc_info=True,
+            )
+            return
+
+        # ---- 6. Repositories (lazy, no await) -------------
+        try:
+            mem_repo = SqliteMemoryRepository(db_path)
+            vec_repo = SqliteVecRepository(db_path)
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: repository construction failed; "
+                "embedding pipeline will not start: %s",
+                exc,
+                exc_info=True,
+            )
+            try:
+                await embedding_outbox.close()
+            except Exception:
+                pass
+            return
+
+        # ---- 7. Worker (created, NOT started) --------------
+        try:
+            worker = EmbeddingWorker(
+                outbox=embedding_outbox,
+                resolver=resolver,
+                vector_repository=vec_repo,
+                memory_repository=mem_repo,
+            )
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: EmbeddingWorker construction "
+                "failed; embedding pipeline will not start: %s",
+                exc,
+                exc_info=True,
+            )
+            try:
+                await embedding_outbox.close()
+            except Exception:
+                pass
+            return
+
+        # ---- 8. Commit state ------------------------------
+        self._embedding_outbox = embedding_outbox
+        self._embedding_resolver = resolver
+        self._embedding_worker = worker
+        self._vec_repository = vec_repo
+        self._memory_repository = mem_repo
+        self._embedding_active_model_key = model_key.strip()
+
+        logger.info(
+            "MemoryService: embedding pipeline initialized "
+            "(model_key=%r, models_in_snapshot=%d, outbox_db=%s, "
+            "worker_id=%s). Worker will start when "
+            "start_embedding_worker() is called.",
+            self._embedding_active_model_key,
+            len(resolver),
+            db_path,
+            worker.worker_id,
+        )
+
     async def _close_extraction(self) -> None:
         """Tear down the extraction subsystem. Idempotent.
 
@@ -1754,6 +2301,79 @@ class MemoryService:
             except Exception as exc:
                 logger.warning(
                     "MemoryService: extraction outbox close "
+                    "failed (non-fatal): %s", exc,
+                )
+
+    async def _close_embedding(self) -> None:
+        """Tear down the embedding pipeline. Idempotent.
+
+        Shutdown ordering mirrors ``_close_extraction``:
+
+          1. Stop the worker FIRST (waits for the current job).
+          2. Close the outbox (the worker's transition methods --
+             complete/fail/retry -- require the outbox to remain
+             open until after the worker stops).
+          3. Close the SQLite repositories. Their ``close_all()``
+             is synchronous; failure here is logged and swallowed
+             so that a broken repository cannot prevent the
+             lifecycle provider from closing.
+
+        Repositories are closed LAST because other pipelines may
+        share the same DB file (WAL permits concurrent access), but
+        nothing else owns references to these specific instances.
+        """
+        # ---- 1. Worker ------------------------------------
+        worker = self._embedding_worker
+        self._embedding_worker = None
+        if worker is not None and worker.is_running:
+            try:
+                await worker.stop(timeout_seconds=30)
+                logger.info("MemoryService: embedding worker stopped.")
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: embedding worker stop "
+                    "failed (non-fatal): %s", exc,
+                )
+
+        # ---- 2. Resolver + active model key ---------------
+        self._embedding_resolver = None
+        self._embedding_active_model_key = None
+
+        # ---- 3. Outbox ------------------------------------
+        outbox = self._embedding_outbox
+        self._embedding_outbox = None
+        if outbox is not None:
+            try:
+                await outbox.close()
+                logger.info(
+                    "MemoryService: embedding outbox closed."
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: embedding outbox close "
+                    "failed (non-fatal): %s", exc,
+                )
+
+        # ---- 4. Repositories (sync close) -----------------
+        vec_repo = self._vec_repository
+        self._vec_repository = None
+        if vec_repo is not None:
+            try:
+                vec_repo.close_all()
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: vec repository close "
+                    "failed (non-fatal): %s", exc,
+                )
+
+        mem_repo = self._memory_repository
+        self._memory_repository = None
+        if mem_repo is not None:
+            try:
+                mem_repo.close_all()
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: memory repository close "
                     "failed (non-fatal): %s", exc,
                 )
 

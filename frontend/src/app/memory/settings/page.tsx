@@ -19,7 +19,12 @@
 
 import Link from 'next/link';
 import { useTranslation } from 'react-i18next';
-import { ArrowRight, FolderCog, ListChecks } from 'lucide-react';
+import {
+  ArrowRight,
+  Brain,
+  FolderCog,
+  ListChecks,
+} from 'lucide-react';
 
 import { useMemorySettings } from '../../../features/memory/api/queries';
 import { SettingsForm } from '../../../features/memory/components/SettingsForm';
@@ -51,6 +56,56 @@ export default function MemorySettingsPage() {
 
       {/* ============ Settings form ============ */}
       <SettingsForm />
+
+      {/* ============ Semantic search (Phase 4) ============ */}
+      {/*
+        A dedicated entry point for the Phase 4 settings page.
+        Phase 4 auto-saves per change (unlike the main form
+        above, which requires an explicit "Save changes"
+        click), so it lives on its own route to keep the two
+        save models from confusing the user. The card shows
+        the CURRENT state (enabled/disabled + selected model)
+        so the user knows whether to click through without
+        opening the page first.
+      */}
+      <MemorySection
+        icon={Brain}
+        title={t('settings.sections.semanticSearch')}
+        subtitle={t('settings.embedding.sectionSubtitle')}
+        accent="cyan"
+        delay={0.25}
+      >
+        <Link
+          href="/memory/embeddings"
+          className={cn(
+            'group flex items-center justify-between gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-[11px]',
+            'hover:border-primary/40 hover:bg-muted/40 transition-colors',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
+          )}
+        >
+          <div className="min-w-0 flex-1">
+            <span className="block font-medium text-foreground">
+              {t('settings.embedding.linkTitle')}
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              {settingsQuery.data?.embedding
+                ? settingsQuery.data.embedding.enabled
+                  ? t('settings.embedding.state.enabledWithModel', {
+                      model:
+                        settingsQuery.data.embedding.model_key ??
+                        t('settings.embedding.state.noModel'),
+                    })
+                  : t('settings.embedding.state.disabled')
+                : t('settings.embedding.linkDescription')}
+            </span>
+          </div>
+          <ArrowRight
+            size={11}
+            aria-hidden="true"
+            className="shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 rtl:group-hover:-translate-x-0.5"
+          />
+        </Link>
+      </MemorySection>
 
       {/* ============ Automation shortcuts ============ */}
       <MemorySection

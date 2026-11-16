@@ -1626,123 +1626,87 @@ def _rebuild_embedding_models_index(
 async def get_embedding_models_endpoint():
     """Return models designated as embedding models.
 
-    A model qualifies when its **effective** ``is_embedding`` flag is
-    ``True``. Effective flag resolution, in priority order:
-
-      1. ``capabilities.is_embedding`` when present — the canonical
-         field, carries a provenance in
-         ``capability_sources.is_embedding`` and is preserved across
-         rescans when the source is ``manual``.
-      2. ``is_embedding`` at the top level — legacy field populated
-         by older scans before the capability-source migration. Used
-         only when the capability layer has no entry for it.
-
-    The response shape is designed so a downstream caller can build
-    an embedding router without ever reading the vault::
-
-        {
-          "ok": true,
-          "models": [
-            {
-              "key": "text-embedding-3-small",
-              "model_id": "text-embedding-3-small",
-              "provider_id": "openai",
-              "provider_name": "OpenAI",
-              "display_name": "text-embedding-3-small",
-              "type": "embeddings",
-              "source": "manual" | "provider_live" | ...
-            },
-            ...
-          ]
-        }
-
-    ``provider_id`` and ``provider_name`` are ``null`` when the
-    model cannot be attributed to any provider in
-    ``models_vault.json``. Callers MUST treat that as "provider
-    unknown", not "no provider".
+    Source of truth: ``models_vault.json`` -> ``embedding_models``.
+    This endpoint MUST read the same file that ``save_vault_to_disk``
+    writes to, otherwise the UI selector (which reads the vault via
+    ``/api/config/vault``) and this endpoint can disagree about which
+    models exist. The old implementation read ``models_metadata.json``
+    + ``_read_models_vault()`` (which reads from ``STORAGE_ROOT``
+    instead of ``BACKEND_DIR/data``), causing the settings page to
+    show "The selected embedding model is no longer available"
+    even when the user had just selected a valid model.
     """
-    metadata: Dict[str, Any] = {}
-    if METADATA_CACHE.exists():
-        try:
-            with open(METADATA_CACHE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                metadata = loaded
-        except Exception as exc:
-            logger.warning("Failed to read metadata cache: %s", exc)
+    # Use load_vault_from_disk -- the SAME function that save_vault_to_disk
+    # and /api/config/vault use. Never use _read_models_vault here: it
+    # reads from STORAGE_ROOT which may diverge from BACKEND_DIR/data.
+    vault = load_vault_from_disk()
 
-    vault = _read_models_vault()
+    by_provider = vault.get("embedding_models") or {}
+    if not isinstance(by_provider, dict):
+        by_provider = {}
 
+    # ---- Build provider_id -> display_name lookup ----
+    provider_names: Dict[str, str] = {}
+
+    for c in (vault.get("provider_connections") or []):
+        if not isinstance(c, dict):
+            continue
+        if not c.get("is_active") or not c.get("enabled"):
+            continue
+        pid = c.get("provider_package_id")
+        if isinstance(pid, str) and pid:
+            nm = c.get("name")
+            provider_names[pid] = nm if isinstance(nm, str) and nm else pid
+
+    for cp in (vault.get("cloud_vault") or []):
+        if not isinstance(cp, dict):
+            continue
+        pid = cp.get("id")
+        if isinstance(pid, str) and pid and pid not in provider_names:
+            nm = cp.get("name")
+            provider_names[pid] = nm if isinstance(nm, str) and nm else pid
+
+    for ce in (vault.get("custom_endpoints") or []):
+        if not isinstance(ce, dict):
+            continue
+        pid = ce.get("providerId") or ce.get("id")
+        if isinstance(pid, str) and pid and pid not in provider_names:
+            nm = ce.get("name")
+            provider_names[pid] = nm if isinstance(nm, str) and nm else pid
+
+    provider_names.setdefault("lmstudio", "LM Studio")
+    provider_names.setdefault("ollama", "Ollama")
+
+    # ---- Flat list of every (provider, model) pair ----
     models: list = []
-    for key, entry in metadata.items():
-        if not isinstance(entry, dict):
+    for pid, model_ids in by_provider.items():
+        if not isinstance(model_ids, list):
             continue
+        pid_str = str(pid)
+        p_name = provider_names.get(pid_str, pid_str)
+        for mid in model_ids:
+            if not isinstance(mid, str) or not mid.strip():
+                continue
+            models.append(
+                {
+                    "key": f"{pid_str}::{mid}",
+                    "model_id": mid,
+                    "provider_id": pid_str,
+                    "provider_name": p_name,
+                    "display_name": mid,
+                    "type": "embeddings",
+                    "source": "manual",
+                }
+            )
 
-        caps = entry.get("capabilities")
-        if not isinstance(caps, dict):
-            caps = {}
-
-        sources = entry.get("capability_sources")
-        if not isinstance(sources, dict):
-            sources = {}
-
-        # Effective embedding flag, mirroring the frontend's
-        # `inferModelCapabilities` resolution order exactly.
-        if "is_embedding" in caps:
-            is_embedding = caps["is_embedding"] is True
-            source = sources.get("is_embedding")
-        else:
-            # Legacy entry — read the top-level field, which was
-            # always populated by the provider scan, so treat it as
-            # a live fact from the provider.
-            is_embedding = entry.get("is_embedding") is True
-            source = "provider_live" if is_embedding else None
-
-        if not is_embedding:
-            continue
-
-        if not isinstance(source, str) or not source:
-            # Defensive default: an entry marked embedding without a
-            # source is, by definition, manually authored — no
-            # automated writer produces such an entry.
-            source = "manual"
-
-        provider_id, provider_name = _resolve_provider_for_model(key, vault)
-
-        # Extract the bare model id. A composite key has the form
-        # "provider::model" or "provider::conn::model"; the last
-        # segment is the model id. The metadata entry itself may
-        # carry a canonical `key` field, which takes precedence.
-        model_id = entry.get("key") or key.split("::")[-1]
-
-        models.append(
-            {
-                "key": key,
-                "model_id": model_id,
-                "provider_id": provider_id,
-                "provider_name": provider_name,
-                "display_name": entry.get("display_name") or model_id,
-                "type": entry.get("type") or "embeddings",
-                "source": source,
-            }
-        )
-
-    # Deterministic ordering keeps diffing and UI rendering stable.
     models.sort(
         key=lambda m: (m.get("provider_id") or "", m.get("model_id") or "")
     )
 
     return {
         "ok": True,
-        # Flat list (backward compatible with existing callers).
         "models": models,
-        # Per-provider view — matches the `embedding_models` section
-        # persisted in `models_vault.json`. Consumers that need "what
-        # embedding models belong to provider X" can read either
-        # source; both are guaranteed identical because they are
-        # produced by the same `_rebuild_embedding_models_index`
-        # helper.
-        "by_provider": _rebuild_embedding_models_index(vault),
+        "by_provider": by_provider,
     }
 
 

@@ -203,6 +203,8 @@ _PATCHABLE_FIELDS: frozenset = frozenset(
         "boost_pinned",
         "token_budget",
         "ai",
+        "embedding",
+        "retrieval",
         "auto_extraction_enabled",
         "auto_extraction_min_turns",
     }
@@ -273,6 +275,24 @@ class _SettingsPatch(BaseModel):
             "``_deep_merge_ai`` for the merge semantics."
         ),
     )
+    embedding: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Partial MemoryEmbeddingSettings. Sent fields override "
+            "the current values; omitted fields are preserved via a "
+            "shallow merge (so ``{enabled: true}`` alone keeps the "
+            "stored ``model_key``). Pass ``{model_key: null}`` to "
+            "clear the model selection explicitly."
+        ),
+    )
+    retrieval: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Partial MemoryRetrievalSettings. Sent fields override "
+            "the current values; omitted fields are preserved via a "
+            "shallow merge."
+        ),
+    )
     auto_extraction_enabled: Optional[bool] = Field(
         default=None,
         description="Enable post-run extraction",
@@ -322,6 +342,20 @@ class _ProjectSettingsBody(BaseModel):
         description=(
             "Per-project AI override. Same deep-merge "
             "semantics as _SettingsPatch.ai."
+        ),
+    )
+    embedding: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-project embedding override. Same shallow-merge "
+            "semantics as _SettingsPatch.embedding."
+        ),
+    )
+    retrieval: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-project retrieval override. Same shallow-merge "
+            "semantics as _SettingsPatch.retrieval."
         ),
     )
     auto_extraction_enabled: Optional[bool] = None
@@ -601,6 +635,38 @@ async def patch_settings(body: _SettingsPatch) -> JSONResponse:
             current_ai, update_dict["ai"]
         )
 
+    # ----- Shallow-merge embedding / retrieval deltas -----
+    #
+    # The frontend sends PARTIAL patches for these sub-trees
+    # (``{enabled: true}`` should keep the stored ``model_key``).
+    # ``MemorySettingsManager.update()`` does a shallow
+    # ``dict.update()`` on the model, so without this merge a
+    # partial patch would reset every omitted sub-field to its
+    # default -- silently wiping the model selection.
+    if (
+        "embedding" in update_dict
+        and isinstance(update_dict["embedding"], dict)
+    ):
+        current_embedding = service.settings.embedding.model_dump(
+            mode="json"
+        )
+        update_dict["embedding"] = {
+            **current_embedding,
+            **update_dict["embedding"],
+        }
+
+    if (
+        "retrieval" in update_dict
+        and isinstance(update_dict["retrieval"], dict)
+    ):
+        current_retrieval = service.settings.retrieval.model_dump(
+            mode="json"
+        )
+        update_dict["retrieval"] = {
+            **current_retrieval,
+            **update_dict["retrieval"],
+        }
+
     try:
         # ----- Persist + validate -----
         new_settings = await service._settings_manager.update(  # noqa: SLF001
@@ -785,6 +851,32 @@ async def put_project_settings(
         override_dict["ai"] = _deep_merge_ai(
             current_ai, override_dict["ai"]
         )
+
+    # Same shallow-merge contract as ``patch_settings`` -- see the
+    # comment there for the rationale.
+    if (
+        "embedding" in override_dict
+        and isinstance(override_dict["embedding"], dict)
+    ):
+        current_embedding = service.settings.embedding.model_dump(
+            mode="json"
+        )
+        override_dict["embedding"] = {
+            **current_embedding,
+            **override_dict["embedding"],
+        }
+
+    if (
+        "retrieval" in override_dict
+        and isinstance(override_dict["retrieval"], dict)
+    ):
+        current_retrieval = service.settings.retrieval.model_dump(
+            mode="json"
+        )
+        override_dict["retrieval"] = {
+            **current_retrieval,
+            **override_dict["retrieval"],
+        }
 
     # ----- Build the override MemorySettings -----
     #

@@ -49,6 +49,10 @@ import type {
   MemoryAISettings,
   MemoryAISettingsOverlay,
 } from './ai';
+import type {
+  MemoryEmbeddingSettings,
+  MemoryRetrievalSettings,
+} from './embedding';
 
 // ---------------------------------------------------------------------------
 // Constraint constants
@@ -62,6 +66,13 @@ import type {
  * the settings contract, not generic UI constants. ``constants.ts``
  * re-exports them for convenience; consumers may import from
  * either module.
+ *
+ * NOTE: bounds for the Phase 4 retrieval sub-tree live in
+ * `embedding.ts` as `MemoryRetrievalBounds` -- they are NOT
+ * duplicated here because they describe a different model
+ * (`MemoryRetrievalSettings`), not a top-level field of
+ * `MemorySettings`. Validators that need both should import
+ * from both modules.
  */
 export const MemorySettingsBounds = {
   default_limit: { min: 1, max: 50 },
@@ -155,6 +166,29 @@ export interface MemorySettingsOverlay {
    * partial) is mandatory on the wire.
    */
   ai?: MemoryAISettingsOverlay;
+  /**
+   * Phase 4 embedding overlay (delta form).
+   *
+   * `Partial<MemoryEmbeddingSettings>` because the backend's
+   * PATCH uses a SHALLOW merge on the `embedding` sub-tree:
+   * sending `{enabled: true}` alone preserves the currently-
+   * stored `model_key`, and sending `{model_key: "..."}` alone
+   * preserves `enabled`. The two fields are independently
+   * patchable by contract (see `MemorySettingsPatch` JSDoc).
+   *
+   * `MemoryEmbeddingSettings` has only two fields (`enabled`,
+   * `model_key`), so the flat `Partial<>` is sufficient --
+   * unlike `ai`, there are no nested sub-objects requiring a
+   * deep-partial helper.
+   */
+  embedding?: Partial<MemoryEmbeddingSettings>;
+  /**
+   * Phase 4 retrieval overlay (delta form).
+   *
+   * Same shallow-merge contract as `embedding`: any subset of
+   * the six retrieval fields may be sent independently.
+   */
+  retrieval?: Partial<MemoryRetrievalSettings>;
   auto_extraction_enabled?: boolean;
   auto_extraction_min_turns?: number;
 }
@@ -213,6 +247,19 @@ export interface MemoryProjectOverride {
    * not as a partial.
    */
   ai?: MemoryAISettingsOverlay;
+  /**
+   * Per-project embedding override (Phase 4).
+   *
+   * Same delta-merge semantics as the global `embedding`
+   * overlay -- fields present here win over the global values
+   * for this project only, and fields absent inherit from
+   * global.
+   */
+  embedding?: Partial<MemoryEmbeddingSettings>;
+  /**
+   * Per-project retrieval override (Phase 4).
+   */
+  retrieval?: Partial<MemoryRetrievalSettings>;
   auto_extraction_enabled?: boolean;
   auto_extraction_min_turns?: number;
 }
@@ -283,6 +330,32 @@ export interface MemorySettingsPatch {
    * helper's job (expanding the partial) type-checks.
    */
   ai?: MemoryAISettingsOverlay;
+  /**
+   * Phase 4 embedding patch (delta form).
+   *
+   * DELTA-merge semantics on the wire -- see the module-level
+   * note under `MemorySettings.embedding` for the exact
+   * behavior. In short: sending `{embedding: {enabled: true}}`
+   * alone preserves the currently-stored `model_key`, and
+   * sending `{embedding: {model_key: "..."}}` alone preserves
+   * the currently-stored `enabled`. The two fields are
+   * independently patchable by contract.
+   *
+   * The backend rejects an empty `embedding: {}` object with
+   * HTTP 422 (`empty_update`) -- send at least one field, or
+   * omit the key entirely.
+   */
+  embedding?: Partial<MemoryEmbeddingSettings>;
+  /**
+   * Phase 4 retrieval patch (delta form).
+   *
+   * Same delta-merge contract as `embedding`: any subset of
+   * the six retrieval fields may be sent independently, and
+   * the backend shallow-merges into the current retrieval
+   * subtree. Sending an empty `retrieval: {}` is rejected with
+   * HTTP 422.
+   */
+  retrieval?: Partial<MemoryRetrievalSettings>;
   auto_extraction_enabled?: boolean;
   auto_extraction_min_turns?: number;
 }
@@ -359,6 +432,59 @@ export interface MemorySettings {
    */
   ai: MemoryAISettings;
   /**
+   * Semantic search configuration (Phase 4).
+   *
+   * See `MemoryEmbeddingSettings` in `./embedding.ts` for the
+   * full field contract. Always present in the response
+   * (backend fills defaults) -- `enabled` defaults to `false`
+   * and `model_key` to `null`, which is a legitimate
+   * "disabled" state, not an error.
+   *
+   * DELTA-MERGE SEMANTICS (informs the patch contract):
+   *
+   * `PATCH /api/memory/settings` accepts a partial `embedding`
+   * sub-object and shallow-merges it into the current value.
+   * The two fields are independently patchable:
+   *
+   *   * `{embedding: {enabled: true}}` alone PRESERVES the
+   *     currently-stored `model_key` (which may still be
+   *     `null` -- that is the "enabled but not yet configured"
+   *     state, and the UI MUST warn when it occurs).
+   *
+   *   * `{embedding: {model_key: "openai::..."}}` alone
+   *     PRESERVES the currently-stored `enabled` flag.
+   *
+   * This is why `MemorySettingsPatch.embedding` and
+   * `MemorySettingsOverlay.embedding` are typed as
+   * `Partial<MemoryEmbeddingSettings>` rather than the full
+   * shape -- a caller changing one field MUST NOT be forced to
+   * echo the other back.
+   */
+  embedding: MemoryEmbeddingSettings;
+  /**
+   * Retrieval strategy and fusion tuning (Phase 4).
+   *
+   * See `MemoryRetrievalSettings` in `./embedding.ts` for the
+   * full field contract. Always present in the response
+   * (backend fills defaults).
+   *
+   * IMPORTANT behavioral note for the UI:
+   *
+   * `retrieval.mode` may be set to a semantic mode (`vector`,
+   * `hybrid`, `automatic`) even when `embedding.enabled` is
+   * `false`. This is a LEGITIMATE state -- it lets a user
+   * pre-configure their preferred strategy before enabling
+   * embeddings. The backend silently falls back to `lexical`
+   * at retrieval time in that case, and logs the fallback at
+   * INFO level only.
+   *
+   * The settings UI MUST NOT reject or block this
+   * combination -- instead, show a warning explaining that
+   * the semantic mode will not take effect until embeddings
+   * are enabled.
+   */
+  retrieval: MemoryRetrievalSettings;
+  /**
    * @deprecated Phase-0 placeholder for the heuristic extractor.
    * Superseded by `ai.enabled` + `ai.extraction_enabled` for the
    * LLM extractor. Kept for backward compatibility with
@@ -399,6 +525,8 @@ export const MEMORY_SETTINGS_PATCHABLE_FIELDS = [
   'boost_pinned',
   'token_budget',
   'ai',
+  'embedding',
+  'retrieval',
   'auto_extraction_enabled',
   'auto_extraction_min_turns',
 ] as const satisfies readonly (keyof MemorySettingsPatch)[];
@@ -581,6 +709,45 @@ export function computeEffectiveOverride(
       effective.ai = mergedAi;
     }
   }
+  // embedding: expand the partial overlay to a FULL
+  // MemoryEmbeddingSettings, then compare against base. The
+  // explicit `!== undefined` check on `model_key` is what lets
+  // a caller send `{model_key: null}` to CLEAR the stored key
+  // -- a plain `??` would treat `null` as "keep base value",
+  // which would make clearing impossible.
+  if (override.embedding !== undefined) {
+    const mergedEmbedding: MemoryEmbeddingSettings = {
+      enabled:
+        override.embedding.enabled !== undefined
+          ? override.embedding.enabled
+          : base.embedding.enabled,
+      model_key:
+        override.embedding.model_key !== undefined
+          ? override.embedding.model_key
+          : base.embedding.model_key,
+    };
+    if (
+      JSON.stringify(mergedEmbedding) !==
+      JSON.stringify(base.embedding)
+    ) {
+      effective.embedding = mergedEmbedding;
+    }
+  }
+  // retrieval: same expansion-then-compare as embedding. All
+  // six fields are primitives (no nested objects), so a flat
+  // spread of the overlay over base suffices.
+  if (override.retrieval !== undefined) {
+    const mergedRetrieval: MemoryRetrievalSettings = {
+      ...base.retrieval,
+      ...override.retrieval,
+    };
+    if (
+      JSON.stringify(mergedRetrieval) !==
+      JSON.stringify(base.retrieval)
+    ) {
+      effective.retrieval = mergedRetrieval;
+    }
+  }
 
   return effective;
 }
@@ -657,6 +824,29 @@ export function mergeProjectSettings(
     ai: override.ai
       ? mergeMemoryAISettings(base.ai, override.ai)
       : base.ai,
+    // embedding: shallow-merge the partial overlay onto base
+    // when present; otherwise inherit the base verbatim. Same
+    // `!== undefined` nuance as `computeEffectiveOverride` --
+    // `{model_key: null}` is a legitimate "clear the key"
+    // instruction and must not be swallowed by `??`.
+    embedding: override.embedding
+      ? {
+          enabled:
+            override.embedding.enabled !== undefined
+              ? override.embedding.enabled
+              : base.embedding.enabled,
+          model_key:
+            override.embedding.model_key !== undefined
+              ? override.embedding.model_key
+              : base.embedding.model_key,
+        }
+      : base.embedding,
+    // retrieval: all six fields are primitives, so a flat
+    // spread of the overlay over base produces the correct
+    // merged object.
+    retrieval: override.retrieval
+      ? { ...base.retrieval, ...override.retrieval }
+      : base.retrieval,
     auto_extraction_enabled:
       override.auto_extraction_enabled ?? base.auto_extraction_enabled,
     auto_extraction_min_turns:

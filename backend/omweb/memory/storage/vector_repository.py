@@ -644,13 +644,41 @@ class SqliteVecRepository:
                 # matches but whose dimension differs would have
                 # raised above, so any surviving embedding here is
                 # safe to index at ``dimension``.
+                #
+                # [FIX-VEC0-UPSERT] sqlite-vec's ``vec0`` virtual
+                # tables do NOT implement SQLite's UPSERT clause
+                # (``ON CONFLICT ... DO UPDATE``). Attempting it
+                # raises:
+                #
+                #     OperationalError: UPSERT not implemented
+                #     for virtual table "memory_vectors"
+                #
+                # The cause is architectural: ``vec0`` is a virtual
+                # table backed by an internal index rather than a
+                # rowid-keyed B-tree, so SQLite's generic
+                # conflict-resolution machinery has no way to reach
+                # the underlying storage. The documented alternative
+                # -- and the one every sqlite-vec consumer uses --
+                # is an explicit DELETE followed by INSERT, which
+                # produces an identical end state:
+                #
+                #   * When the row does NOT exist, the DELETE is a
+                #     no-op and the INSERT creates it.
+                #   * When the row DOES exist, the DELETE removes
+                #     the stale vector and the INSERT replaces it.
+                #
+                # Both statements run inside the enclosing
+                # ``with conn:`` block, so the DELETE+INSERT is
+                # atomic -- a crash between the two cannot leave a
+                # vec0 table missing an entry that exists in
+                # ``memory_embeddings``.
                 conn.execute(
-                    """
-                    INSERT INTO memory_vectors (memory_id, embedding)
-                    VALUES (?, ?)
-                    ON CONFLICT(memory_id) DO UPDATE SET
-                        embedding = excluded.embedding
-                    """,
+                    "DELETE FROM memory_vectors WHERE memory_id = ?",
+                    (emb.memory_id,),
+                )
+                conn.execute(
+                    "INSERT INTO memory_vectors (memory_id, embedding) "
+                    "VALUES (?, ?)",
                     (emb.memory_id, packed),
                 )
                 written += 1

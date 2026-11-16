@@ -145,7 +145,17 @@ import type {
   JobRetryResponse,
   JobsListResponse,
   TestModelResponse,
+  EmbeddingStatsResponse,
+  ReindexResponse,
 } from '../types/responses';
+
+// Phase 4 request body types live in `../types/embedding.ts`
+// (domain). Grouped separately so the domain-vs-transport split
+// is visible at the import site -- same pattern as the Phase 3
+// block above. `ReindexRequest` is the ONLY request body type
+// the Phase 4 endpoints accept; `stats` and `embeddingModels`
+// are both read-only.
+import type { ReindexRequest } from '../types/embedding';
 
 // ---------------------------------------------------------------------------
 // Base URL
@@ -1130,6 +1140,96 @@ export const memoryClient = {
         blob,
       };
     },
+  },
+
+  // -------------------------------------------------------------------------
+  // Embedding (Phase 4)
+  // -------------------------------------------------------------------------
+  //
+  // Endpoints under `/api/memory` related to the embedding
+  // subsystem:
+  //
+  //   * `reindex` -- POST; enqueues embedding jobs.
+  //   * `stats`   -- GET;  read-only coverage snapshot.
+  //
+  // The model-catalog endpoint (`GET /api/config/embedding-models`)
+  // is NOT here because it lives under `/api/config`, not
+  // `/api/memory` -- `MEMORY_API_BASE` cannot reach it without
+  // an override. That call is added as a separate concern (see
+  // `configClient` below if one exists in this deployment, or
+  // the note in `SettingsForm`'s Phase 4 section for the
+  // fallback path).
+
+  embedding: {
+    /**
+     * `POST /api/memory/reindex`.
+     *
+     * Enqueues embedding jobs for memories that need one under
+     * the currently-selected `embedding.model_key`. Idempotent
+     * for jobs already pending/running under the same
+     * `(memory_id, model_key, content_version)` tuple -- a
+     * repeated call shifts counts from `enqueued` to
+     * `skipped` but never creates duplicates.
+     *
+     * Error contract (documented in `ReindexErrorResponse`):
+     *
+     *   * 503 `embedding_not_enabled`     -- toggle Section A
+     *                                        on.
+     *   * 503 `model_key_not_set`         -- select a model.
+     *   * 503 `model_key_not_in_snapshot` -- re-select a model
+     *                                        (stale key).
+     *   * 500 `internal_error`            -- server bug; do
+     *                                        NOT auto-retry,
+     *                                        check logs.
+     *
+     * All four cases throw `MemoryApiError`. The UI maps the
+     * `errorType` to a specific toast + (for the 503s) a
+     * "Go to settings" action. See `errors.ts`'s
+     * `KNOWN_UX_HINTS` entries for `EmbeddingNotEnabled`,
+     * `ModelKeyNotSet`, `ModelKeyNotInSnapshot`, and
+     * `InternalErrorReindex`.
+     *
+     * The body is OPTIONAL: sending `{}` (or omitting it)
+     * reindexes every active memory under the current model.
+     * `memory_ids` (max 1000, backend-enforced) restricts the
+     * reindex to a specific set -- useful for retrying after a
+     * transient provider error on a single memory.
+     */
+    reindex: (
+      body: ReindexRequest = {},
+      opts: { signal?: AbortSignal } = {},
+    ) =>
+      memoryFetch<ReindexResponse>('/reindex', {
+        method: 'POST',
+        json: body,
+        signal: opts.signal,
+      }),
+
+    /**
+     * `GET /api/memory/embedding-stats`.
+     *
+     * Coverage snapshot: how many memories have embeddings
+     * under the CURRENT `model_key`, how many are pending,
+     * when the last reindex ran, and the raw sqlite-vec row
+     * count. Powers the "12 of 15 embedded" summary in the
+     * reindex panel and the vector-health section of the
+     * diagnostics page.
+     *
+     * OPTIONAL ENDPOINT (plan §9): some deployments may not
+     * provide it. In that case the backend responds with a
+     * 404 and this method throws `MemoryApiError` with
+     * `errorType: 'not_found'`. Callers MUST treat that as a
+     * graceful degradation -- the reindex panel falls back to
+     * client-side counters (from the last `reindex` response),
+     * and the diagnostics panel hides the vector-health
+     * subsection. Do NOT bubble the error to the user as a
+     * toast; log once and move on.
+     */
+    stats: (opts: { signal?: AbortSignal } = {}) =>
+      memoryFetch<EmbeddingStatsResponse>('/embedding-stats', {
+        method: 'GET',
+        signal: opts.signal,
+      }),
   },
 
   // -------------------------------------------------------------------------

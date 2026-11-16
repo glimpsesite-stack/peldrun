@@ -65,6 +65,11 @@ import type {
   MemorySettings,
   MemorySettingsOverlay,
 } from './settings';
+import type {
+  EmbeddingModel,
+  EmbeddingModelsByProvider,
+  EmbeddingStats,
+} from './embedding';
 
 // ---------------------------------------------------------------------------
 // Base envelope
@@ -87,6 +92,38 @@ import type {
 export interface MemoryOkEnvelope {
   status: 'ok';
   operation: string;
+}
+
+/**
+ * The base shape for the Phase 4 endpoints, which use a
+ * BOOLEAN `ok` field instead of the `{status, operation}`
+ * pair.
+ *
+ * WHY A SECOND ENVELOPE?
+ * ----------------------
+ * The Phase 4 endpoints (`/api/config/embedding-models`,
+ * `/api/memory/reindex`, `/api/memory/embedding-stats`) were
+ * authored in a separate backend module (`config_rtr.py` and
+ * `memory_reindex.py`) whose convention is `{ok: true/false}`.
+ * This differs from the Phase 1-3 memory API, which uses
+ * `{status: 'ok' | 'error', operation: '...'}`. Both
+ * conventions ship today, so the frontend must model both --
+ * a single unified envelope would misrepresent one of them
+ * on the wire and break the discriminated-union narrowing
+ * on `status` for the Phase 1-3 responses.
+ *
+ * Consumers MUST NOT assume `status` or `operation` exist on
+ * a `BooleanOkEnvelope` response, and MUST NOT assume `ok`
+ * exists on a `MemoryOkEnvelope` response. The two families
+ * are disjoint.
+ *
+ * The `error` union on the corresponding failure envelopes
+ * (see `ReindexErrorResponse` below) carries the specific
+ * failure code -- unlike the memory API, where `error` is
+ * always a free-form string.
+ */
+export interface BooleanOkEnvelope {
+  ok: true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,6 +1303,303 @@ export interface BatchCancelResponse extends MemoryOkEnvelope {
   operation: 'batch_cancel';
   batch: MemoryBatch;
   progress: BatchProgress;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 -- Embedding & retrieval responses
+// ---------------------------------------------------------------------------
+//
+// All four Phase 4 endpoints use the `{ok: true}` envelope (see
+// `BooleanOkEnvelope` above), NOT the `{status, operation}`
+// envelope used elsewhere in this module. This is a deliberate
+// consequence of the backend's module split, not a frontend
+// design choice.
+//
+// The REQUEST shapes for reindex (`ReindexRequest`) and the
+// filter parameters for embedding-stats live in
+// `./embedding.ts`, not here -- `responses.ts` is
+// response-only by contract (see the module JSDoc at the top
+// of this file).
+
+/**
+ * Response of ``GET /api/config/embedding-models``.
+ *
+ * Returns the catalog of models the user can select as the
+ * embedding model for `MemorySettings.embedding.model_key`.
+ * The catalog is the union of:
+ *
+ *   * models the user MANUALLY tagged as embeddings in the
+ *     Models settings page (`source: "manual"`),
+ *   * models the provider's live `/v1/models` scan flagged as
+ *     embeddings-capable (`source: "provider_live"`),
+ *   * legacy entries the backend could not classify
+ *     (`source: "unknown"`).
+ *
+ * IMPORTANT nullability caveat
+ * ----------------------------
+ * `provider_id` and `provider_name` on individual models may
+ * be `null` due to a known bug in the backend's
+ * `_read_models_vault` helper (it reads from `STORAGE_ROOT`
+ * while the current deployment stores the vault under
+ * `backend/data/`). The frontend MUST tolerate `null` here
+ * (group such models under an "Unknown provider" heading)
+ * and MUST NOT filter them out -- they may be the only
+ * models available on some deployments.
+ *
+ * The response is NOT paginated -- the model catalog is
+ * bounded by what the provider(s) advertise, typically well
+ * under 100 entries. If the catalog ever grows large enough
+ * to need search, that will be a frontend-side filter, not
+ * a server-side pagination.
+ */
+export interface EmbeddingModelsResponse extends BooleanOkEnvelope {
+  /** Full list of selectable models. May be empty. */
+  models: EmbeddingModel[];
+  /**
+   * Convenience grouping: `provider_id -> [model_id, ...]`.
+   *
+   * Provided by the backend so the UI can render per-provider
+   * sections without walking `models`. The `"unknown"` key
+   * (lowercase literal) synthesizes the entries whose
+   * `provider_id` was `null` -- they are the SAME entries
+   * that appear in `models`, not a separate list.
+   */
+  by_provider: EmbeddingModelsByProvider;
+}
+
+/**
+ * Success response of ``POST /api/memory/reindex``.
+ *
+ * Enqueues embedding jobs for the selected model. The endpoint
+ * is IDEMPOTENT for jobs already pending or running under the
+ * same `(memory_id, model_key, content_version)` tuple -- a
+ * repeated call does not create duplicates, it just shifts
+ * the counts from `enqueued` to `skipped`.
+ *
+ * Field-by-field:
+ *
+ *   * `model_key`        -- the composite key used for this
+ *                           reindex. Echoes
+ *                           `MemorySettings.embedding.model_key`
+ *                           at the moment of the request
+ *                           (useful for detecting a settings
+ *                           race -- if the response's
+ *                           `model_key` differs from what the
+ *                           UI currently shows, a concurrent
+ *                           settings change happened).
+ *
+ *   * `model_id`         -- the parsed model id (the part after
+ *                           `::`). Provided for logging/display;
+ *                           do NOT reconstruct `model_key` from
+ *                           this + `provider` -- use `model_key`
+ *                           verbatim.
+ *
+ *   * `model_version`    -- opaque version tag of the model
+ *                           (bumped when the provider rotates
+ *                           a model). Changes invalidate old
+ *                           embeddings on retrieval -- the
+ *                           backend enforces this internally.
+ *
+ *   * `content_version`  -- echoed `content_version` from the
+ *                           request (defaults to 1). Opaque to
+ *                           the UI; used for pipeline
+ *                           versioning.
+ *
+ *   * `total_candidates` -- count of memories considered
+ *                           (after `memory_ids` filter, if
+ *                           any). `enqueued + skipped` is
+ *                           usually <= `total_candidates`;
+ *                           the difference is entries that
+ *                           the backend deemed not worth
+ *                           re-embedding (e.g. already
+ *                           embedded under the same version
+ *                           with no content change). Do NOT
+ *                           assume `enqueued + skipped ==
+ *                           total_candidates` -- the exact
+ *                           difference semantics are
+ *                           backend-internal.
+ *
+ *   * `enqueued`         -- NEW jobs inserted. These will be
+ *                           processed by `embedding_worker`
+ *                           in the background.
+ *
+ *   * `skipped`          -- jobs that already existed (in
+ *                           any status) under the same tuple.
+ *                           Idempotency working as intended.
+ *
+ * The UI shows `enqueued` and `skipped` in the confirmation
+ * toast: "Reindex queued: 12 enqueued, 3 skipped". A
+ * subsequent `GET /api/memory/embedding-stats` polls
+ * `pending_reindex` to show progress.
+ */
+export interface ReindexResponse extends BooleanOkEnvelope {
+  model_key: string;
+  model_id: string;
+  model_version: string;
+  content_version: number;
+  total_candidates: number;
+  enqueued: number;
+  skipped: number;
+}
+
+/**
+ * The specific failure codes the reindex endpoint returns on
+ * HTTP 503 (service/config not ready).
+ *
+ *   * `embedding_not_enabled`   -- `MemorySettings.embedding.enabled`
+ *                                  is `false`. Fix: toggle it on
+ *                                  in Section A.
+ *
+ *   * `model_key_not_set`       -- `MemorySettings.embedding.enabled`
+ *                                  is `true` but `model_key` is
+ *                                  `null`. Fix: select a model
+ *                                  in Section A.
+ *
+ *   * `model_key_not_in_snapshot` -- a `model_key` is set but
+ *                                    does not match any entry
+ *                                    in the current
+ *                                    `GET /api/config/embedding-models`
+ *                                    response. Usually means the
+ *                                    provider rotated or
+ *                                    removed the model since
+ *                                    the user selected it. Fix:
+ *                                    re-select a model in
+ *                                    Section A, then retry.
+ *
+ * The UI MUST NOT hardcode human-readable messages for these
+ * codes -- the backend supplies a `message` field that is
+ * already user-facing (i18n-ready, but currently English-only
+ * per the backend). Render `message` verbatim.
+ */
+export type ReindexErrorCode =
+  | 'embedding_not_enabled'
+  | 'model_key_not_set'
+  | 'model_key_not_in_snapshot';
+
+/**
+ * HTTP 503 response of ``POST /api/memory/reindex``.
+ *
+ * A 503 here means "config not ready", not "server down" --
+ * the retry-after-fix pattern is: read `error`, fix the
+ * specific config issue in Section A, retry the reindex. The
+ * UI surfaces this as a toast using the backend-provided
+ * `message` (which is already user-facing) plus a link to
+ * Section A.
+ */
+export interface ReindexErrorResponse {
+  ok: false;
+  error: ReindexErrorCode;
+  /** User-facing message from the backend. Render verbatim. */
+  message: string;
+}
+
+/**
+ * HTTP 500 response of ``POST /api/memory/reindex``.
+ *
+ * A 500 is always a bug or an unexpected runtime failure
+ * (e.g. a sqlite-vec write error). The UI shows a generic
+ * "Reindex failed. Check server logs." toast. Do NOT retry
+ * automatically -- 500s are not transient in this endpoint.
+ */
+export interface ReindexInternalErrorResponse {
+  ok: false;
+  error: 'internal_error';
+  /** User-facing message from the backend. Render verbatim. */
+  message: string;
+}
+
+/**
+ * Discriminated union of every shape ``POST /api/memory/reindex``
+ * can return.
+ *
+ * Narrowing pattern::
+ *
+ *     if (response.ok) {
+ *       // ReindexResponse -- response.enqueued, response.skipped
+ *     } else if (response.error === 'internal_error') {
+ *       // ReindexInternalErrorResponse -- 500
+ *     } else {
+ *       // ReindexErrorResponse -- 503; response.error is one of
+ *       // 'embedding_not_enabled' | 'model_key_not_set' |
+ *       // 'model_key_not_in_snapshot'
+ *     }
+ *
+ * NOTE: `memoryClient.reindex()` (see `client.ts`) does NOT
+ * return this union -- it throws `MemoryApiError` on the
+ * failure branches and returns `ReindexResponse` on success,
+ * consistent with every other mutation in the client. This
+ * union type is exported for tests and for advanced callers
+ * who unwrap the raw response manually.
+ */
+export type ReindexResponseUnion =
+  | ReindexResponse
+  | ReindexErrorResponse
+  | ReindexInternalErrorResponse;
+
+/**
+ * Response of ``GET /api/memory/embedding-stats``.
+ *
+ * A read-only coverage snapshot: how many memories have
+ * embeddings under the CURRENT model, how many are pending,
+ * when the last reindex ran, and the raw sqlite-vec row
+ * count. Powers the "12 of 15 embedded" summary in Section D
+ * of the settings page and the vector-health section of the
+ * diagnostics page.
+ *
+ * The response shape is `{ok: true} + EmbeddingStats` --
+ * `EmbeddingStats` itself is defined in `./embedding.ts` so
+ * that non-response contexts (e.g. a future Zustand store
+ * caching the last snapshot) do not depend on the responses
+ * module.
+ *
+ * This endpoint is OPTIONAL in the backend (see the plan's
+ * section 9). If a deployment does not provide it, the UI
+ * gracefully degrades: the Reindex panel falls back to
+ * client-side counters (from the last `ReindexResponse`) and
+ * the diagnostics panel hides the vector-health subsection.
+ * The client MUST NOT treat a 404/501 on this endpoint as a
+ * fatal error -- catch it, fall back, log once, move on.
+ */
+export interface EmbeddingStatsResponse extends BooleanOkEnvelope {
+  model_key: string | null;
+  model_id: string | null;
+  total_memories: number;
+  with_embeddings: number;
+  pending_reindex: number;
+  last_reindex_at: number | null;
+  vec0_dimension: number | null;
+  vec0_row_count: number;
+}
+
+/**
+ * Convenience alias: extract just the stats payload from the
+ * response envelope.
+ *
+ * Used by hooks that only want the raw stats (e.g. a `select`
+ * callback in `useEmbeddingStatsQuery`). Kept in this module
+ * (not `embedding.ts`) because it is derived from a RESPONSE
+ * type, keeping `embedding.ts` free of any transport
+ * dependency.
+ */
+export type EmbeddingStatsPayload = Omit<
+  EmbeddingStatsResponse,
+  'ok'
+>;
+
+/**
+ * Type guard that narrows a `ReindexResponseUnion` to the 200
+ * success branch.
+ *
+ * Mirrors the `isOkEnvelope` helper below, but checks the
+ * BOOLEAN `ok` field (Phase 4 envelope), not the string
+ * `status` field (Phase 1-3 envelope). The two must not be
+ * conflated -- a mixed-up check compiles but always returns
+ * `false` (or `true`) on the wrong envelope shape.
+ */
+export function isReindexSuccess(
+  response: ReindexResponseUnion,
+): response is ReindexResponse {
+  return response.ok === true;
 }
 
 // ---------------------------------------------------------------------------

@@ -127,6 +127,7 @@
       "tokenBudget": "Token budget",
       "autoExtraction": "Auto extraction",
       "autoMemory": "Automatic memory",
+      "semanticSearch": "Semantic search",
       "projectOverrides": "Project overrides"
     },
     "fields": {
@@ -191,6 +192,94 @@
       "contextWindowLabel": "Context",
       "maxOutputLabel": "Max output",
       "embeddingWarning": "Warning: do not select an embedding model here. Extraction requires a chat-completion model (e.g. gpt-4o-mini). Embedding models will fail on the first extraction job."
+    },
+    "embedding": {
+      "enabled": "Enable semantic search",
+      "enabledHelp": "Use AI embeddings to find memories by meaning, not just keyword match.",
+      "disabledHint": "Semantic search is off. Only keyword (lexical) retrieval is used.",
+      "sectionSubtitle": "Vector embeddings and hybrid retrieval (Phase 4).",
+      "modelLabel": "Embedding model",
+      "modelHelp": "Used to embed memory content for semantic search.",
+      "selectModelPlaceholder": "— Select a model —",
+      "searchPlaceholder": "Search models…",
+      "searchLabel": "Search embedding models",
+      "noSearchResults": "No models match your search.",
+      "noModelsAvailable": "No embedding models available. Scan models in Settings → Models first, then mark one as \"Embedding\" via Model Info.",
+      "markModelAsEmbedding": "Go to Models settings",
+      "loadFailed": "Could not load embedding models.",
+      "unknownProvider": "Unknown provider",
+      "manualBadge": "Manual",
+      "autoBadge": "Auto",
+      "currentSelection": "current",
+      "selectedInfo": "{{provider}} — {{model}}",
+      "modelNotSelected": "Semantic search is enabled but no embedding model is selected. Choose a model below.",
+      "modelMissingFromSnapshot": "The selected embedding model is no longer available. Re-select it below.",
+      "unavailableTitle": "Semantic search settings unavailable",
+      "unavailableMessage": "This backend deployment does not include Phase 4 settings (embedding and retrieval). Update the backend to enable semantic search, or hard-refresh the page if the backend was recently upgraded.",
+      "linkTitle": "Manage semantic search settings",
+      "linkDescription": "Embedding model, retrieval strategy, and index maintenance.",
+      "openSettings": "Open settings",
+      "state": {
+        "disabled": "Disabled",
+        "enabledWithModel": "Enabled · {{model}}",
+        "noModel": "No model selected"
+      },
+      "reindex": {
+        "title": "Rebuild embedding index",
+        "summary": "{{withEmbeddings}} of {{total}} memories have embeddings under this model.",
+        "pending": "{{count}} memories pending reindex.",
+        "lastReindex": "Last reindex: {{date}}",
+        "never": "No reindex has run yet.",
+        "button": "Rebuild embedding index",
+        "confirmTitle": "Rebuild embedding index?",
+        "confirmMessage": "This will queue existing memories for re-embedding. New embeddings may take a few minutes to generate. Continue?",
+        "confirmAction": "Confirm",
+        "success": "Reindex queued: {{enqueued}} new, {{skipped}} skipped.",
+        "errorPrefix": "Reindex failed",
+        "disabledNotEnabled": "Enable semantic search first.",
+        "disabledNoModel": "Select an embedding model first.",
+        "statsUnavailable": "Embedding statistics are not available on this deployment."
+      }
+    },
+    "retrieval": {
+      "modeLabel": "Retrieval strategy",
+      "modeHelp": "How the memory subsystem matches queries to stored memories.",
+      "modes": {
+        "lexical": {
+          "label": "Keyword (Fast)",
+          "description": "Classic text search — fast, free, precise on exact keywords. Does not need embeddings."
+        },
+        "vector": {
+          "label": "Semantic (AI)",
+          "description": "Meaning-based search — understands synonyms and cross-language queries. Requires embeddings enabled and a model selected."
+        },
+        "hybrid": {
+          "label": "Hybrid (Best Quality)",
+          "description": "Combines keyword and semantic results — best overall quality. Requires embeddings. Slightly slower and more expensive."
+        },
+        "automatic": {
+          "label": "Smart Auto",
+          "description": "Short queries use keyword search, longer queries use hybrid. Requires embeddings."
+        }
+      },
+      "semanticDisabledWarning": "This mode needs embeddings enabled. Currently falling back to keyword (lexical) until you enable them in the section above.",
+      "advanced": {
+        "title": "Advanced tuning",
+        "vectorAlpha": "Keyword vs semantic balance",
+        "vectorAlphaHelp": "0.0 = keyword only, 1.0 = semantic only. 0.5 uses rank fusion (recommended). Only used in hybrid mode.",
+        "minLexicalScore": "Minimum keyword match",
+        "minLexicalScoreHelp": "0.0 = accept all matches, 1.0 = exact match only.",
+        "minVectorSimilarity": "Minimum semantic similarity",
+        "minVectorSimilarityHelp": "0.0 = accept all, 1.0 = identical only. Higher = stricter.",
+        "rrfK": "Rank fusion smoothing (RRF k)",
+        "rrfKHelp": "1–100. Default 60 balances top results and consensus. Only used when balance = 0.5.",
+        "rerank": "Enable cross-encoder reranking",
+        "rerankHelp": "Cross-encoder reranking re-scores the fused top-N for higher quality.",
+        "rerankComingSoon": "Coming in Phase 5",
+        "saved": "Saved",
+        "saving": "Saving…",
+        "saveFailed": "Save failed"
+      }
     },
     "triggers": {
       "after_turn": "After each turn",

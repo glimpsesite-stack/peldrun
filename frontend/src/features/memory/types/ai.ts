@@ -16,9 +16,13 @@
  *   * `MemoryAISettings`         -- top-level AI configuration.
  *   * `MemoryAIExtractionSettings` -- per-task LLM configuration
  *                                    (provider, model, limits).
- *   * `MemoryEmbeddingSettings`  -- Phase 4 (semantic search).
- *   * `MemoryRetrievalSettings`  -- Phase 4 (hybrid retrieval).
  *   * Job / Batch types          -- Phase 3 (jobs UI).
+ *
+ * NOTE on Phase 4 types: `MemoryEmbeddingSettings` and
+ * `MemoryRetrievalSettings` were previously stubbed in this
+ * file for forward-compatibility. They have been migrated to
+ * `./embedding.ts` -- see the redirect notice further down
+ * in this file (search for "MOVED") for the rationale.
  *   * `DEFAULT_MEMORY_AI_SETTINGS` -- safe defaults.
  *   * `MemoryAIBounds`           -- Zod bounds source.
  *
@@ -260,61 +264,66 @@ export interface MemoryAISettingsOverlay {
 }
 
 // ---------------------------------------------------------------------------
-// Embedding settings (Phase 4)
+// Phase 4 types -- MOVED to ./embedding.ts
 // ---------------------------------------------------------------------------
-
-/**
- * Semantic search configuration (Phase 4).
- *
- * Stubbed here so `MemorySettings.embedding` can be typed now,
- * even though the backend does not yet consume it. When Phase 4
- * lands, `_PATCHABLE_FIELDS` will accept these fields and the
- * retrieval pipeline will honor them.
- */
-export interface MemoryEmbeddingSettings {
-  /** Enable vector-based retrieval. */
-  enabled: boolean;
-  /** Embedding provider id (e.g. 'openai', 'google'). */
-  provider_id: string | null;
-  /** Embedding model id (e.g. 'text-embedding-3-small'). */
-  model_id: string | null;
-  /** Vector dimensions (model-dependent; read-only). */
-  dimensions: number;
-  /** Batch size for embedding generation. */
-  batch_size: number;
-  /** Daily cost ceiling for embedding jobs. */
-  max_cost_nano_usd_per_day: number;
-  /** Model version (bumped when the provider rotates a model). */
-  version: string;
-}
-
-// ---------------------------------------------------------------------------
-// Retrieval settings (Phase 4)
-// ---------------------------------------------------------------------------
-
-/**
- * Retrieval strategy configuration (Phase 4).
- *
- * The four `mode` values:
- *   * `lexical`    -- FTS5 only (Phase 1 behavior; default).
- *   * `vector`     -- vector similarity only.
- *   * `hybrid`     -- both, fused by `vector_alpha`.
- *   * `automatic`  -- heuristic: short query -> lexical,
- *                     long query -> hybrid.
- */
-export interface MemoryRetrievalSettings {
-  mode: 'lexical' | 'vector' | 'hybrid' | 'automatic';
-  /** Weight of lexical score in hybrid fusion. Range 0..1. */
-  vector_alpha: number;
-  /** Minimum normalized lexical score to include. */
-  min_lexical_score: number;
-  /** Minimum cosine similarity for vector hits. */
-  min_vector_similarity: number;
-  /** Enable cross-encoder reranking (Phase 5). */
-  rerank_enabled: boolean;
-  /** RRF k parameter for reciprocal rank fusion. */
-  rrf_k: number;
-}
+//
+// WHAT WAS REMOVED
+// ----------------
+// The stubs `MemoryEmbeddingSettings` and
+// `MemoryRetrievalSettings` that previously lived here have been
+// migrated to `./embedding.ts` and their shapes corrected to
+// match the ACTUAL backend contract.
+//
+// WHY THE STUBS WERE WRONG
+// ------------------------
+// The old `MemoryEmbeddingSettings` (7 fields: enabled,
+// provider_id, model_id, dimensions, batch_size,
+// max_cost_nano_usd_per_day, version) did NOT match the backend
+// model at `peldrun.memory.domain.settings.MemoryEmbeddingSettings`,
+// whose Phase 4 contract is exactly 2 fields:
+//
+//     interface MemoryEmbeddingSettings {
+//       enabled: boolean;
+//       model_key: string | null;   // "provider::model"
+//     }
+//
+// The composite `model_key` already carries provider and model
+// identity, so separate `provider_id` / `model_id` fields would
+// have been redundant AND invalid on the wire (the backend does
+// not accept them). The other fields (dimensions, batch_size,
+// version, cost ceiling) are DERIVED server-side from the
+// selected model in the provider registry -- they are NOT
+// user-configurable via `PATCH /api/memory/settings`.
+//
+// The old `MemoryRetrievalSettings` also diverged from the
+// backend: field set, defaults, and the addition of `mode` as a
+// first-class `RetrievalMode` union. See `./embedding.ts` for
+// the corrected shape.
+//
+// WHY THIS MOVE IS SAFE
+// ---------------------
+// Neither stub was imported by any other module -- verified by
+// `grep -rn "MemoryEmbeddingSettings|MemoryRetrievalSettings" src/`.
+// They existed only as declarations with no consumers, which is
+// precisely why removing them cannot break any call site.
+//
+// IMPORTANT -- what was NOT moved
+// -------------------------------
+// The `MemoryAISettings` tree above (extraction, consolidation,
+// MemoryTaskModel, ExtractionTrigger, MemoryAIBounds,
+// DEFAULT_MEMORY_AI_SETTINGS) is the Phase 3 extraction
+// subsystem. It is INDEPENDENT from the embedding subsystem:
+//
+//   * Extraction uses chat/completion models (e.g. gpt-4o-mini)
+//     with max_output_tokens and timeout_seconds.
+//   * Embedding uses embedding models (e.g. text-embedding-3-small)
+//     with dimensions and model_key.
+//
+// They share `models_vault.json` for provider credentials but are
+// configured, executed, and billed separately. Phase 4 does NOT
+// change the extraction pipeline. Nothing in this file's AI
+// section was modified -- only the two Phase 4 stubs below it
+// were relocated.
 
 // ---------------------------------------------------------------------------
 // Job types (Phase 3)

@@ -306,6 +306,82 @@ async def lifespan(app: FastAPI):
             exc_info=True,
         )
 
+    # 0d. Start the Embedding Worker (Phase 4).
+    #
+    # Runs AFTER `start_extraction_worker()` for two reasons:
+    #
+    #   1. **Schema warm-up.** The extraction pipeline opens the
+    #      ``SqliteMemoryRepository`` first, which triggers the
+    #      lazy ``apply_schema`` on its first connection. By the
+    #      time the embedding pipeline opens its own
+    #      ``SqliteMemoryRepository`` instance, the schema
+    #      (memories + FTS + memory_embeddings + memory_vectors
+    #      tables) is guaranteed to exist. This ordering is not
+    #      strictly required -- both repositories apply the
+    #      schema lazily and idempotently -- but it produces a
+    #      cleaner startup log and eliminates one class of
+    #      first-request cold-start weirdness.
+    #
+    #   2. **Independent failure domains.** If extraction startup
+    #      fails, the embedding worker can still start (and vice
+    #      versa). Each is wrapped in its own try/except so one
+    #      broken subsystem cannot disable the other.
+    #
+    # The embedding worker is CREATED during
+    # ``MemoryService.ainitialize()`` (via ``_initialize_embedding``)
+    # ONLY when:
+    #
+    #   * ``settings.embedding.enabled == True``,
+    #   * ``settings.embedding.model_key`` is a non-empty string,
+    #   * memory mode permits writes,
+    #   * the memory provider is ``sqlite_fts``.
+    #
+    # When those preconditions are not met, ``embedding_enabled``
+    # is ``False`` and this block is a cheap no-op that logs at
+    # DEBUG. The typical deployment (embedding not yet enabled)
+    # pays zero cost here.
+    #
+    # Failure handling: any exception is logged at WARNING and
+    # NEVER blocks startup. The memory subsystem degrades to
+    # "embedding unavailable" without affecting retrieval,
+    # extraction, or any other service -- jobs enqueued by
+    # ``POST /api/memory/reindex`` will simply remain in
+    # ``pending`` status until the operator fixes the
+    # configuration and restarts.
+    try:
+        from omweb.memory import get_memory_service
+
+        _emb_svc = get_memory_service()
+        if _emb_svc is not None and _emb_svc.embedding_enabled:
+            _emb_started = await _emb_svc.start_embedding_worker()
+            if _emb_started:
+                logger.info(
+                    "EmbeddingWorker started; queued embedding "
+                    "jobs (if any) will be processed in the "
+                    "background using the configured embedding "
+                    "model."
+                )
+            else:
+                logger.warning(
+                    "EmbeddingWorker NOT started despite the "
+                    "pipeline being initialized. Check the "
+                    "preceding log lines for the specific "
+                    "failure. Embedding jobs will remain in "
+                    "'pending' status until the worker starts."
+                )
+        else:
+            logger.debug(
+                "Memory embedding pipeline disabled; worker "
+                "startup skipped."
+            )
+    except Exception as exc:
+        logger.warning(
+            "Memory embedding worker startup failed "
+            "(non-fatal; embedding unavailable): %s",
+            exc,
+            exc_info=True,
+        )
+
     # 1. Start Resource Monitor subsystem
     try:
         from omweb.services.resource_monitor_service import (
@@ -541,6 +617,44 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(
             "Failed to close BrowserSessionManager on shutdown: %s", exc
+        )
+
+    # 3a. Stop the Embedding Worker (Phase 4) BEFORE the extraction
+    # worker below.
+    #
+    # Same rationale as block 3b: the worker's transition methods
+    # (``complete`` / ``fail`` / ``retry``) all require its outbox
+    # SQLite connection to remain open. Stopping the worker first
+    # drains any in-flight job cleanly (up to 30s), then the outbox
+    # can be closed by ``shutdown_memory_service()`` below without
+    # race conditions.
+    #
+    # Embedding stops before extraction only for symmetry with the
+    # startup ordering (extraction -> embedding). The two pipelines
+    # are independent -- they use separate SQLite tables
+    # (``memory_jobs`` vs ``memory_embedding_jobs``) and separate
+    # repository instances -- so either shutdown order would be
+    # correct. The symmetry makes the lifespan log easier to reason
+    # about at a glance.
+    #
+    # Both ``stop_embedding_worker`` and this wrapper are
+    # idempotent and never raise -- a shutdown failure here must
+    # not prevent the memory service (and the provider it holds)
+    # from closing. ``MemoryService.aclose()`` will run its own
+    # cleanup pass (``_close_embedding``) afterwards as defense in
+    # depth; the second pass sees the worker already stopped and
+    # is a no-op.
+    try:
+        from omweb.memory import get_memory_service
+
+        _emb_svc = get_memory_service()
+        if _emb_svc is not None:
+            await _emb_svc.stop_embedding_worker(timeout_seconds=30)
+    except Exception as exc:
+        logger.warning(
+            "Memory embedding worker stop failed on shutdown "
+            "(non-fatal): %s",
+            exc,
         )
 
     # 3b. [PHASE 1-C] Stop the Memory Extraction Worker BEFORE the
