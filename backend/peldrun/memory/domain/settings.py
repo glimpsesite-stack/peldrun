@@ -637,6 +637,262 @@ class MemoryAISettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MemoryEmbeddingSettings (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class MemoryEmbeddingSettings(BaseModel):
+    """Embedding subsystem configuration (Phase 4).
+
+    Kept minimal on purpose: only the two fields that any code
+    path actually reads. Everything else a caller might expect
+    (``provider_id``, ``base_url``, ``api_key``,
+    ``model_id``, ``model_version``, ``dimensions``) is
+    **derived** from ``model_key`` via
+    ``EmbeddingModelResolver.resolve()``. Storing any of them
+    here would create a second source of truth that could
+    drift from the resolver snapshot.
+
+    Master switch
+    -------------
+    ``enabled`` controls whether the Phase 4 embedding layer
+    runs at all:
+
+      * ``False`` (default) -- no jobs are enqueued, the
+        embedding worker is not started, and retrieval falls
+        back to lexical-only mode. This is the current
+        behavior for every deployment that has not opted into
+        Phase 4.
+      * ``True`` AND ``model_key`` set -- jobs are enqueued
+        when memories are created/updated, the embedding worker
+        processes them, and retrieval can use vector / hybrid
+        mode.
+
+    Why no ``dimensions`` field
+    ---------------------------
+    The vector dimension is a fact about the model, not a user
+    preference. It is:
+
+      * discovered by
+        ``OpenAICompatEmbeddingProvider.probe_dimensions`` the
+        first time a model is used,
+      * cached in ``models_metadata.json`` (the canonical
+        location for model facts, written by
+        ``config_rtr._parse_adapter_model_list``),
+      * re-read by the embedding worker via
+        ``ResolvedEmbeddingModel.known_dimensions``.
+
+    Persisting it in settings would duplicate state that
+    already has a home and could disagree with the metadata
+    cache after a re-scan. Keeping it out of settings ensures
+    the metadata cache remains the single source of truth.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the Phase 4 embedding subsystem. "
+            "When False, no embedding jobs are enqueued, the "
+            "embedding worker is not started, and retrieval "
+            "stays on lexical mode. When True and "
+            "``model_key`` is set, the embedding pipeline "
+            "activates."
+        ),
+    )
+    model_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Composite key that identifies the embedding model "
+            "to use (e.g. ``'openai::text-embedding-3-small'``). "
+            "Must match a key in the resolver snapshot built by "
+            "``build_embedding_model_snapshot``. The key "
+            "resolves to the provider credentials, model_id, "
+            "model_version, and dimensions -- none of which are "
+            "stored separately in this settings object."
+        ),
+    )
+
+    @field_validator("model_key", mode="after")
+    @classmethod
+    def _validate_model_key(cls, v: Optional[str]) -> Optional[str]:
+        """Allow None ('not configured'); reject empty/whitespace strings."""
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError(
+                f"model_key must be a string or None, got "
+                f"{type(v).__name__}"
+            )
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "model_key must not be empty (use None to leave "
+                "unconfigured)"
+            )
+        return stripped
+
+
+# ---------------------------------------------------------------------------
+# MemoryRetrievalSettings (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class MemoryRetrievalSettings(BaseModel):
+    """Retrieval strategy and tuning (Phase 4).
+
+    DISTINCT from ``MemorySettings.mode``:
+
+      * ``MemorySettings.mode`` is a memory-subsystem state
+        (DISABLED / READ_ONLY / READ_WRITE) -- "is memory on
+        at all, and can it write?"
+
+      * ``MemoryRetrievalSettings.mode`` is a search strategy
+        choice -- "how should enabled memory be searched?"
+        The four values (lexical / vector / hybrid /
+        automatic) are orthogonal to the memory state: any
+        can be combined with any ``MemorySettings.mode``.
+
+    Modes
+    -----
+    ``lexical`` (default)
+        FTS5/BM25 only. Fast, deterministic, no API calls. The
+        current pre-Phase-4 behavior.
+
+    ``vector``
+        Embedding cosine similarity only. Requires a working
+        embedding configuration (``embedding.enabled=True``
+        plus a valid ``model_key``) and a populated
+        ``memory_vectors`` index. Falls back to lexical when
+        either precondition fails.
+
+    ``hybrid``
+        Runs both lexical and vector, then fuses the results
+        via ``reciprocal_rank_fusion`` (when ``rrf_k`` is
+        set) or ``weighted_fusion`` (when ``vector_alpha``
+        drives the mix). The recommended mode when both
+        preconditions hold.
+
+    ``automatic``
+        Short queries (fewer than 3 words) use lexical;
+        longer queries use hybrid. A pragmatic default for
+        deployments where vector calls are expensive and the
+        query distribution is mixed. The threshold is
+        implemented in ``MemoryRetrievalRouter``, not here.
+
+    Tuning fields
+    -------------
+    ``vector_alpha``
+        Weight of the vector side in fusion. ``0.0`` = pure
+        lexical, ``1.0`` = pure vector, ``0.5`` = balanced.
+        Translated to ``weighted_fusion(alpha=1 - vector_alpha)``
+        by the router (note: ``weighted_fusion``'s ``alpha``
+        is the weight of the LEXICAL side, so the translation
+        keeps the naming intuitive for operators).
+
+    ``min_lexical_score`` / ``min_vector_similarity``
+        Per-source thresholds applied before fusion. Values
+        below these are dropped from their respective lists
+        before the merge. Both default to values that discard
+        obvious noise without over-filtering.
+
+    ``rrf_k``
+        RRF smoothing constant. Default 60 (Cormack 2009).
+        Only consulted when ``mode="hybrid"`` AND
+        ``vector_alpha`` is at its default of 0.5 (the router
+        interprets non-default ``vector_alpha`` as "user wants
+        weighted fusion").
+
+    ``rerank_enabled``
+        Phase 5 stub. When True, the router will call
+        ``CrossEncoderReranker.rerank`` on the fused top-K.
+        In Phase 4 this field is present but unused; a future
+        Phase 5 deployment flips it on without any settings
+        migration.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    mode: Literal["lexical", "vector", "hybrid", "automatic"] = Field(
+        default="lexical",
+        description=(
+            "Retrieval strategy. See the class docstring for "
+            "the semantics of each value. Defaults to lexical "
+            "so existing deployments keep their current "
+            "behavior when Phase 4 is rolled out."
+        ),
+    )
+    vector_alpha: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight of the vector side in hybrid fusion. "
+            "0.0 = pure lexical, 1.0 = pure vector, 0.5 = "
+            "balanced. Only consulted when mode is 'hybrid' "
+            "or 'automatic'. The router translates this to "
+            "``weighted_fusion(alpha=1 - vector_alpha)`` so "
+            "the operator-facing name matches the intuitive "
+            "meaning."
+        ),
+    )
+    min_lexical_score: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum normalized BM25 score for a lexical hit "
+            "to survive into fusion. Applied by "
+            "``MemoryRanker`` before the fusion step. Lower "
+            "values increase recall; higher values reduce "
+            "noise. 0.2 is a conservative floor that keeps "
+            "weak-but-valid matches."
+        ),
+    )
+    min_vector_similarity: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum cosine similarity for a vector hit to "
+            "survive into fusion. Applied by "
+            "``SqliteVecProvider.search``. Cosine similarity "
+            "of 0.5 is roughly the boundary between 'somewhat "
+            "related' and 'unrelated' for most embedding "
+            "models; raise this for stricter semantic "
+            "matching."
+        ),
+    )
+    rrf_k: int = Field(
+        default=60,
+        ge=1,
+        le=100,
+        description=(
+            "RRF smoothing constant (Cormack 2009). Larger "
+            "values flatten the rank-reward curve (rank "
+            "differences matter less). 60 is optimal across a "
+            "wide range of datasets in the original paper. "
+            "Only consulted when ``mode='hybrid'`` AND "
+            "``vector_alpha`` is at the default 0.5 (otherwise "
+            "the router uses weighted fusion)."
+        ),
+    )
+    rerank_enabled: bool = Field(
+        default=False,
+        description=(
+            "Phase 5 stub. When True, the router calls "
+            "``CrossEncoderReranker.rerank`` on the fused "
+            "top-K before returning results. Present in "
+            "Phase 4 so a future Phase 5 deployment does not "
+            "need a settings migration -- the router checks "
+            "this flag and skips the (not-yet-existing) "
+            "reranker in Phase 4."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # MemorySettings
 # ---------------------------------------------------------------------------
 
@@ -775,6 +1031,36 @@ class MemorySettings(BaseModel):
             "or the mode forbids writes, the pipeline is "
             "entirely absent. See ``MemoryAISettings`` for the "
             "full gating contract."
+        ),
+    )
+
+    # ------------------------- phase 4: embedding --------------------------
+
+    embedding: MemoryEmbeddingSettings = Field(
+        default_factory=MemoryEmbeddingSettings,
+        description=(
+            "Embedding subsystem configuration (Phase 4). See "
+            "``MemoryEmbeddingSettings`` for the gating contract: "
+            "``enabled=True`` and ``model_key`` set are both "
+            "required for the embedding pipeline to activate. "
+            "When either condition fails, no embedding jobs are "
+            "enqueued and retrieval falls back to lexical mode."
+        ),
+    )
+
+    # ------------------------- phase 4: retrieval --------------------------
+
+    retrieval: MemoryRetrievalSettings = Field(
+        default_factory=MemoryRetrievalSettings,
+        description=(
+            "Retrieval strategy configuration (Phase 4). See "
+            "``MemoryRetrievalSettings`` for the semantics of "
+            "each mode. DISTINCT from ``MemorySettings.mode``: "
+            "the latter controls whether memory is enabled at "
+            "all (DISABLED / READ_ONLY / READ_WRITE); this field "
+            "controls HOW enabled memory is searched. Both are "
+            "orthogonal -- any ``retrieval.mode`` can combine "
+            "with any ``MemorySettings.mode``."
         ),
     )
 
@@ -996,6 +1282,8 @@ def default_settings() -> MemorySettings:
 __all__ = [
     "MemoryAIExtractionSettings",
     "MemoryAISettings",
+    "MemoryEmbeddingSettings",
+    "MemoryRetrievalSettings",
     "MemorySettings",
     "MemoryTokenBudget",
     "default_settings",

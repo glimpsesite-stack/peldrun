@@ -50,6 +50,7 @@ from omweb.memory.api.memory_extraction import (
 from omweb.memory.api.memory_import import router as _import_router
 from omweb.memory.api.memory_jobs import router as _jobs_router
 from omweb.memory.api.memory_projects import router as _projects_router
+from omweb.memory.api.memory_reindex import router as _reindex_router
 from omweb.memory.api.memory_settings import router as _settings_router
 from omweb.memory.api.memory_usage import router as _usage_router
 
@@ -181,6 +182,30 @@ router.include_router(
     _batch_router,
     prefix="/automation",
     tags=["memory", "automation", "batch"],
+)
+
+# 7. Reindex -- Phase 4: enqueue embedding jobs for existing
+#    memories.
+#
+# No prefix: the endpoint registers at ``/reindex``, giving the
+# full path ``/api/memory/reindex`` as specified in the plan
+# (§5.7 task 4.10). ``/reindex`` is a FIXED segment, so this
+# router MUST be registered before CRUD's catch-all in main.py
+# -- which it is, because this aggregator is included first.
+#
+# No collision with CRUD:
+#   * CRUD's catch-all is ``GET /{memory_id}`` -- it matches
+#     GET only, not POST.
+#   * CRUD's POST routes are ``POST /`` (create) and
+#     ``POST /search`` (search). Neither is a catch-all, so
+#     ``POST /reindex`` cannot be shadowed by either.
+#   * Even if CRUD later added ``POST /{memory_id}`` (e.g. an
+#     update-via-POST endpoint), the registration-order
+#     guarantee (this aggregator first) would still route
+#     ``POST /reindex`` to the reindex handler.
+router.include_router(
+    _reindex_router,
+    tags=["memory", "reindex"],
 )
 
 # CRUD is mounted separately in main.py -- see the import-block
