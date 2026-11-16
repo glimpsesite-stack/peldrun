@@ -80,8 +80,8 @@ export function MemorySummaryCard({
             {label}
           </span>
           <div
-            className="text-xl lg:text-2xl font-bold font-mono tabular-nums truncate"
-            style={{ color: accent }}
+            className="text-xl lg:text-2xl font-bold font-mono tabular-nums truncate text-black"
+
           >
             {value}
           </div>

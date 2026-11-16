@@ -107,7 +107,7 @@ export default function MemoryLayout({
 
   // ---- Post-mount: full layout ----------------------------------
   return (
-    <div className="relative h-full w-full overflow-y-auto bg-background text-foreground font-sans flex flex-col">
+    <div className="relative h-full w-full overflow-y-auto bg-custom text-foreground font-sans flex flex-col">
       {/* ============ Ambient background ============ */}
       <div
         className="pointer-events-none absolute inset-0 overflow-hidden"
@@ -119,14 +119,14 @@ export default function MemoryLayout({
       </div>
 
       {/* ============ Sticky header ============ */}
-      <header className="border-b border-border bg-card/60 backdrop-blur-xl px-6 py-4 sticky top-0 z-20">
-        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4 flex-wrap">
+      <header className="border-b border-darkest bg-darkest backdrop-blur-xl px-6 py-4 ">
+        <div className="max-w-full mx-auto flex items-center justify-between gap-4 flex-wrap">
           <div className="flex items-center gap-2.5">
             <div className="p-2 icon">
-              <Brain size={16} className="text-primary" aria-hidden="true" />
+              <Brain size={16} className="text-slate-100" aria-hidden="true" />
             </div>
             <div>
-              <h1 className="text-sm font-semibold font-heading tracking-wide">
+              <h1 className="text-sm text-[#fff] font-semibold font-heading tracking-wide">
                 {t('nav.title')}
               </h1>
               <p className="text-[10px] text-muted-foreground">
@@ -149,7 +149,7 @@ export default function MemoryLayout({
 
       {/* ============ Sub-navigation ============ */}
       <nav
-        className="border-b border-border bg-background/40"
+        className="border-b border-dark bg-dark sticky top-0 z-20 backdrop-blur-sm"
         aria-label={t('a11y.mainNavigation')}
       >
         <div className="max-w-7xl mx-auto">
@@ -165,8 +165,8 @@ export default function MemoryLayout({
                     className={cn(
                       'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors',
                       active
-                        ? 'bg-primary/10 text-primary'
-                        : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                        ? 'bg-primary/10 text-amber-400'
+                        : 'text-[#fff] hover:bg-darkest hover:text-amber-300',
                       'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background',
                     )}
                   >
