@@ -39,8 +39,16 @@ from fastapi import APIRouter
 #     app.include_router(memory_crud.router,   prefix="/api/memory")
 #
 # See main.py for the same rule applied to skills' catalog router.
+from omweb.memory.api.memory_automation import (
+    router as _automation_router,
+)
+from omweb.memory.api.memory_batch import router as _batch_router
 from omweb.memory.api.memory_export import router as _export_router
+from omweb.memory.api.memory_extraction import (
+    router as _extraction_router,
+)
 from omweb.memory.api.memory_import import router as _import_router
+from omweb.memory.api.memory_jobs import router as _jobs_router
 from omweb.memory.api.memory_projects import router as _projects_router
 from omweb.memory.api.memory_settings import router as _settings_router
 from omweb.memory.api.memory_usage import router as _usage_router
@@ -108,6 +116,71 @@ router.include_router(
     _usage_router,
     prefix="/usage",
     tags=["memory", "usage"],
+)
+
+# 6. Automation -- Phase 3 AI extraction control surface.
+#
+# All four sub-routers are mounted under the SAME /automation
+# prefix. The resulting URL namespace is:
+#
+#     /automation/settings             (automation: GET, PATCH)
+#     /automation/test-model           (automation: POST)
+#     /automation/jobs                 (jobs: GET)
+#     /automation/jobs/{id}            (jobs: GET)
+#     /automation/jobs/{id}/retry      (jobs: POST)
+#     /automation/jobs/{id}/cancel     (jobs: POST)
+#     /automation/extract/from-session (extraction: POST)
+#     /automation/extract/range        (extraction: POST)
+#     /automation/batch                (batch: GET, POST)
+#     /automation/batch/estimate       (batch: GET)
+#     /automation/batch/{id}           (batch: GET)
+#     /automation/batch/{id}/pause     (batch: POST)
+#     /automation/batch/{id}/resume    (batch: POST)
+#     /automation/batch/{id}/cancel    (batch: POST)
+#
+# Route-ordering note: each sub-router handles its OWN ordering
+# (see each module's "Route-ordering contract" docstring --
+# especially ``memory_batch.py``, where ``/batch/estimate`` MUST
+# precede ``/batch/{batch_id}``). Across sub-routers, no path
+# overlap exists: ``/settings``, ``/jobs``, ``/extract``, and
+# ``/batch`` are disjoint fixed prefixes, so their mutual
+# registration order is irrelevant for correctness. We register
+# them as one contiguous block for readability.
+#
+# Collision-safety with ``memory_crud``: every route in this
+# block has at least TWO path segments after ``/api/memory``
+# (``automation`` + at least one more). The CRUD router's
+# ``/{memory_id}`` catch-all matches a SINGLE segment, so it
+# cannot match ``/automation/settings`` (2 segments) or
+# ``/automation/jobs/{id}`` (3 segments). No shadowing is
+# possible, regardless of mount order in ``main.py``.
+
+# 6a. Automation -- /automation/settings + /automation/test-model.
+router.include_router(
+    _automation_router,
+    prefix="/automation",
+    tags=["memory", "automation"],
+)
+
+# 6b. Jobs -- /automation/jobs + per-job actions.
+router.include_router(
+    _jobs_router,
+    prefix="/automation",
+    tags=["memory", "automation", "jobs"],
+)
+
+# 6c. Extraction -- /automation/extract/from-session, /range.
+router.include_router(
+    _extraction_router,
+    prefix="/automation",
+    tags=["memory", "automation", "extraction"],
+)
+
+# 6d. Batch -- /automation/batch + per-batch actions.
+router.include_router(
+    _batch_router,
+    prefix="/automation",
+    tags=["memory", "automation", "batch"],
 )
 
 # CRUD is mounted separately in main.py -- see the import-block

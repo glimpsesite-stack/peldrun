@@ -9,6 +9,9 @@ import { UsageBadgeGroup } from "@/components/chat/UsageBadges";
 import type { ChatUsageSummary } from "@/lib/types";
 import { ModeBadge } from "@/features/memory/components/ModeBadge";
 
+import { ExtractFromChatButton } from '@/features/memory/components/ExtractFromChatButton';
+
+
 
  // app/layout.tsx أو TopBar.tsx
 
@@ -95,6 +98,10 @@ export function ChatSubHeader({
   activeProvider,
   activeModel,
   totalCostUsd,
+  // Phase 3: forwarded to `<ExtractFromChatButton>` below. Optional
+  // (nullable) because a fresh session has no active chat yet; the
+  // button is not rendered in that case.
+  activeChatId,
 }: ChatSubHeaderProps) {
   // Safe aggregation: fallback gracefully to tokensUsed if usageSummary is absent
   const effectiveSummary: ChatUsageSummary | null =
@@ -281,6 +288,22 @@ export function ChatSubHeader({
               return null;
           }
         })()}
+
+
+        {/* Extract-from-chat button -- only when there is an
+            ACTIVE chat. In a fresh session there is nothing to
+            extract yet, and the backend would return
+            `job: null` (no turns). Skipping the render also
+            avoids a flash of a disabled button during the brief
+            window between the new-session click and the first
+            turn's persistence. */}
+        {activeChatId && (
+          <ExtractFromChatButton
+            chatId={activeChatId}
+            onQueued={(job) => console.log('queued:', job.job_id)}
+            onNoop={(msg) => console.log('noop:', msg)}
+          />
+        )}
 
         {/* Stop button — visible during `running` OR `paused`, hidden
             during `cancelling` to prevent double-click. The rose

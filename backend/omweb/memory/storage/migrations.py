@@ -95,7 +95,7 @@ logger = logging.getLogger("omweb.memory.storage.migrations")
 # ---------------------------------------------------------------------------
 
 
-CURRENT_VERSION: int = 2
+CURRENT_VERSION: int = 3
 """Highest schema version this module knows how to produce.
 
 Bump only when adding a new migration. Every bump must be paired
@@ -469,6 +469,148 @@ def _apply_v2(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# DDL -- v3 (memory_batches + jobs.batch_id + extraction_job_id safety net)
+# ---------------------------------------------------------------------------
+#
+# v3 introduces the retroactive batch extraction subsystem (Phase 3):
+#
+#   * ``memory_batches`` -- one row per batch run. Tracks the scope
+#     filters, the frozen model configuration, progress counters,
+#     cost estimate vs actual, and lifecycle timestamps.
+#
+#   * ``memory_jobs.batch_id`` -- nullable FK-like link from a job
+#     to the batch that spawned it. NULL for on-the-fly jobs
+#     (``after_turn`` / ``after_session``); non-NULL only for
+#     retroactive jobs created by a batch.
+#
+#   * A **defensive re-check** for ``extraction_job_id`` on
+#     ``memories``. The report from the Phase 1 audit noted that
+#     some deployments reached ``memory_schema_version=2`` BEFORE
+#     the generated column was added to ``_apply_v2``. Those
+#     databases will never see ``_apply_v2`` run again (version
+#     gate), so the column stays missing. v3 self-heals them:
+#     if the column is absent, add it. If it is already present
+#     (the normal path), the guard is a no-op.
+#
+# Every DDL below uses ``CREATE ... IF NOT EXISTS``; every ALTER is
+# guarded by ``_column_exists``. Re-running v3 on a partially
+# applied database is safe (crash-safety guarantee preserved).
+
+_V3_MEMORY_BATCHES_DDL: str = """
+CREATE TABLE IF NOT EXISTS memory_batches (
+    batch_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    triggered_by TEXT NOT NULL DEFAULT 'manual',
+
+    project_id TEXT,
+    chat_ids_json TEXT NOT NULL DEFAULT '[]',
+    date_from REAL,
+    date_to REAL,
+
+    session_count INTEGER NOT NULL DEFAULT 0,
+    job_count INTEGER NOT NULL DEFAULT 0,
+    completed_jobs INTEGER NOT NULL DEFAULT 0,
+    failed_jobs INTEGER NOT NULL DEFAULT 0,
+    cancelled_jobs INTEGER NOT NULL DEFAULT 0,
+    total_candidates INTEGER NOT NULL DEFAULT 0,
+    total_memories_created INTEGER NOT NULL DEFAULT 0,
+
+    estimated_cost_nano_usd INTEGER NOT NULL DEFAULT 0,
+    actual_cost_nano_usd INTEGER NOT NULL DEFAULT 0,
+
+    model_provider_id TEXT,
+    model_id TEXT,
+    min_confidence REAL,
+
+    created_at REAL NOT NULL,
+    started_at REAL,
+    paused_at REAL,
+    completed_at REAL,
+    cancelled_at REAL,
+    last_progress_at REAL,
+
+    error_message TEXT,
+    options_json TEXT NOT NULL DEFAULT '{}'
+);
+"""
+
+_V3_MEMORY_BATCHES_INDEXES_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_memory_batches_status
+    ON memory_batches(status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_batches_created
+    ON memory_batches(created_at DESC);
+"""
+
+_V3_MEMORY_JOBS_BATCH_INDEX_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_memory_jobs_batch
+    ON memory_jobs(batch_id, status)
+    WHERE batch_id IS NOT NULL;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Migration v3 -- full function body
+# ---------------------------------------------------------------------------
+
+
+def _apply_v3(conn: sqlite3.Connection) -> None:
+    """Apply the Phase 3 schema: batch table + job batch link.
+
+    Layout
+    ------
+      1. Defensive re-check of ``memories.extraction_meta_json``
+         and ``memories.extraction_job_id``. The normal path
+         (v2 already applied) finds both present, so both
+         ``ALTER`` statements are no-ops. On a drifted database
+         that reached v2 before the columns were added, the
+         guards fire and complete the missing columns.
+      2. ``memory_batches`` table + 2 indexes.
+      3. ``memory_jobs.batch_id`` column (guarded ADD).
+      4. Partial index on ``memory_jobs(batch_id, status)`` for
+         fast batch progress queries.
+
+    Idempotency
+    -----------
+    All CREATE statements use ``IF NOT EXISTS``. Both ALTERs are
+    guarded by ``_column_exists``. A crash between any step and
+    ``_record_version(conn, 3)`` re-runs the whole function
+    safely.
+    """
+    # 1. Defensive re-check: extraction columns on `memories`.
+    #    On the normal path both checks return True and neither
+    #    ALTER fires. On a drifted database the missing column
+    #    (or columns) are added here.
+    if not _column_exists(conn, "memories", "extraction_meta_json"):
+        conn.execute(
+            "ALTER TABLE memories "
+            "ADD COLUMN extraction_meta_json TEXT DEFAULT NULL"
+        )
+    if not _column_exists(conn, "memories", "extraction_job_id"):
+        conn.execute(
+            "ALTER TABLE memories "
+            "ADD COLUMN extraction_job_id TEXT "
+            "GENERATED ALWAYS AS "
+            "(json_extract(extraction_meta_json, '$.job_id')) VIRTUAL"
+        )
+
+    # 2. Batch table + indexes.
+    conn.executescript(_V3_MEMORY_BATCHES_DDL)
+    conn.executescript(_V3_MEMORY_BATCHES_INDEXES_DDL)
+
+    # 3. batch_id on memory_jobs (nullable; NULL for on-the-fly
+    #    jobs, non-NULL only for batch-spawned retroactive jobs).
+    if not _column_exists(conn, "memory_jobs", "batch_id"):
+        conn.execute(
+            "ALTER TABLE memory_jobs "
+            "ADD COLUMN batch_id TEXT DEFAULT NULL"
+        )
+
+    # 4. Partial index for batch progress queries.
+    conn.executescript(_V3_MEMORY_JOBS_BATCH_INDEX_DDL)
+
+
+# ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
 #
@@ -484,6 +626,7 @@ def _apply_v2(conn: sqlite3.Connection) -> None:
 _MIGRATIONS: List[Tuple[int, Any]] = [
     (1, _apply_v1),
     (2, _apply_v2),
+    (3, _apply_v3),
 ]
 
 

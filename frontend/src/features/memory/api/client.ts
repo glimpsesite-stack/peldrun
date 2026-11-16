@@ -110,6 +110,44 @@ import type {
 } from '../types/import-export';
 
 // ---------------------------------------------------------------------------
+// Phase 3 (Automation) imports
+// ---------------------------------------------------------------------------
+//
+// Grouped in a separate block from the Phase-1 imports above so a
+// reviewer can see at a glance which additions belong to the
+// automation subsystem. The response envelopes referenced here
+// are defined in `../types/responses.ts` under the "Phase 3"
+// sections; the param type unions come from `../types/jobs.ts`
+// and `../types/batch.ts`. `MemoryAISettingsOverlay` is the
+// deep-partial patch shape used by `PATCH /automation/settings`
+// (same family as `MemorySettingsPatch`).
+
+import type { MemoryAISettingsOverlay } from '../types/ai';
+import type { MemoryBatchStatus } from '../types/batch';
+import type {
+  ExtractionTrigger,
+  MemoryJobStatus,
+} from '../types/jobs';
+import type {
+  AISettingsGetResponse,
+  AISettingsUpdateResponse,
+  BatchCancelResponse,
+  BatchCreateResponse,
+  BatchEstimateResponse,
+  BatchGetResponse,
+  BatchListResponse,
+  BatchPauseResponse,
+  BatchResumeResponse,
+  ExtractFromSessionResponse,
+  ExtractRangeResponse,
+  JobCancelResponse,
+  JobGetResponse,
+  JobRetryResponse,
+  JobsListResponse,
+  TestModelResponse,
+} from '../types/responses';
+
+// ---------------------------------------------------------------------------
 // Base URL
 // ---------------------------------------------------------------------------
 
@@ -1091,6 +1129,411 @@ export const memoryClient = {
         totalMatched: totalMatched || entriesCount,
         blob,
       };
+    },
+  },
+
+  // -------------------------------------------------------------------------
+  // Automation (Phase 3)
+  // -------------------------------------------------------------------------
+  //
+  // Every endpoint under `/api/memory/automation/*`. Four
+  // sub-namespaces, mirroring the four backend sub-routers:
+  //
+  //   * `settings` -- AI extraction configuration + model probe.
+  //   * `jobs`     -- extraction job inspection + per-job actions.
+  //   * `extract`  -- MANUAL one-shot extraction triggers.
+  //   * `batch`    -- retroactive batch orchestration.
+  //
+  // Transport contract for `testModel` (documented on the method)
+  // is the ONLY place in the client where a 200 response carries
+  // `status: 'error'` -- see the `TestModelResponse` JSDoc for why.
+
+  automation: {
+    // -----------------------------------------------------------------------
+    // Automation settings
+    // -----------------------------------------------------------------------
+    settings: {
+      /**
+       * `GET /api/memory/automation/settings`.
+       *
+       * Returns ONLY the `MemoryAISettings` subtree. The full
+       * `MemorySettings` document (mode, provider, budget, ...)
+       * remains at `settings.get()`. Callers that need a mode
+       * gate should combine both.
+       */
+      get: (opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<AISettingsGetResponse>('/automation/settings', {
+          method: 'GET',
+          signal: opts.signal,
+        }),
+
+      /**
+       * `PATCH /api/memory/automation/settings`.
+       *
+       * Partial update of the AI settings subtree. The backend
+       * deep-merges nested `extraction` / `consolidation`
+       * objects, so a caller who sends only
+       * `{extraction: {provider_id: 'x'}}` keeps every other
+       * extraction field. Explicit `null` on
+       * `batch_auto_schedule_hours` is the ONLY way to clear
+       * it; `undefined` (the field omitted) means "leave
+       * unchanged".
+       *
+       * An EMPTY patch (or a patch whose effective fields equal
+       * the current values) is rejected by the backend with a
+       * 400 `empty_update`. Callers should pre-check with a
+       * shallow comparison before hitting this method --
+       * typically by diffing against the cached GET response.
+       */
+      patch: (
+        patch: MemoryAISettingsOverlay,
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<AISettingsUpdateResponse>('/automation/settings', {
+          method: 'PATCH',
+          json: patch,
+          signal: opts.signal,
+        }),
+
+      /**
+       * `POST /api/memory/automation/test-model`.
+       *
+       * Runs a single cheap extraction-shaped call against the
+       * given provider+model and returns the parsed response,
+       * latency, token counts, and cost.
+       *
+       * **Status-code contract**: this endpoint returns HTTP
+       * 200 for BOTH success and model-level failure. The
+       * distinction is carried by the `status` field of the
+       * response body:
+       *
+       *   * `status: 'ok'`     -> `TestModelSuccessResponse`
+       *   * `status: 'error'`  -> `TestModelErrorResponse`
+       *
+       * `memoryFetch` treats 200 as success and returns the
+       * union unchanged -- the caller MUST narrow on `status`
+       * before reading `parsed` / `message`. A non-200 status
+       * (e.g. 503 when extraction is disabled) still throws
+       * a `MemoryApiError` as usual.
+       *
+       * The probe does NOT create a job and does NOT touch any
+       * session cursor; only the cost (in `cost_nano_usd`) is
+       * recorded in `token_ledger` for accounting.
+       */
+      testModel: (
+        body: {
+          provider_id: string;
+          model_id: string;
+          timeout_seconds?: number;
+        },
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<TestModelResponse>('/automation/test-model', {
+          method: 'POST',
+          json: body,
+          signal: opts.signal,
+        }),
+    },
+
+    // -----------------------------------------------------------------------
+    // Extraction jobs
+    // -----------------------------------------------------------------------
+    jobs: {
+      /**
+       * `GET /api/memory/automation/jobs`.
+       *
+       * Paginated list of extraction jobs, newest first.
+       * Filters are AND-combined; each may be omitted for "no
+       * filter on this field".
+       *
+       * The response's `has_more` is `offset + jobs.length <
+       * total` -- a UI showing "Load more" should trust it
+       * rather than recompute from `total` alone (a concurrent
+       * create can briefly misalign the two).
+       */
+      list: (
+        params: {
+          status?: MemoryJobStatus;
+          chat_id?: string | null;
+          trigger_type?: ExtractionTrigger;
+          limit?: number;
+          offset?: number;
+        } = {},
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<JobsListResponse>(
+          `/automation/jobs${buildQueryString({
+            status: params.status,
+            chat_id: params.chat_id ?? undefined,
+            trigger_type: params.trigger_type,
+            limit: params.limit,
+            offset: params.offset,
+          })}`,
+          { method: 'GET', signal: opts.signal },
+        ),
+
+      /**
+       * `GET /api/memory/automation/jobs/{job_id}`.
+       *
+       * Single job by id. A 404 for unknown ids is delivered
+       * as a `MemoryApiError` with `errorType: 'not_found'`
+       * (see `errors.ts`); the caller should treat that as
+       * "the job was never created or has been purged".
+       */
+      get: (jobId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<JobGetResponse>(
+          `/automation/jobs/${encodeURIComponent(jobId)}`,
+          { method: 'GET', signal: opts.signal },
+        ),
+
+      /**
+       * `POST /api/memory/automation/jobs/{job_id}/retry`.
+       *
+       * Re-queues a `failed` or `cancelled` job. Returns the
+       * post-transition job (`status: 'pending'`,
+       * `attempts: 0`, error fields cleared). Illegal state
+       * transitions produce a 409 (`errorType: 'invalid_state'`);
+       * unknown ids produce 404.
+       *
+       * The backend preserves `message_snapshot_hash` so a
+       * session that changed since the original enqueue will
+       * fail the retried job with `SESSION_CHANGED` -- the
+       * operator must explicitly accept the new state (by
+       * creating a fresh job) rather than silently
+       * re-extracting from different content.
+       */
+      retry: (jobId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<JobRetryResponse>(
+          `/automation/jobs/${encodeURIComponent(jobId)}/retry`,
+          { method: 'POST', signal: opts.signal },
+        ),
+
+      /**
+       * `POST /api/memory/automation/jobs/{job_id}/cancel`.
+       *
+       * Cancels a `pending` / `retry_pending` / `running` job.
+       * Terminal states (`completed` / `failed` / `cancelled`)
+       * produce a 409 -- the API never silently overwrites a
+       * terminal state with a cancellation.
+       */
+      cancel: (jobId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<JobCancelResponse>(
+          `/automation/jobs/${encodeURIComponent(jobId)}/cancel`,
+          { method: 'POST', signal: opts.signal },
+        ),
+    },
+
+    // -----------------------------------------------------------------------
+    // Manual extraction
+    // -----------------------------------------------------------------------
+    extract: {
+      /**
+       * `POST /api/memory/automation/extract/from-session`.
+       *
+       * Enqueues a MANUAL-trigger job covering the WHOLE
+       * session. Powers the "Extract from this chat" button.
+       *
+       * The response is a discriminated union on
+       * `job === null`:
+       *
+       *   * `job: MemoryJob` -> a job was enqueued (200).
+       *   * `job: null`     -> nothing to extract (200 with a
+       *                         `message` explaining why:
+       *                         zero turns, missing session
+       *                         file, or a duplicate idempotency
+       *                         key).
+       *
+       * Both branches are HTTP 200 -- "nothing to do" is a
+       * legitimate success, not an error.
+       */
+      fromSession: (
+        body: {
+          chat_id: string;
+          project_id?: string | null;
+        },
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<ExtractFromSessionResponse>(
+          '/automation/extract/from-session',
+          { method: 'POST', json: body, signal: opts.signal },
+        ),
+
+      /**
+       * `POST /api/memory/automation/extract/range`.
+       *
+       * Enqueues a MANUAL-trigger job for a SPECIFIC turn range.
+       * Useful after editing an earlier turn. `start_turn_index
+       * <= end_turn_index` is enforced by the request body
+       * (Pydantic), so an inverted range is rejected at the
+       * HTTP layer (400) rather than reaching the trigger
+       * router.
+       *
+       * Same `job: null` semantics as `fromSession` -- a
+       * clamped-empty range produces a 200 with `job: null`.
+       */
+      range: (
+        body: {
+          chat_id: string;
+          project_id?: string | null;
+          start_turn_index: number;
+          end_turn_index: number;
+        },
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<ExtractRangeResponse>(
+          '/automation/extract/range',
+          { method: 'POST', json: body, signal: opts.signal },
+        ),
+    },
+
+    // -----------------------------------------------------------------------
+    // Batch orchestration
+    // -----------------------------------------------------------------------
+    batch: {
+      /**
+       * `POST /api/memory/automation/batch`.
+       *
+       * Creates a batch and enqueues its jobs SYNCHRONOUSLY --
+       * the response returns only after every job row has been
+       * inserted. For a workspace with hundreds of sessions
+       * this can take a few seconds; the UI should show a
+       * spinner during the POST.
+       *
+       * The returned `batch.status` is either `'running'`
+       * (jobs enqueued) or `'completed'` (zero pending
+       * sessions). Every field is optional in the request body
+       * -- the empty body `{}` is a valid "scan everything"
+       * batch. `triggered_by` defaults to `'manual'`.
+       *
+       * `project_id` / `chat_ids` / `date_from` / `date_to`
+       * are recorded as batch METADATA -- the current backend
+       * does not filter by them (the route scans all
+       * projects). Do not send them expecting scoped work.
+       */
+      create: (
+        body: {
+          triggered_by?: string;
+          project_id?: string | null;
+          chat_ids?: string[];
+          date_from?: number | null;
+          date_to?: number | null;
+          options?: Record<string, unknown>;
+        } = {},
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<BatchCreateResponse>('/automation/batch', {
+          method: 'POST',
+          json: body,
+          signal: opts.signal,
+        }),
+
+      /**
+       * `GET /api/memory/automation/batch`.
+       *
+       * Paginated list of batches, newest first. Self-healing:
+       * any `running` batch whose jobs are all terminal is
+       * transitioned to `completed` DURING the list call, so
+       * the UI sees the fresh state without a separate fetch.
+       */
+      list: (
+        params: {
+          status?: MemoryBatchStatus;
+          limit?: number;
+          offset?: number;
+        } = {},
+        opts: { signal?: AbortSignal } = {},
+      ) =>
+        memoryFetch<BatchListResponse>(
+          `/automation/batch${buildQueryString({
+            status: params.status,
+            limit: params.limit,
+            offset: params.offset,
+          })}`,
+          { method: 'GET', signal: opts.signal },
+        ),
+
+      /**
+       * `GET /api/memory/automation/batch/estimate`.
+       *
+       * Cost / scope preview for a fresh batch created NOW.
+       * Pure read -- no batch is created, no job enqueued.
+       *
+       * Route-ordering note: this URL is declared BEFORE
+       * `/batch/{batch_id}` on the backend (see
+       * `memory_batch.py`'s "Route-ordering contract"), so it
+       * cannot be shadowed by the get-by-id handler. The client
+       * need not worry about ordering; it just calls the
+       * specific path.
+       */
+      estimate: (opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<BatchEstimateResponse>(
+          '/automation/batch/estimate',
+          { method: 'GET', signal: opts.signal },
+        ),
+
+      /**
+       * `GET /api/memory/automation/batch/{batch_id}`.
+       *
+       * Returns the batch row (self-healed if applicable) plus
+       * its LIVE aggregate progress. The `progress` block is
+       * recomputed on every request -- it is the authoritative
+       * view; the counters stored on the batch row itself are
+       * historical snapshots.
+       */
+      get: (batchId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<BatchGetResponse>(
+          `/automation/batch/${encodeURIComponent(batchId)}`,
+          { method: 'GET', signal: opts.signal },
+        ),
+
+      /**
+       * `POST /api/memory/automation/batch/{batch_id}/pause`.
+       *
+       * Cancels every `pending` / `retry_pending` job in the
+       * batch with `error_code='BATCH_PAUSED'`. RUNNING jobs
+       * are left alone -- the current attempt finishes
+       * naturally, then no further jobs are claimed.
+       *
+       * 409 if the batch is not currently `running`.
+       */
+      pause: (batchId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<BatchPauseResponse>(
+          `/automation/batch/${encodeURIComponent(batchId)}/pause`,
+          { method: 'POST', signal: opts.signal },
+        ),
+
+      /**
+       * `POST /api/memory/automation/batch/{batch_id}/resume`.
+       *
+       * Re-queues every job whose `error_code` is
+       * `BATCH_PAUSED`. Jobs cancelled for OTHER reasons (a
+       * per-job cancel, a `SESSION_CHANGED` failure) stay
+       * cancelled -- resume is "resume from where we paused",
+       * not "re-run everything".
+       *
+       * 409 if the batch is not currently `paused`.
+       */
+      resume: (batchId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<BatchResumeResponse>(
+          `/automation/batch/${encodeURIComponent(batchId)}/resume`,
+          { method: 'POST', signal: opts.signal },
+        ),
+
+      /**
+       * `POST /api/memory/automation/batch/{batch_id}/cancel`.
+       *
+       * Cancels EVERY non-terminal job in the batch
+       * (`pending`, `retry_pending`, `running`) with
+       * `error_code='BATCH_CANCELLED'`. There is no "graceful"
+       * variant -- the user asked for it to stop.
+       *
+       * 409 if the batch is already in a terminal state.
+       */
+      cancel: (batchId: string, opts: { signal?: AbortSignal } = {}) =>
+        memoryFetch<BatchCancelResponse>(
+          `/automation/batch/${encodeURIComponent(batchId)}/cancel`,
+          { method: 'POST', signal: opts.signal },
+        ),
     },
   },
 };

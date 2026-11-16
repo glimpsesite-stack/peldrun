@@ -170,6 +170,37 @@ class MemoryJob(BaseModel):
         description="Job discriminator; Phase 1 only defines 'extraction'.",
     )
 
+    # ------------------------- batch linkage -------------------------------
+    #
+    # Nullable link to the batch that spawned this job. NULL for
+    # on-the-fly jobs created by AFTER_TURN / AFTER_SESSION /
+    # MANUAL triggers; non-NULL only for retroactive BATCH jobs
+    # created by the Phase 3 batch subsystem.
+    #
+    # The column itself was introduced by Migration v3 (which also
+    # creates `memory_batches`). This field is declared here so the
+    # Pydantic model round-trips cleanly with the SQL schema AFTER
+    # the migration is applied. `MemoryJob.model_config` sets
+    # `extra="forbid"`, so ANY column added to `memory_jobs` MUST
+    # have a matching field here -- otherwise `SELECT *` returns a
+    # row whose `batch_id` key would raise `ValidationError` on
+    # `MemoryJob(**data)`.
+    #
+    # The `_job_to_row_values` helper in `outbox.py` inlines this
+    # column into the INSERT ONLY when it is non-None. That keeps
+    # the "job is not part of a batch" INSERT compatible with v2
+    # databases that have not yet been migrated to v3 (rolling
+    # upgrade safety), while still writing it for real batch jobs.
+    batch_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Batch id this job belongs to, or None for on-the-fly "
+            "jobs. Set only by the batch subsystem (Phase 3); "
+            "AFTER_TURN / AFTER_SESSION / MANUAL jobs leave it "
+            "None."
+        ),
+    )
+
     # ------------------------- chat context --------------------------------
 
     chat_id: str = Field(
@@ -489,6 +520,7 @@ class MemoryJob(BaseModel):
         start_turn_index: Optional[int],
         end_turn_index: Optional[int],
         message_snapshot_hash: str,
+        batch_id: Optional[str] = None,
     ) -> str:
         """Compute the deterministic idempotency key (§18.1).
 
@@ -501,11 +533,29 @@ class MemoryJob(BaseModel):
           * start/end_turn_index   -- different range, different job
           * message_snapshot_hash  -- different session content,
                                       different job
+          * batch_id               -- different batch, different
+                                      logical operation
 
         Two enqueues with the same inputs produce the same key,
         which the UNIQUE constraint on
         ``memory_jobs.idempotency_key`` rejects. Two enqueues with
         ANY differing input produce distinct keys and both jobs run.
+
+        ``batch_id`` inclusion rationale
+        --------------------------------
+        A batch is a DISTINCT user-initiated operation, not a
+        dedup opportunity. If the operator creates two batches
+        back-to-back on the same unchanged sessions, both must
+        run -- the second batch's jobs must not be silently
+        swallowed as duplicates of the first batch's. Prepending
+        ``batch_id`` to the canonical string gives each batch
+        its own idempotency namespace.
+
+        On-the-fly jobs (AFTER_TURN / AFTER_SESSION / MANUAL)
+        pass ``batch_id=None`` (the default). Their keys are
+        byte-identical to the pre-batch format, so existing
+        rows in the database remain valid -- the change is
+        backward-compatible.
         """
         start_s = (
             "none" if start_turn_index is None
@@ -515,18 +565,33 @@ class MemoryJob(BaseModel):
             "none" if end_turn_index is None
             else str(end_turn_index)
         )
-        raw = (
+        base = (
             f"{chat_id}:{trigger_type.value}:"
             f"{start_s}:{end_s}:"
             f"{message_snapshot_hash[:16]}"
         )
+        if batch_id:
+            raw = f"{batch_id}:{base}"
+        else:
+            raw = base
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return a JSON-safe dict for logging / API responses."""
+        """Return a JSON-safe dict for logging / API responses.
+
+        Includes ``batch_id`` (added in Migration v3). It is ``None``
+        for on-the-fly jobs (AFTER_TURN / AFTER_SESSION / MANUAL)
+        and non-``None`` for jobs created by the batch subsystem.
+
+        The key is ALWAYS present (possibly ``null``) so consumers
+        can distinguish "this field was not serialized" from "this
+        job has no batch" -- the former would be a serialization
+        bug, the latter is the normal state for most jobs.
+        """
         return {
             "job_id": self.job_id,
             "job_type": self.job_type.value,
+            "batch_id": self.batch_id,
             "chat_id": self.chat_id,
             "project_id": self.project_id,
             "scope_type": self.scope_type.value,

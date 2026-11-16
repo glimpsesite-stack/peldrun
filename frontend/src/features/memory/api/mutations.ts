@@ -106,6 +106,30 @@ import type {
 } from '../types/import-export';
 
 // ---------------------------------------------------------------------------
+// Phase 3 (Automation) imports
+// ---------------------------------------------------------------------------
+//
+// Grouped together and placed AFTER the Phase-1 imports so the
+// diff between the two surfaces is unambiguous when reading the
+// file. `MemoryAISettingsOverlay` is the deep-partial patch
+// shape; the response types are the 10 envelopes the automation
+// mutations produce.
+
+import type { MemoryAISettingsOverlay } from '../types/ai';
+import type {
+  AISettingsUpdateResponse,
+  BatchCancelResponse,
+  BatchCreateResponse,
+  BatchPauseResponse,
+  BatchResumeResponse,
+  ExtractFromSessionResponse,
+  ExtractRangeResponse,
+  JobCancelResponse,
+  JobRetryResponse,
+  TestModelResponse,
+} from '../types/responses';
+
+// ---------------------------------------------------------------------------
 // Shared hook-options base
 // ---------------------------------------------------------------------------
 
@@ -1005,6 +1029,502 @@ export function useExportJson(
     mutationFn: (params) =>
       memoryClient.exports.downloadJson({ ...params, format: 'json' }),
     onSuccess: options.onSuccess,
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ===========================================================================
+// Automation (Phase 3)
+// ===========================================================================
+//
+// Invalidation policy (documented per-hook, summarized here):
+//
+//   * AI settings PATCH -> settings.get(), jobs.lists()
+//     (enabling/disabling extraction tears down or rebuilds the
+//     pipeline; the jobs list may have stale state-of-pipeline
+//     from the user's POV).
+//
+//   * test-model -> NO invalidation (read-only probe).
+//
+//   * job retry / cancel -> jobs.lists(), jobs.detail(id).
+//     The batch aggregate is ALSO invalidated when the job
+//     belongs to a batch -- but the mutation does not know the
+//     batch id at call time (the caller's job object does). The
+//     caller who opens the batch panel after mutating a job
+//     should invalidate `automation.batch.all()` themselves; the
+//     hooks below invalidate only what they can prove.
+//
+//   * extract-from-session / extract-range -> jobs.lists().
+//     No batch is touched (these are MANUAL jobs).
+//
+//   * batch create -> batch.lists(), batch.estimate(),
+//     jobs.lists() (new jobs appear; the estimate is now stale).
+//
+//   * batch pause / resume / cancel -> batch.detail(id),
+//     batch.lists(), jobs.lists() (job statuses changed).
+
+// ---------------------------------------------------------------------------
+// AI settings mutations
+// ---------------------------------------------------------------------------
+
+/**
+ * Variables for `usePatchAISettings`.
+ */
+type PatchAISettingsVariables = MemoryAISettingsOverlay;
+
+/**
+ * `PATCH /api/memory/automation/settings` -- partial AI update.
+ *
+ * The backend deep-merges nested `extraction` / `consolidation`
+ * objects, so callers may send a sparse patch. The route's
+ * `batch_auto_schedule_hours` field is the ONLY nullable field
+ * -- sending `null` clears it, omitting leaves it unchanged.
+ *
+ * On success, invalidates:
+ *
+ *   * `automation.settings.get()` -- the source of truth.
+ *   * `automation.jobs.lists()` -- if the enable flags flipped,
+ *     the extraction pipeline was torn down or rebuilt, which
+ *     can invalidate in-flight job states.
+ *
+ * Does NOT invalidate batches: a batch row's historical
+ * configuration snapshot (model, min_confidence) is independent
+ * of the current AI settings, and the batch detail self-heals
+ * on read.
+ */
+export function usePatchAISettings(
+  options: BaseMutationOptions<
+    AISettingsUpdateResponse,
+    PatchAISettingsVariables
+  > = {},
+): UseMutationResult<
+  AISettingsUpdateResponse,
+  MemoryApiError,
+  PatchAISettingsVariables
+> {
+  const queryClient = useQueryClient();
+  return useMutation<
+    AISettingsUpdateResponse,
+    MemoryApiError,
+    PatchAISettingsVariables
+  >({
+    mutationFn: (patch) => memoryClient.automation.settings.patch(patch),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.settings.get(),
+      });
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Test-model mutation
+// ---------------------------------------------------------------------------
+
+/**
+ * Variables for `useTestModel`.
+ */
+type TestModelVariables = Parameters<
+  typeof memoryClient.automation.settings.testModel
+>[0];
+
+/**
+ * `POST /api/memory/automation/test-model` -- probe a model.
+ *
+ * **Response contract**: the mutation resolves with EITHER a
+ * success envelope (`status: 'ok'`) OR an error envelope
+ * (`status: 'error'`) -- both delivered via HTTP 200. The hook
+ * does NOT throw on `status: 'error'`; the caller must narrow.
+ *
+ *     const result = await testModel.mutateAsync({...});
+ *     if (result.status === 'ok') {
+ *       showSuccess(result.latency_ms);
+ *     } else {
+ *       showError(result.message);
+ *     }
+ *
+ * This is deliberate: a model-level failure (unreachable
+ * provider, unparseable output) is a LEGITIMATE OUTCOME of the
+ * probe -- not an infrastructure error. Callers need to display
+ * it as "the model is misconfigured", not as "the API call
+ * failed".
+ *
+ * No invalidation -- the probe does not change any state, only
+ * the cost ledger (which is not cached in this feature).
+ */
+export function useTestModel(
+  options: BaseMutationOptions<TestModelResponse, TestModelVariables> = {},
+): UseMutationResult<TestModelResponse, MemoryApiError, TestModelVariables> {
+  return useMutation<TestModelResponse, MemoryApiError, TestModelVariables>({
+    mutationFn: (body) =>
+      memoryClient.automation.settings.testModel(body),
+    onSuccess: options.onSuccess,
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Job mutations
+// ---------------------------------------------------------------------------
+
+/**
+ * Variables for `useRetryJob` and `useCancelJob`.
+ */
+type JobIdVariables = { jobId: string };
+
+/**
+ * `POST /api/memory/automation/jobs/{id}/retry` -- requeue a
+ * terminal-failure job.
+ *
+ * The backend enforces `failed` / `cancelled` only; illegal
+ * state transitions surface as `MemoryApiError` with
+ * `errorType: 'invalid_state'` (HTTP 409). The UI should gate
+ * the Retry button on `isRetryableJobStatus(job.status)` from
+ * `types/jobs.ts` -- but the mutation still throws on the 409
+ * path, so a stale button cannot silently fail.
+ *
+ * On success, invalidates `automation.jobs.detail(id)` (the
+ * requeued job) and `automation.jobs.lists()` (any list
+ * containing it).
+ */
+export function useRetryJob(
+  options: BaseMutationOptions<JobRetryResponse, JobIdVariables> = {},
+): UseMutationResult<JobRetryResponse, MemoryApiError, JobIdVariables> {
+  const queryClient = useQueryClient();
+  return useMutation<JobRetryResponse, MemoryApiError, JobIdVariables>({
+    mutationFn: ({ jobId }) =>
+      memoryClient.automation.jobs.retry(jobId),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.detail(variables.jobId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+/**
+ * `POST /api/memory/automation/jobs/{id}/cancel` -- cancel an
+ * active job.
+ *
+ * Terminal states surface as `MemoryApiError` with
+ * `errorType: 'invalid_state'` (HTTP 409). The UI should gate
+ * the Cancel button on `isCancellableJobStatus(job.status)`.
+ *
+ * A RUNNING job CAN be cancelled: the worker notices on its
+ * next heartbeat and skips the subsequent `complete()` call
+ * (the outbox raises `JobNotFoundError`, which the worker
+ * already handles as "the job disappeared; done").
+ *
+ * Same invalidation as `useRetryJob`.
+ */
+export function useCancelJob(
+  options: BaseMutationOptions<JobCancelResponse, JobIdVariables> = {},
+): UseMutationResult<JobCancelResponse, MemoryApiError, JobIdVariables> {
+  const queryClient = useQueryClient();
+  return useMutation<JobCancelResponse, MemoryApiError, JobIdVariables>({
+    mutationFn: ({ jobId }) =>
+      memoryClient.automation.jobs.cancel(jobId),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.detail(variables.jobId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Manual extraction mutations
+// ---------------------------------------------------------------------------
+
+/**
+ * Variables for `useExtractFromSession`.
+ */
+type ExtractFromSessionVariables = Parameters<
+  typeof memoryClient.automation.extract.fromSession
+>[0];
+
+/**
+ * `POST /api/memory/automation/extract/from-session` -- enqueue
+ * a MANUAL extraction of the whole session.
+ *
+ * The response is a discriminated union on `job === null`:
+ *
+ *   * `job: MemoryJob` -- a job was enqueued.
+ *   * `job: null`      -- nothing to extract (200, with a
+ *                          `message` explaining why).
+ *
+ * Neither case is an error. Both invalidate the jobs list --
+ * even a no-op is worth re-fetching because it proves no job
+ * was created (which is itself state the UI cares about).
+ */
+export function useExtractFromSession(
+  options: BaseMutationOptions<
+    ExtractFromSessionResponse,
+    ExtractFromSessionVariables
+  > = {},
+): UseMutationResult<
+  ExtractFromSessionResponse,
+  MemoryApiError,
+  ExtractFromSessionVariables
+> {
+  const queryClient = useQueryClient();
+  return useMutation<
+    ExtractFromSessionResponse,
+    MemoryApiError,
+    ExtractFromSessionVariables
+  >({
+    mutationFn: (body) =>
+      memoryClient.automation.extract.fromSession(body),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+/**
+ * Variables for `useExtractRange`.
+ */
+type ExtractRangeVariables = Parameters<
+  typeof memoryClient.automation.extract.range
+>[0];
+
+/**
+ * `POST /api/memory/automation/extract/range` -- enqueue a
+ * MANUAL extraction of a specific turn range.
+ *
+ * Same `job: null` semantics and invalidation policy as
+ * `useExtractFromSession`.
+ */
+export function useExtractRange(
+  options: BaseMutationOptions<
+    ExtractRangeResponse,
+    ExtractRangeVariables
+  > = {},
+): UseMutationResult<
+  ExtractRangeResponse,
+  MemoryApiError,
+  ExtractRangeVariables
+> {
+  const queryClient = useQueryClient();
+  return useMutation<
+    ExtractRangeResponse,
+    MemoryApiError,
+    ExtractRangeVariables
+  >({
+    mutationFn: (body) => memoryClient.automation.extract.range(body),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Batch mutations
+// ---------------------------------------------------------------------------
+
+/**
+ * Variables for `useCreateBatch`.
+ */
+type CreateBatchVariables = Parameters<
+  typeof memoryClient.automation.batch.create
+>[0];
+
+/**
+ * `POST /api/memory/automation/batch` -- create a batch.
+ *
+ * SYNCHRONOUS on the backend: the response returns only after
+ * every job row has been inserted. A workspace with hundreds of
+ * sessions can make this a multi-second POST; the UI should
+ * show a spinner and disable the trigger button.
+ *
+ * On success, invalidates:
+ *
+ *   * `automation.batch.lists()` -- a new batch appears.
+ *   * `automation.batch.estimate()` -- the estimate for the
+ *     "next" batch is stale now.
+ *   * `automation.jobs.lists()` -- new jobs were enqueued.
+ */
+export function useCreateBatch(
+  options: BaseMutationOptions<
+    BatchCreateResponse,
+    CreateBatchVariables
+  > = {},
+): UseMutationResult<
+  BatchCreateResponse,
+  MemoryApiError,
+  CreateBatchVariables
+> {
+  const queryClient = useQueryClient();
+  return useMutation<
+    BatchCreateResponse,
+    MemoryApiError,
+    CreateBatchVariables
+  >({
+    mutationFn: (body) => memoryClient.automation.batch.create(body),
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.batch.lists(),
+      });
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.batch.estimate(),
+      });
+      queryClient.invalidateQueries({
+        queryKey: memoryKeys.automation.jobs.lists(),
+      });
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+/**
+ * Variables for `usePauseBatch`, `useResumeBatch`, and
+ * `useCancelBatch`.
+ */
+type BatchIdVariables = { batchId: string };
+
+/**
+ * Shared invalidation for the three batch mutating operations.
+ *
+ * All three change:
+ *   * the batch's own status + timestamps (`batch.detail(id)`),
+ *   * its position in the list (`batch.lists()`),
+ *   * the statuses of many jobs (`jobs.lists()`).
+ *
+ * Centralized so the three hooks cannot drift.
+ */
+function invalidateBatchCascade(
+  queryClient: ReturnType<typeof useQueryClient>,
+  batchId: string,
+): void {
+  queryClient.invalidateQueries({
+    queryKey: memoryKeys.automation.batch.detail(batchId),
+  });
+  queryClient.invalidateQueries({
+    queryKey: memoryKeys.automation.batch.lists(),
+  });
+  queryClient.invalidateQueries({
+    queryKey: memoryKeys.automation.jobs.lists(),
+  });
+}
+
+/**
+ * `POST /api/memory/automation/batch/{id}/pause` -- pause a
+ * RUNNING batch.
+ *
+ * Pending / retry_pending jobs are cancelled with
+ * `error_code='BATCH_PAUSED'`. Running jobs are left alone --
+ * the current attempt finishes naturally, and no further jobs
+ * are claimed until resume (or cancel).
+ *
+ * 409 if the batch is not currently `running`. The UI should
+ * gate the Pause button on `isPausableBatchStatus(batch.status)`.
+ */
+export function usePauseBatch(
+  options: BaseMutationOptions<
+    BatchPauseResponse,
+    BatchIdVariables
+  > = {},
+): UseMutationResult<BatchPauseResponse, MemoryApiError, BatchIdVariables> {
+  const queryClient = useQueryClient();
+  return useMutation<BatchPauseResponse, MemoryApiError, BatchIdVariables>({
+    mutationFn: ({ batchId }) =>
+      memoryClient.automation.batch.pause(batchId),
+    onSuccess: (data, variables) => {
+      invalidateBatchCascade(queryClient, variables.batchId);
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+/**
+ * `POST /api/memory/automation/batch/{id}/resume` -- resume a
+ * PAUSED batch.
+ *
+ * Re-queues every job whose `error_code` is `BATCH_PAUSED`.
+ * Jobs cancelled for other reasons (per-job cancel,
+ * `SESSION_CHANGED` failures) stay cancelled.
+ *
+ * 409 if the batch is not currently `paused`. UI gate:
+ * `isResumableBatchStatus(batch.status)`.
+ */
+export function useResumeBatch(
+  options: BaseMutationOptions<
+    BatchResumeResponse,
+    BatchIdVariables
+  > = {},
+): UseMutationResult<BatchResumeResponse, MemoryApiError, BatchIdVariables> {
+  const queryClient = useQueryClient();
+  return useMutation<BatchResumeResponse, MemoryApiError, BatchIdVariables>({
+    mutationFn: ({ batchId }) =>
+      memoryClient.automation.batch.resume(batchId),
+    onSuccess: (data, variables) => {
+      invalidateBatchCascade(queryClient, variables.batchId);
+      options.onSuccess?.(data, variables);
+    },
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+/**
+ * `POST /api/memory/automation/batch/{id}/cancel` -- cancel an
+ * active batch.
+ *
+ * Cancels EVERY non-terminal job (pending, retry_pending,
+ * running) with `error_code='BATCH_CANCELLED'`. There is no
+ * graceful variant.
+ *
+ * 409 if the batch is already terminal. UI gate:
+ * `isCancellableBatchStatus(batch.status)`.
+ */
+export function useCancelBatch(
+  options: BaseMutationOptions<
+    BatchCancelResponse,
+    BatchIdVariables
+  > = {},
+): UseMutationResult<BatchCancelResponse, MemoryApiError, BatchIdVariables> {
+  const queryClient = useQueryClient();
+  return useMutation<BatchCancelResponse, MemoryApiError, BatchIdVariables>({
+    mutationFn: ({ batchId }) =>
+      memoryClient.automation.batch.cancel(batchId),
+    onSuccess: (data, variables) => {
+      invalidateBatchCascade(queryClient, variables.batchId);
+      options.onSuccess?.(data, variables);
+    },
     onError: options.onError,
     onSettled: options.onSettled,
   });

@@ -62,14 +62,22 @@ import {
 import { memoryClient } from './client';
 import { memoryKeys } from './keys';
 import type {
+  BatchesListParams,
   EntryListParams,
+  JobsListParams,
   UsageBreakdownParams,
   UsageSummaryParams,
   UsageTimeseriesParams,
 } from './keys';
 import type { MemoryApiError } from '../types/errors';
 import type {
+  AISettingsGetResponse,
+  BatchEstimateResponse,
+  BatchGetResponse,
+  BatchListResponse,
   GetMemoryResponse,
+  JobGetResponse,
+  JobsListResponse,
   ListMemoryResponse,
   ListProjectsResponse,
   ProjectSettingsGetResponse,
@@ -100,6 +108,41 @@ export const MEMORY_STALE_TIMES = {
   projects: 60_000,
   usage: 60_000,
   adapters: Number.POSITIVE_INFINITY,
+  // Phase 3 additions:
+  //
+  //   * `aiSettings` -- same cadence as `settings` (user-action
+  //     driven). Combining the two hooks' staleness keeps a
+  //     settings-page reload atomic.
+  //
+  //   * `jobs` / `batches` (lists) -- shorter than the domain
+  //     data above because the underlying rows are MANAGED BY A
+  //     BACKGROUND WORKER. A 30s or 60s stale time would show a
+  //     "running" job as in-progress long after it finished. 5s
+  //     / 3s keeps the UI close-to-live without polling every
+  //     render; components that need true live updates use
+  //     `useAutomationPolling` (in `hooks/`) with a short
+  //     `refetchInterval`.
+  //
+  //   * `jobDetail` / `batchDetail` -- slightly slower than
+  //     their list counterparts because a detail view has one
+  //     item and the cost of a stale render is lower. The
+  //     detail panel is the natural place to enable active
+  //     polling; the passive stale time can be more relaxed.
+  //
+  //   * `batchEstimate` -- ALWAYS zero. Each "Start Batch"
+  //     dialog opening wants a fresh estimate because the
+  //     workspace state may have changed since the last time
+  //     the dialog was opened (a new chat ended, an extraction
+  //     completed, ...). `staleTime: 0` means "refetch on
+  //     mount, but use cached data while refetching" -- the
+  //     user sees something immediately, and it updates in the
+  //     background.
+  aiSettings: 60_000,
+  jobs: 5_000,
+  jobDetail: 15_000,
+  batches: 3_000,
+  batchDetail: 3_000,
+  batchEstimate: 0,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -512,6 +555,200 @@ export function useImportAdapters(
     enabled: options.enabled ?? true,
     select: options.select as
       | ((data: ImportAdaptersResponse) => ImportAdaptersResponse)
+      | undefined,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Automation -- AI settings
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the AI extraction settings subtree.
+ *
+ * Distinct from `useMemorySettings()` above: that hook returns
+ * the FULL `MemorySettings` document (mode, provider, retrieval
+ * tuning, budget, AI, ...). This one returns ONLY the
+ * `MemoryAISettings` subtree -- what the "Memory Automation"
+ * panel and every Phase-3 gate (jobs, batches, extraction
+ * triggers) actually needs.
+ *
+ * Enabled unconditionally. Callers who want to hide the
+ * automation panel when extraction is OFF can gate rendering on
+ * `data.ai.enabled` rather than gating the query itself -- the
+ * query is cheap and its response tells them BOTH whether the
+ * subsystem is on AND what its configuration is.
+ */
+export function useAISettings(
+  options: HookOptions<AISettingsGetResponse> = {},
+): UseQueryResult<AISettingsGetResponse, MemoryApiError> {
+  return useQuery<AISettingsGetResponse, MemoryApiError>({
+    queryKey: memoryKeys.automation.settings.get(),
+    queryFn: ({ signal }) =>
+      memoryClient.automation.settings.get({ signal }),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.aiSettings,
+    enabled: options.enabled ?? true,
+    select: options.select as
+      | ((data: AISettingsGetResponse) => AISettingsGetResponse)
+      | undefined,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Automation -- extraction jobs
+// ---------------------------------------------------------------------------
+
+/**
+ * List extraction jobs with filters and pagination.
+ *
+ * Same params-in / params-to-key pattern as `useEntryList` above:
+ * the hook takes the EXACT object `memoryKeys.automation.jobs.list`
+ * expects, so call sites cannot accidentally diverge the cache
+ * key from the request body.
+ *
+ * The active jobs list is one of the two live surfaces in the
+ * memory feature (the other is the batch detail panel). Callers
+ * that want per-render liveness should combine this hook with
+ * `useAutomationPolling` (in `hooks/`) -- the hook itself uses
+ * only the passive `staleTime` from `MEMORY_STALE_TIMES.jobs`.
+ */
+export function useJobsList(
+  params: JobsListParams,
+  options: HookOptions<JobsListResponse> = {},
+): UseQueryResult<JobsListResponse, MemoryApiError> {
+  return useQuery<JobsListResponse, MemoryApiError>({
+    queryKey: memoryKeys.automation.jobs.list(params),
+    queryFn: ({ signal }) =>
+      memoryClient.automation.jobs.list(
+        {
+          status: params.status ?? undefined,
+          chat_id: params.chat_id,
+          trigger_type: params.trigger_type ?? undefined,
+          limit: params.limit,
+          offset: params.offset,
+        },
+        { signal },
+      ),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.jobs,
+    enabled: options.enabled ?? true,
+    select: options.select as
+      | ((data: JobsListResponse) => JobsListResponse)
+      | undefined,
+  });
+}
+
+/**
+ * Fetch a single extraction job by id.
+ *
+ * Disabled when `jobId` is empty -- detail panels are typically
+ * opened from a route param that is briefly undefined on first
+ * render. A 404 for an unknown id surfaces as a `MemoryApiError`
+ * with `errorType: 'not_found'` -- the panel should treat that
+ * as "the job was deleted or never existed" and close itself.
+ */
+export function useJobDetail(
+  jobId: string | undefined,
+  options: HookOptions<JobGetResponse> = {},
+): UseQueryResult<JobGetResponse, MemoryApiError> {
+  return useQuery<JobGetResponse, MemoryApiError>({
+    queryKey: memoryKeys.automation.jobs.detail(jobId ?? ''),
+    queryFn: ({ signal }) =>
+      memoryClient.automation.jobs.get(jobId!, { signal }),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.jobDetail,
+    enabled: (options.enabled ?? true) && Boolean(jobId),
+    select: options.select as
+      | ((data: JobGetResponse) => JobGetResponse)
+      | undefined,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Automation -- batches
+// ---------------------------------------------------------------------------
+
+/**
+ * List batch runs with filters and pagination.
+ *
+ * The batches list self-heals on every read: any `running`
+ * batch whose jobs are all terminal is transitioned to
+ * `completed` DURING this query. So the list reflects the
+ * current state without a separate refresh.
+ *
+ * Same "combine with `useAutomationPolling` for live updates"
+ * contract as `useJobsList`.
+ */
+export function useBatchesList(
+  params: BatchesListParams,
+  options: HookOptions<BatchListResponse> = {},
+): UseQueryResult<BatchListResponse, MemoryApiError> {
+  return useQuery<BatchListResponse, MemoryApiError>({
+    queryKey: memoryKeys.automation.batch.list(params),
+    queryFn: ({ signal }) =>
+      memoryClient.automation.batch.list(
+        {
+          status: params.status ?? undefined,
+          limit: params.limit,
+          offset: params.offset,
+        },
+        { signal },
+      ),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.batches,
+    enabled: options.enabled ?? true,
+    select: options.select as
+      | ((data: BatchListResponse) => BatchListResponse)
+      | undefined,
+  });
+}
+
+/**
+ * Fetch a single batch with its LIVE aggregate progress.
+ *
+ * The response carries both `batch` (historical configuration +
+ * counters) and `progress` (recomputed from `memory_jobs` on
+ * every request). The UI must render "N of M done" from
+ * `progress`, NOT from `batch.completed_jobs` /
+ * `batch.job_count` -- the latter are snapshots.
+ */
+export function useBatchDetail(
+  batchId: string | undefined,
+  options: HookOptions<BatchGetResponse> = {},
+): UseQueryResult<BatchGetResponse, MemoryApiError> {
+  return useQuery<BatchGetResponse, MemoryApiError>({
+    queryKey: memoryKeys.automation.batch.detail(batchId ?? ''),
+    queryFn: ({ signal }) =>
+      memoryClient.automation.batch.get(batchId!, { signal }),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.batchDetail,
+    enabled: (options.enabled ?? true) && Boolean(batchId),
+    select: options.select as
+      | ((data: BatchGetResponse) => BatchGetResponse)
+      | undefined,
+  });
+}
+
+/**
+ * Fetch the cost estimate for a fresh batch.
+ *
+ * Pure read -- no batch is created, no job enqueued. Intended
+ * for the "Start Batch" dialog's preview panel. `staleTime: 0`
+ * means "refetch on every mount" -- the workspace state can
+ * change between dialog openings (a new chat ended, an
+ * extraction completed), so an estimate from 10 minutes ago
+ * would mislead.
+ *
+ * The estimate is a CONSERVATIVE UPPER BOUND; the UI should
+ * label it "estimated" / "at most", not "will cost".
+ */
+export function useBatchEstimate(
+  options: HookOptions<BatchEstimateResponse> = {},
+): UseQueryResult<BatchEstimateResponse, MemoryApiError> {
+  return useQuery<BatchEstimateResponse, MemoryApiError>({
+    queryKey: memoryKeys.automation.batch.estimate(),
+    queryFn: ({ signal }) =>
+      memoryClient.automation.batch.estimate({ signal }),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.batchEstimate,
+    enabled: options.enabled ?? true,
+    select: options.select as
+      | ((data: BatchEstimateResponse) => BatchEstimateResponse)
       | undefined,
   });
 }

@@ -48,11 +48,18 @@
  * specific type.
  */
 
+import type { MemoryAISettings } from './ai';
+import type {
+  BatchEstimate,
+  BatchProgress,
+  MemoryBatch,
+} from './batch';
 import type {
   MemoryEntry,
   MemoryScopeRefString,
 } from './entry';
 import type { RouterDecision } from './enums';
+import type { MemoryJob } from './jobs';
 import type {
   MemoryProjectOverride,
   MemorySettings,
@@ -840,6 +847,425 @@ export interface UsageTimeseriesResponse extends MemoryOkEnvelope {
   period: string;
   granularity: string;
   points: UsageTimeseriesPoint[];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 -- Automation responses
+// ---------------------------------------------------------------------------
+
+/**
+ * Response of ``GET /api/memory/automation/settings``.
+ *
+ * Returns ONLY the ``MemoryAISettings`` subtree -- no mode,
+ * provider, retrieval tuning, or budget. The dedicated
+ * automation UI needs nothing else; the full settings live at
+ * ``GET /api/memory/settings`` (see ``SettingsGetResponse``).
+ */
+export interface AISettingsGetResponse extends MemoryOkEnvelope {
+  operation: 'ai_settings_get';
+  ai: MemoryAISettings;
+}
+
+/**
+ * Response of ``PATCH /api/memory/automation/settings``.
+ *
+ * ``applied_fields`` lists the top-level fields the caller sent
+ * in the request body (sorted). A field sent as ``null`` (only
+ * meaningful for ``batch_auto_schedule_hours``) appears in this
+ * list too -- the backend echoes the request keys, not the diff
+ * against current state.
+ */
+export interface AISettingsUpdateResponse extends MemoryOkEnvelope {
+  operation: 'ai_settings_patch';
+  applied_fields: string[];
+  ai: MemoryAISettings;
+}
+
+/**
+ * Success response of ``POST /api/memory/automation/test-model``.
+ *
+ * The probe ran end-to-end: the model was reachable, the
+ * extraction-shaped prompt reached it, and the response was
+ * parsed as JSON. ``parsed`` carries whatever the model
+ * returned (for the fixed probe prompt, typically
+ * ``{ok: true}``); ``raw_text_preview`` carries the first 500
+ * characters of the raw text (useful for diagnosing why a
+ * successful call did not match expectations).
+ *
+ * ``cost_nano_usd`` reports the actual token cost of the probe
+ * -- the test-model endpoint records cost in ``token_ledger``
+ * just like a real extraction call. Callers should not assume
+ * this is always 0 (local models are often free, cloud models
+ * are not).
+ */
+export interface TestModelSuccessResponse extends MemoryOkEnvelope {
+  operation: 'test_model';
+  provider_id: string;
+  model_id: string;
+  latency_ms: number;
+  parsed: Record<string, unknown>;
+  raw_text_preview: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_nano_usd: number;
+}
+
+/**
+ * Failure response of ``POST /api/memory/automation/test-model``.
+ *
+ * IMPORTANT: this is delivered with HTTP **200**, not 4xx/5xx.
+ * The HTTP layer succeeded (the router handled the request);
+ * only the UNDERLYING model call failed. The UI distinguishes
+ * "reachable but misconfigured" from "unreachable" via the
+ * ``error`` field, not the status code.
+ *
+ * Two error subtypes exist:
+ *
+ *   * ``LLMTransportError``  -- the model call failed at the
+ *                               network / provider layer
+ *                               (timeout, DNS failure, 4xx from
+ *                               the provider). No raw text
+ *                               preview.
+ *
+ *   * ``LLMParseError``      -- the model responded but the
+ *                               response could not be parsed as
+ *                               JSON. ``raw_text_preview``
+ *                               carries the first 500 chars of
+ *                               whatever the model returned,
+ *                               so the operator can see the
+ *                               syntax error.
+ *
+ * A third "unexpected" case (500 from the router itself, e.g.
+ * a bug in the gateway) returns the same ``status: "error"``
+ * shape but omits ``provider_id``, ``model_id``, and
+ * ``latency_ms`` -- hence those fields are optional here. The
+ * caller should render the ``message`` field unconditionally;
+ * everything else is best-effort.
+ */
+export interface TestModelErrorResponse {
+  status: 'error';
+  operation: 'test_model';
+  /** Error class name from the backend. */
+  error: string;
+  /** Human-readable diagnostic message. */
+  message: string;
+  /** Present unless the failure was an unexpected backend error. */
+  provider_id?: string;
+  /** Present unless the failure was an unexpected backend error. */
+  model_id?: string;
+  /** Present unless the failure was an unexpected backend error. */
+  latency_ms?: number;
+  /** Present ONLY when ``error === 'LLMParseError'``. */
+  raw_text_preview?: string;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/test-model``.
+ *
+ * A discriminated union on ``status`` (NOT on ``operation`` --
+ * both branches carry ``operation: 'test_model'``). Callers
+ * must check ``status`` before reading ``parsed``; TypeScript
+ * narrows automatically:
+ *
+ *     if (response.status === 'ok') {
+ *       const parsed = response.parsed;   // Record<string, unknown>
+ *     } else {
+ *       const message = response.message; // string
+ *     }
+ */
+export type TestModelResponse =
+  | TestModelSuccessResponse
+  | TestModelErrorResponse;
+
+// ---------------------------------------------------------------------------
+// Phase 3 -- Jobs responses
+// ---------------------------------------------------------------------------
+
+/**
+ * Response of ``GET /api/memory/automation/jobs``.
+ *
+ * Paginated list of extraction jobs, newest first. Filters
+ * (``status``, ``chat_id``, ``trigger_type``) are applied
+ * server-side; the ``total`` reflects the filter, not the
+ * universe of all jobs.
+ *
+ * Pagination fields follow the same contract as
+ * ``ListMemoryResponse``: ``has_more`` is computed as
+ * ``offset + jobs.length < total``. A concurrent create
+ * between the count and the page fetch can briefly
+ * misalign ``total`` -- acceptable for a UI that refreshes
+ * periodically.
+ */
+export interface JobsListResponse extends MemoryOkEnvelope {
+  operation: 'jobs_list';
+  jobs: MemoryJob[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
+/**
+ * Response of ``GET /api/memory/automation/jobs/{job_id}``.
+ *
+ * Returns a single job by id. A 404 is delivered for unknown
+ * ids -- see ``errors.ts`` for the ``job_not_found``
+ * ``errorType``.
+ */
+export interface JobGetResponse extends MemoryOkEnvelope {
+  operation: 'job_get';
+  job: MemoryJob;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/jobs/{job_id}/retry``.
+ *
+ * The job transitions ``failed`` / ``cancelled`` -> ``pending``
+ * with attempt bookkeeping reset. The response carries the
+ * post-transition state (``status: 'pending'``,
+ * ``attempts: 0``, error fields cleared, ``completed_at``
+ * cleared, ``started_at`` cleared, ``heartbeat_at`` cleared).
+ *
+ * NOTE: a 409 is delivered for illegal state transitions
+ * (``pending`` / ``running`` / ``completed``). A 404 is
+ * delivered for unknown ids. Both map to specific error types
+ * in ``errors.ts``.
+ */
+export interface JobRetryResponse extends MemoryOkEnvelope {
+  operation: 'job_retry';
+  job: MemoryJob;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/jobs/{job_id}/cancel``.
+ *
+ * The job transitions ``pending`` / ``retry_pending`` /
+ * ``running`` -> ``cancelled`` with ``error_code:
+ * 'BATCH_CANCELLED'`` NOT set (that code is reserved for
+ * batch-induced cancellations; single-job cancels from the
+ * jobs API leave ``error_code`` at whatever the caller's
+ * ``cancel_if_active`` implementation sets, currently unset).
+ *
+ * A 409 is delivered for terminal states; a 404 for unknown
+ * ids.
+ */
+export interface JobCancelResponse extends MemoryOkEnvelope {
+  operation: 'job_cancel';
+  job: MemoryJob;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 -- Manual extraction responses
+// ---------------------------------------------------------------------------
+
+/**
+ * Success variant of ``POST /api/memory/automation/extract/from-session``.
+ *
+ * A MANUAL-trigger extraction job was enqueued for the whole
+ * session. The job appears in the jobs list with
+ * ``trigger_type: 'manual'`` and covers turn indices
+ * ``0..(total-1)``.
+ */
+export interface ExtractFromSessionSuccessResponse
+  extends MemoryOkEnvelope {
+  operation: 'extract_from_session';
+  chat_id: string;
+  job: MemoryJob;
+}
+
+/**
+ * No-op variant of ``POST /api/memory/automation/extract/from-session``.
+ *
+ * Returned when the extraction pipeline ran successfully but
+ * produced no job. The ``message`` field explains the likely
+ * cause (zero turns, missing session file, or a duplicate
+ * idempotency key).
+ *
+ * Both variants use HTTP 200 -- "nothing to do" is a
+ * legitimate outcome, not an error. Callers must distinguish
+ * success-with-job from success-with-null by checking
+ * ``response.job !== null``.
+ */
+export interface ExtractFromSessionNoJobResponse
+  extends MemoryOkEnvelope {
+  operation: 'extract_from_session';
+  chat_id: string;
+  job: null;
+  message: string;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/extract/from-session``.
+ *
+ * A discriminated union on the nullability of ``job``. The
+ * ``status`` field is ``'ok'`` in BOTH branches -- "no job was
+ * enqueued" is a valid success, not an error.
+ */
+export type ExtractFromSessionResponse =
+  | ExtractFromSessionSuccessResponse
+  | ExtractFromSessionNoJobResponse;
+
+/**
+ * Success variant of ``POST /api/memory/automation/extract/range``.
+ *
+ * The response echoes the caller's requested range so the UI
+ * can confirm the exact job it created (without re-parsing the
+ * request body).
+ */
+export interface ExtractRangeSuccessResponse
+  extends MemoryOkEnvelope {
+  operation: 'extract_range';
+  chat_id: string;
+  start_turn_index: number;
+  end_turn_index: number;
+  job: MemoryJob;
+}
+
+/**
+ * No-op variant of ``POST /api/memory/automation/extract/range``.
+ *
+ * The echo fields are preserved so a caller can log the exact
+ * request that produced no job. Causes: range entirely outside
+ * the session's turn count, missing session file, or duplicate
+ * idempotency key.
+ */
+export interface ExtractRangeNoJobResponse extends MemoryOkEnvelope {
+  operation: 'extract_range';
+  chat_id: string;
+  start_turn_index: number;
+  end_turn_index: number;
+  job: null;
+  message: string;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/extract/range``.
+ */
+export type ExtractRangeResponse =
+  | ExtractRangeSuccessResponse
+  | ExtractRangeNoJobResponse;
+
+// ---------------------------------------------------------------------------
+// Phase 3 -- Batch responses
+// ---------------------------------------------------------------------------
+//
+// Every batch response carries BOTH the batch row AND its live
+// aggregate progress. The two are complementary:
+//
+//   * ``batch``    -- the historical/configuration view (status,
+//                     project scope, model snapshot, timestamps).
+//   * ``progress`` -- the authoritative live view (jobs in
+//                     each status, actual cost).
+//
+// The UI must render "N of M done" from ``progress``, NOT from
+// ``batch.completed_jobs / batch.job_count``. The latter are
+// snapshotted and can lag; the former is recomputed on every
+// read and is always fresh.
+
+/**
+ * Response of ``POST /api/memory/automation/batch``.
+ *
+ * Creating a batch enqueues all its jobs SYNCHRONOUSLY -- the
+ * response returns only after every job has been inserted into
+ * ``memory_jobs``. For a workspace with hundreds of sessions
+ * this can take a few seconds; the UI should show a spinner
+ * during the POST.
+ *
+ * The returned ``batch.status`` is either ``'running'`` (jobs
+ * were enqueued) or ``'completed'`` (zero pending sessions --
+ * nothing to do). The ``progress`` block mirrors that state.
+ */
+export interface BatchCreateResponse extends MemoryOkEnvelope {
+  operation: 'batch_create';
+  batch: MemoryBatch;
+  progress: BatchProgress;
+}
+
+/**
+ * Response of ``GET /api/memory/automation/batch``.
+ *
+ * Paginated list of batches, newest first. Self-healing: any
+ * ``running`` batch in the page whose jobs are all terminal is
+ * transitioned to ``completed`` during the list call, so the
+ * UI sees the fresh state without an extra round trip.
+ */
+export interface BatchListResponse extends MemoryOkEnvelope {
+  operation: 'batch_list';
+  batches: MemoryBatch[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
+/**
+ * Response of ``GET /api/memory/automation/batch/estimate``.
+ *
+ * A pure read-only projection over the current pending-session
+ * state. NO batch is created; no job is enqueued. Powers the
+ * "Start Batch" dialog's cost preview.
+ */
+export interface BatchEstimateResponse extends MemoryOkEnvelope {
+  operation: 'batch_estimate';
+  estimate: BatchEstimate;
+}
+
+/**
+ * Response of ``GET /api/memory/automation/batch/{batch_id}``.
+ *
+ * Returns the batch row (self-healed if applicable) plus its
+ * live aggregate. The ``progress`` block is computed fresh on
+ * every request.
+ */
+export interface BatchGetResponse extends MemoryOkEnvelope {
+  operation: 'batch_get';
+  batch: MemoryBatch;
+  progress: BatchProgress;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/batch/{batch_id}/pause``.
+ *
+ * After a successful pause, ``batch.status`` is ``'paused'``.
+ * ``progress.pending_work`` is typically 0 (all pending /
+ * retry_pending jobs were cancelled) unless a job was running
+ * at pause time -- running jobs are intentionally left alone,
+ * so ``progress.by_status.running`` may be non-zero.
+ */
+export interface BatchPauseResponse extends MemoryOkEnvelope {
+  operation: 'batch_pause';
+  batch: MemoryBatch;
+  progress: BatchProgress;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/batch/{batch_id}/resume``.
+ *
+ * After a successful resume, ``batch.status`` is ``'running'``
+ * and ``progress.pending_work`` is positive (the paused jobs
+ * were requeued). Jobs cancelled for reasons OTHER than pause
+ * (e.g. a per-job cancel, or a ``SESSION_CHANGED`` failure)
+ * remain cancelled -- resume is "resume from where we paused",
+ * not "rerun everything".
+ */
+export interface BatchResumeResponse extends MemoryOkEnvelope {
+  operation: 'batch_resume';
+  batch: MemoryBatch;
+  progress: BatchProgress;
+}
+
+/**
+ * Response of ``POST /api/memory/automation/batch/{batch_id}/cancel``.
+ *
+ * After a successful cancel, ``batch.status`` is
+ * ``'cancelled'``. Every non-terminal job in the batch was
+ * cancelled with ``error_code: 'BATCH_CANCELLED'``;
+ * ``progress.pending_work`` is 0.
+ */
+export interface BatchCancelResponse extends MemoryOkEnvelope {
+  operation: 'batch_cancel';
+  batch: MemoryBatch;
+  progress: BatchProgress;
 }
 
 // ---------------------------------------------------------------------------

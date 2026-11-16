@@ -350,13 +350,33 @@ class TriggerRouter:
     # Route: Batch
     # ------------------------------------------------------------------
 
-    async def route_batch(self) -> List[MemoryJob]:
+    async def route_batch(
+        self,
+        *,
+        batch_id: Optional[str] = None,
+    ) -> List[MemoryJob]:
         """Enqueue extraction for every chat with pending turns.
 
-        Used by `POST /api/memory/extract/batch`. One job per
+        Used by ``MemoryBatchService.create_batch``. One job per
         chat, covering the whole pending tail. Chats with no
         pending turns are skipped. Sessions whose snapshot
         cannot be read are skipped with a debug log.
+
+        Parameters
+        ----------
+        batch_id
+            Optional batch identifier to stamp on every enqueued
+            job. When set, the id is:
+              * stored in ``memory_jobs.batch_id`` (the SQL column
+                added by Migration v3), so the batch service can
+                aggregate progress with a single ``WHERE batch_id
+                = ?`` query;
+              * included in the job's ``idempotency_key`` (see
+                ``MemoryJob.compute_idempotency_key``'s
+                ``batch_id`` parameter) so two batches created
+                back-to-back on the same unchanged sessions both
+                run -- the second batch's jobs must NOT be
+                silently deduped against the first.
 
         Returns
         -------
@@ -404,6 +424,7 @@ class TriggerRouter:
                 end=end,
                 snapshot=snapshot,
                 config=config,
+                batch_id=batch_id,
             )
             all_jobs.extend(jobs)
 
@@ -609,14 +630,23 @@ class TriggerRouter:
         end: int,
         snapshot: str,
         config: ExtractionModelConfig,
+        batch_id: Optional[str] = None,
     ) -> List[MemoryJob]:
-        """Build, hash, and enqueue one job. Swallow duplicates."""
+        """Build, hash, and enqueue one job. Swallow duplicates.
+
+        ``batch_id`` is threaded through to the ``MemoryJob``
+        constructor AND to ``compute_idempotency_key``. All
+        non-batch routes (after_turn / after_session / on_demand
+        / explicit) leave it at the default ``None`` -- their
+        jobs behave exactly as before.
+        """
         idempotency_key = MemoryJob.compute_idempotency_key(
             chat_id=chat_id,
             trigger_type=trigger_type,
             start_turn_index=start,
             end_turn_index=end,
             message_snapshot_hash=snapshot,
+            batch_id=batch_id,
         )
 
         scope_type, scope_id = _derive_scope(
@@ -639,6 +669,7 @@ class TriggerRouter:
             model_provider_id=config.provider_id,
             model_id=config.model_id,
             idempotency_key=idempotency_key,
+            batch_id=batch_id,
         )
 
         try:

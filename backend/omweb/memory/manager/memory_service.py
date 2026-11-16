@@ -224,6 +224,12 @@ class MemoryService:
         ] = transport_provider
         self._has_real_transport: bool = False
 
+        # --- Batch subsystem (Phase 3) ---
+        # Constructed lazily inside ``_initialize_extraction``
+        # (only when extraction is enabled) and cleared in
+        # ``_close_extraction``. None until then.
+        self._batch_service: Optional["MemoryBatchService"] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -378,6 +384,19 @@ class MemoryService:
         etc. -- while still exposing the instance for inspection.
         """
         return self._worker
+
+    @property
+    def batch_service(self) -> Optional["MemoryBatchService"]:
+        """The batch orchestration service, or ``None``.
+
+        Available only when the extraction pipeline is up.
+        Callers (the batch HTTP router) must treat ``None`` as
+        "AI extraction is not running" and return 503 -- there
+        is no meaningful way to run a batch without the outbox,
+        scanner, and trigger router that ``_initialize_extraction``
+        wires together.
+        """
+        return self._batch_service
 
     def get_extraction_trigger(self) -> Optional[str]:
         """Return the current ``extraction_trigger`` mode or ``None``.
@@ -1381,6 +1400,22 @@ class MemoryService:
             heartbeat_interval_seconds=heartbeat_seconds,
         )
 
+        # ------------------------------------------------------------------
+        # Build the batch service (Phase 3). It composes the same
+        # outbox / scanner / trigger router the extraction pipeline
+        # already uses; the settings provider is the SAME closure
+        # used by the router, so both see the same authoritative
+        # settings at all times.
+        # ------------------------------------------------------------------
+        from omweb.memory.batch.service import MemoryBatchService
+
+        batch_service = MemoryBatchService(
+            outbox=outbox,
+            scanner=scanner,
+            trigger_router=router,
+            settings_provider=_get_ai_settings,
+        )
+
         # Commit the subsystem state ONLY after all steps succeed.
         self._outbox = outbox
         self._scanner = scanner
@@ -1388,11 +1423,12 @@ class MemoryService:
         self._status_watcher = watcher
         self._orchestrator = orchestrator
         self._worker = worker  # created but NOT started
+        self._batch_service = batch_service
 
         logger.info(
             "MemoryService: extraction pipeline initialized "
             "(outbox_db=%s, after_turn_batching=%s, "
-            "real_transport=%s, heartbeat=%ss).",
+            "real_transport=%s, heartbeat=%ss, batch_service=up).",
             db_path,
             after_turn_batching,
             self._has_real_transport,
@@ -1687,10 +1723,12 @@ class MemoryService:
                     "(non-fatal): %s", exc,
                 )
 
-        # Clear orchestrator alongside worker -- both are useless
-        # after the worker stops, and nulling them prevents any
-        # in-flight call from accidentally using a stale reference.
+        # Clear orchestrator + batch service alongside worker --
+        # all three depend on outbox + router, and leaving any
+        # of them reachable after teardown would produce
+        # "RuntimeError: outbox is not open" on the next call.
         self._orchestrator = None
+        self._batch_service = None
         self._has_real_transport = False
 
         # --- Step 2: stop the rest of the pipeline ---

@@ -19,7 +19,7 @@
 
 import Link from 'next/link';
 import { useTranslation } from 'react-i18next';
-import { ArrowRight, FolderCog } from 'lucide-react';
+import { ArrowRight, FolderCog, ListChecks } from 'lucide-react';
 
 import { useMemorySettings } from '../../../features/memory/api/queries';
 import { SettingsForm } from '../../../features/memory/components/SettingsForm';
@@ -51,6 +51,54 @@ export default function MemorySettingsPage() {
 
       {/* ============ Settings form ============ */}
       <SettingsForm />
+
+      {/* ============ Automation shortcuts ============ */}
+      <MemorySection
+        icon={ListChecks}
+        title={t('settings.sections.automation', 'Automation')}
+        subtitle={t(
+          'settings.automationSubtitle',
+          'Manage extraction jobs and batches',
+        )}
+        delay={0.15}
+      >
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <Link
+            href="/memory/jobs"
+            className={cn(
+              'group flex items-center justify-between gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-[11px]',
+              'hover:border-primary/40 hover:bg-muted/40 transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
+            )}
+          >
+            <span className="font-medium text-foreground">
+              {t('jobs.title', 'Extraction Jobs')}
+            </span>
+            <ArrowRight
+              size={11}
+              aria-hidden="true"
+              className="shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 rtl:group-hover:-translate-x-0.5"
+            />
+          </Link>
+          <Link
+            href="/memory/automation/batch"
+            className={cn(
+              'group flex items-center justify-between gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-[11px]',
+              'hover:border-primary/40 hover:bg-muted/40 transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
+            )}
+          >
+            <span className="font-medium text-foreground">
+              {t('batch.title', 'Batch Extraction')}
+            </span>
+            <ArrowRight
+              size={11}
+              aria-hidden="true"
+              className="shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 rtl:group-hover:-translate-x-0.5"
+            />
+          </Link>
+        </div>
+      </MemorySection>
 
       {/* ============ Projects with overrides ============ */}
       <MemorySection

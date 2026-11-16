@@ -107,6 +107,15 @@ import type {
   UsagePeriod,
 } from '../types';
 
+// Phase 3 additions -- same rationale as the response imports in
+// `client.ts`: grouped so the diff between Phase-1 and Phase-3
+// surface is obvious.
+import type { MemoryBatchStatus } from '../types/batch';
+import type {
+  ExtractionTrigger,
+  MemoryJobStatus,
+} from '../types/jobs';
+
 // ---------------------------------------------------------------------------
 // Parameter types
 // ---------------------------------------------------------------------------
@@ -193,6 +202,44 @@ export interface UsageTimeseriesParams {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3 (Automation) parameter types
+// ---------------------------------------------------------------------------
+//
+// Same null-vs-undefined hashing rule as the Phase-1 params: every
+// filter field is `T | null` (never optional) so that clearing a
+// filter and omitting it produce byte-identical cache keys. The
+// normalizers below enforce the same invariant.
+
+/**
+ * Parameters for the jobs list query.
+ *
+ * Mirrors `GET /api/memory/automation/jobs`'s query parameters,
+ * plus the pagination fields the query key factory hashes.
+ *
+ * `status` / `trigger_type` / `chat_id` are ALL filter slots --
+ * `null` means "no filter on this field", not "match null".
+ */
+export interface JobsListParams {
+  status: MemoryJobStatus | null;
+  chat_id: string | null;
+  trigger_type: ExtractionTrigger | null;
+  limit: number;
+  offset: number;
+}
+
+/**
+ * Parameters for the batches list query.
+ *
+ * `status: null` means "all batches, any status" (the UI's
+ * default view). A non-null value restricts to that status.
+ */
+export interface BatchesListParams {
+  status: MemoryBatchStatus | null;
+  limit: number;
+  offset: number;
+}
+
+// ---------------------------------------------------------------------------
 // Normalizers
 // ---------------------------------------------------------------------------
 //
@@ -256,6 +303,26 @@ function normalizeUsageTimeseriesParams(
   return {
     period: p.period,
     granularity: p.granularity,
+  };
+}
+
+function normalizeJobsListParams(p: JobsListParams): JobsListParams {
+  return {
+    status: p.status ?? null,
+    chat_id: p.chat_id ?? null,
+    trigger_type: p.trigger_type ?? null,
+    limit: p.limit,
+    offset: p.offset,
+  };
+}
+
+function normalizeBatchesListParams(
+  p: BatchesListParams,
+): BatchesListParams {
+  return {
+    status: p.status ?? null,
+    limit: p.limit,
+    offset: p.offset,
   };
 }
 
@@ -492,6 +559,143 @@ export const memoryKeys = {
      * logic.
      */
     all: () => [...memoryKeys.all, 'import', 'adapters'] as const,
+  },
+
+  // -------------------------------------------------------------------------
+  // Automation (Phase 3)
+  // -------------------------------------------------------------------------
+  //
+  // The Phase 3 surface lives ENTIRELY under a single `automation`
+  // namespace, mirroring the backend's mount point
+  // (`/api/memory/automation/*`). This isolation matters for two
+  // reasons:
+  //
+  //   1. **Invalidation containment.** Invalidating
+  //      `memoryKeys.automation.all()` never touches any Phase-1
+  //      cache (settings / entries / projects / usage / imports /
+  //      exports). A future "reset the automation UI" action can
+  //      be implemented as a single prefix invalidation without
+  //      risking collateral damage.
+  //
+  //   2. **Readability.** A grep for `automation.` in a
+  //      component immediately identifies it as Phase-3 code --
+  //      useful when triaging which subsystem owns a bug report.
+  //
+  // Sub-namespace layout mirrors the four backend sub-routers
+  // (`memory_automation.py`, `memory_jobs.py`,
+  // `memory_extraction.py`, `memory_batch.py`), plus a shared
+  // `extract` alias for the two manual-extraction endpoints
+  // (which do not have their own top-level URL segment --
+  // they live under `/automation/extract/*`).
+
+  automation: {
+    /**
+     * Prefix for EVERY Phase 3 query. Invalidating this clears
+     * the entire automation cache in one call -- appropriate on
+     * logout, or after the "disable AI extraction" transition
+     * (which makes every automation query return 503).
+     */
+    all: () => [...memoryKeys.all, 'automation'] as const,
+
+    // ---------------------------------------------------------------------
+    // Automation settings
+    // ---------------------------------------------------------------------
+
+    settings: {
+      /** Prefix for every automation-settings query. */
+      all: () => [...memoryKeys.automation.all(), 'settings'] as const,
+
+      /**
+       * The single AI-settings snapshot.
+       *
+       * No parameters -- the endpoint returns the current
+       * `MemoryAISettings` regardless of scope. So `get()` is
+       * both the builder AND the invalidation prefix; there is
+       * no way to cache two "current AI settings" entries.
+       */
+      get: () => [...memoryKeys.automation.settings.all(), 'get'] as const,
+    },
+
+    // ---------------------------------------------------------------------
+    // Extraction jobs
+    // ---------------------------------------------------------------------
+
+    jobs: {
+      /** Prefix for every job query (lists + details). */
+      all: () => [...memoryKeys.automation.all(), 'jobs'] as const,
+
+      /** Prefix for every job list (any params). */
+      lists: () => [...memoryKeys.automation.jobs.all(), 'list'] as const,
+
+      /**
+       * One specific jobs list (filters + page).
+       *
+       * Normalized before hashing, so `{status: null, ...}` and
+       * `{status: undefined, ...}` produce the same key.
+       * Different filter combinations are distinct cache
+       * entries -- toggling the status filter on the jobs page
+       * fetches a new page rather than refetching the previous
+       * one.
+       */
+      list: (params: JobsListParams) =>
+        [
+          ...memoryKeys.automation.jobs.lists(),
+          normalizeJobsListParams(params),
+        ] as const,
+
+      /** Prefix for every job detail query. */
+      details: () => [...memoryKeys.automation.jobs.all(), 'detail'] as const,
+
+      /**
+       * One specific job detail.
+       *
+       * `jobId` is the ONLY parameter -- the backend has no
+       * scope filter for jobs (the table is a global audit
+       * trail), so two clients asking for the same id get the
+       * same row.
+       */
+      detail: (jobId: string) =>
+        [...memoryKeys.automation.jobs.details(), jobId] as const,
+    },
+
+    // ---------------------------------------------------------------------
+    // Batch orchestration
+    // ---------------------------------------------------------------------
+
+    batch: {
+      /** Prefix for every batch query. */
+      all: () => [...memoryKeys.automation.all(), 'batch'] as const,
+
+      /** Prefix for every batch list (any params). */
+      lists: () => [...memoryKeys.automation.batch.all(), 'list'] as const,
+
+      /** One specific batches list (status filter + page). */
+      list: (params: BatchesListParams) =>
+        [
+          ...memoryKeys.automation.batch.lists(),
+          normalizeBatchesListParams(params),
+        ] as const,
+
+      /** Prefix for every batch detail query. */
+      details: () => [...memoryKeys.automation.batch.all(), 'detail'] as const,
+
+      /** One specific batch detail (with live progress). */
+      detail: (batchId: string) =>
+        [...memoryKeys.automation.batch.details(), batchId] as const,
+
+      /**
+       * The single cost estimate for a fresh batch.
+       *
+       * No parameters -- the estimate is a snapshot of the
+       * current workspace state. Every "Start Batch" dialog
+       * opening wants a fresh value, so consumers should use
+       * `staleTime: 0` (see `MEMORY_STALE_TIMES.batchEstimate`
+       * in `queries.ts`). The key is namespaced separately
+       * from details so a routine "refresh the currently-open
+       * batch" invalidation does not force a new estimate.
+       */
+      estimate: () => [...memoryKeys.automation.batch.all(), 'estimate'] as const,
+    },
   },
 } as const;
 

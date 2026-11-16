@@ -626,7 +626,7 @@ export function MemoryAISettingsSection({
                     </MemoryField>
                   </div>
                   <Link
-                    href="/memory/batch"
+                    href="/memory/automation/batch"
                     className="inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
                   >
                     {t('settings.ai.batchTitle')}
