@@ -424,39 +424,107 @@ class SqliteVecRepository:
                 return
 
             existing = self._read_existing_vec0_dimension(conn)
-            if existing == dimension:
+            existing_cosine = self._vec0_uses_cosine(conn)
+
+            # Only skip the rebuild when BOTH conditions hold:
+            # the dimension matches AND the table uses cosine.
+            # A table at the right dimension but with L2 metric
+            # would silently return wrong search results --
+            # rebuilt here even if the dimension did not change.
+            if existing == dimension and existing_cosine:
                 self._vec0_dimension = dimension
                 return
 
-            # Drop whatever exists (if anything) and recreate at the
-            # requested dimension. The vec0 table is a pure index —
-            # all data lives in ``memory_embeddings`` and can be
-            # rebuilt by the reindex path. Dropping it here does
-            # NOT lose any embedding.
+            # Rebuild the vec0 table. Two independent reasons can
+            # trigger this path:
+            #
+            #   1. Dimension drift (e.g. the user switched from
+            #      nomic 768d to qwen3 1024d).
+            #   2. Metric drift (legacy L2 table from before the
+            #      FIX-VEC0-COSINE patch).
+            #
+            # In BOTH cases, the vec0 table is a pure index -- the
+            # source of truth lives in ``memory_embeddings`` -- so
+            # a DROP + CREATE loses NO embedding. The caller is
+            # expected to follow up with ``reindex_namespace`` to
+            # repopulate (``MemoryService._build_hybrid_provider``
+            # does this automatically).
+            #
+            # [FIX-VEC0-COSINE] The CREATE statement MUST specify
+            # ``distance_metric=cosine``. sqlite-vec defaults to
+            # L2 (Euclidean distance), which is NOT what
+            # ``_search_in_namespace_sync`` assumes -- that method
+            # does ``sim = 1.0 - distance``, which is only
+            # meaningful for cosine distance (range [0, 2]).
+            #
+            # With L2, distance values are large non-negative
+            # numbers (5-50 for real embeddings), so
+            # ``sim = 1.0 - distance`` produces large NEGATIVE
+            # similarities that are then filtered out by
+            # ``min_similarity >= 0``. The symptom is SILENT:
+            # every search returns zero results despite the
+            # index being populated.
+            #
+            # This was the actual root cause behind the "short
+            # query works, full sentence doesn't" report: short
+            # queries produce compact vectors whose L2 distance
+            # to stored vectors is small enough that
+            # ``1.0 - distance`` stays positive; full-sentence
+            # queries spread across more dimensions, so their
+            # L2 distance exceeds 1.0 and the similarity is
+            # filtered out.
             try:
                 with conn:
                     conn.execute("DROP TABLE IF EXISTS memory_vectors")
                     conn.execute(
                         "CREATE VIRTUAL TABLE memory_vectors USING vec0("
                         f"memory_id TEXT PRIMARY KEY, "
-                        f"embedding FLOAT[{dimension}]"
+                        f"embedding FLOAT[{dimension}] "
+                        f"distance_metric=cosine"
                         ")"
                     )
             except sqlite3.OperationalError as exc:
                 raise Vec0UnavailableError(
                     f"Could not create the memory_vectors table at "
-                    f"dimension {dimension}: {exc}",
+                    f"dimension {dimension} with cosine metric: {exc}",
                     context={"dimension": dimension},
                     cause=exc,
                 ) from exc
 
             self._vec0_dimension = dimension
             logger.info(
-                "memory_vectors rebuilt at dimension %d "
-                "(previous dimension: %s)",
+                "memory_vectors rebuilt at dimension %d with cosine "
+                "metric (previous: dim=%s, cosine=%s)",
                 dimension,
                 existing if existing else "none",
+                existing_cosine,
             )
+
+    @staticmethod
+    def _vec0_uses_cosine(conn: sqlite3.Connection) -> bool:
+        """Return True when the existing vec0 table uses cosine distance.
+
+        Reads ``sqlite_master.sql`` for the ``memory_vectors`` table
+        and checks whether the CREATE statement included
+        ``distance_metric=cosine``. Returns False when the table does
+        not exist OR was created without that clause (i.e., L2
+        default).
+
+        This detection is what allows the schema migration from
+        L2 (buggy) to cosine (correct) to happen automatically on
+        the first ``ensure_vec0_table`` call after the fix is
+        deployed -- no manual DROP required from the operator.
+        """
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='memory_vectors'"
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        if row is None or not row["sql"]:
+            return False
+        return "distance_metric=cosine" in row["sql"]
 
     @staticmethod
     def _read_existing_vec0_dimension(

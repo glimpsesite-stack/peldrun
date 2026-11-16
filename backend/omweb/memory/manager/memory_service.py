@@ -64,6 +64,7 @@ Design invariants
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -252,6 +253,28 @@ class MemoryService:
         self._memory_repository: Optional["SqliteMemoryRepository"] = None
         self._embedding_active_model_key: Optional[str] = None
 
+        # --- Hybrid retrieval (Phase 5) ---
+        #
+        # ``_vec_provider`` wraps the vector backend with a
+        # long-lived embedder and the hydration adapter. It
+        # implements the ``search`` surface the hybrid wrapper
+        # consumes. Closed in ``_close_embedding`` alongside the
+        # vec repository.
+        #
+        # ``_hybrid_provider`` wraps ``lifecycle.provider`` (the
+        # FTS provider) and ``_vec_provider``. When both are
+        # available, ``provider`` (see the property below)
+        # returns the hybrid; otherwise it falls through to the
+        # raw FTS provider.
+        #
+        # Both fields are ``None`` until ``_initialize_embedding``
+        # succeeds AND dimensions are resolvable. Any failure in
+        # that chain leaves them at ``None`` -- the memory
+        # subsystem continues to serve retrieval via FTS exactly
+        # as it did before hybrid was introduced.
+        self._vec_provider: Optional["SqliteVecProvider"] = None
+        self._hybrid_provider: Optional["HybridMemoryProvider"] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -376,7 +399,21 @@ class MemoryService:
         is a ``NullMemoryProvider`` -- every write raises
         ``MemoryUnavailableError`` and every read returns empty,
         which is exactly the semantics DISABLED mode promises.
+
+        [PHASE 5] When the hybrid pipeline is fully initialized
+        AND dimensions are known, this returns a
+        ``HybridMemoryProvider`` that fuses FTS + vector search
+        on every ``search``/``search_ranked`` call. Otherwise it
+        returns the raw FTS provider.
+
+        Both providers implement the full ``MemoryProvider``
+        contract. Every WRITE method on the hybrid delegates to
+        FTS internally -- only the read path gains semantic
+        recall, so switching between FTS-only and hybrid does
+        not change write semantics.
         """
+        if self._hybrid_provider is not None:
+            return self._hybrid_provider
         return self._lifecycle.provider
 
     # ------------------------------------------------------------------
@@ -715,11 +752,17 @@ class MemoryService:
         # context. The try/except here is defense in depth against
         # a bug in the pipeline itself.
         try:
+            # [PHASE 5] Use ``self.provider`` rather than the raw
+            # ``self._lifecycle.provider`` so the dispatcher's
+            # auto-retrieval observes hybrid recall when available
+            # (falls through to FTS otherwise). Consistent with
+            # the /api/memory/search endpoint which also calls
+            # ``service.provider``.
             context = await build_memory_context(
                 query=query,
                 scope_refs=scope_refs,
                 route=route,
-                provider=self._lifecycle.provider,
+                provider=self.provider,
                 settings=settings,
             )
         except Exception as exc:
@@ -1690,8 +1733,13 @@ class MemoryService:
         )
 
         def _write_pipeline_provider() -> "MemoryWritePipeline":
+            # [PHASE 5] Use ``self.provider`` so the write pipeline
+            # observes the SAME provider the rest of the service
+            # uses. When hybrid is built, this returns the hybrid
+            # wrapper (which delegates writes to FTS transparently
+            # via __getattr__); otherwise the raw FTS provider.
             return MemoryWritePipeline(
-                port=self._lifecycle.provider,
+                port=self.provider,
                 settings=self._lifecycle.settings,
             )
 
@@ -2221,7 +2269,13 @@ class MemoryService:
                 pass
             return
 
-        # ---- 8. Commit state ------------------------------
+        # ---- 8. Commit worker + repos FIRST --------------
+        #
+        # Commit these BEFORE attempting the hybrid build so
+        # that a hybrid failure (e.g. LM Studio unreachable at
+        # boot) does NOT prevent the worker from writing
+        # embeddings. Hybrid is a retrieval enhancement -- it
+        # must never disable the write path.
         self._embedding_outbox = embedding_outbox
         self._embedding_resolver = resolver
         self._embedding_worker = worker
@@ -2229,15 +2283,51 @@ class MemoryService:
         self._memory_repository = mem_repo
         self._embedding_active_model_key = model_key.strip()
 
+        # ---- 9. Attempt hybrid retrieval build -----------
+        #
+        # Best-effort. See ``_build_hybrid_provider`` for the
+        # full decision matrix. Success sets
+        # ``self._hybrid_provider`` so the ``provider`` property
+        # starts returning the hybrid wrapper; failure leaves
+        # both fields at ``None`` and the property falls through
+        # to the raw FTS provider.
+        #
+        # The extra try/except here is defense in depth against
+        # a broken import or a subtle bug -- ``_build_hybrid_provider``
+        # already has its own try/except, but we do not want a
+        # hypothetical exception there to abort the WHOLE
+        # ``_initialize_embedding`` after the worker has been
+        # committed.
+        try:
+            await self._build_hybrid_provider(
+                resolver=resolver,
+                model_key=model_key.strip(),
+                mem_repo=mem_repo,
+                vec_repo=vec_repo,
+                db_path=db_path,
+            )
+        except Exception as hybrid_err:
+            logger.warning(
+                "MemoryService: hybrid build raised unexpectedly "
+                "(non-fatal; retrieval will remain FTS-only): %s",
+                hybrid_err,
+                exc_info=True,
+            )
+            self._hybrid_provider = None
+            self._vec_provider = None
+
         logger.info(
             "MemoryService: embedding pipeline initialized "
             "(model_key=%r, models_in_snapshot=%d, outbox_db=%s, "
-            "worker_id=%s). Worker will start when "
+            "worker_id=%s, hybrid=%s). Worker will start when "
             "start_embedding_worker() is called.",
             self._embedding_active_model_key,
             len(resolver),
             db_path,
             worker.worker_id,
+            "enabled"
+            if self._hybrid_provider is not None
+            else "disabled",
         )
 
     async def _close_extraction(self) -> None:
@@ -2322,6 +2412,20 @@ class MemoryService:
         share the same DB file (WAL permits concurrent access), but
         nothing else owns references to these specific instances.
         """
+        # ---- 0. Hybrid + vec provider --------------------
+        #
+        # Null the hybrid wrapper BEFORE tearing down the rest
+        # of the chain. The hybrid holds references to BOTH
+        # ``self._lifecycle.provider`` (FTS) and
+        # ``self._vec_provider``. If a concurrent caller reads
+        # ``self.provider`` mid-teardown, they would otherwise
+        # see a hybrid whose vec side is already closing. Nulling
+        # the wrapper first makes the caller fall through to the
+        # FTS provider, which remains open until lifecycle
+        # shutdown runs (after this method).
+        self._hybrid_provider = None
+        self._vec_provider = None
+
         # ---- 1. Worker ------------------------------------
         worker = self._embedding_worker
         self._embedding_worker = None
@@ -2376,6 +2480,361 @@ class MemoryService:
                     "MemoryService: memory repository close "
                     "failed (non-fatal): %s", exc,
                 )
+
+    # ------------------------------------------------------------------
+    # Internal: hybrid retrieval build (Phase 5)
+    # ------------------------------------------------------------------
+
+    async def _build_hybrid_provider(
+        self,
+        *,
+        resolver: "EmbeddingModelResolver",
+        model_key: str,
+        mem_repo: "SqliteMemoryRepository",
+        vec_repo: "SqliteVecRepository",
+        db_path: Path,
+    ) -> bool:
+        """Build the hybrid retrieval pipeline. Returns True on success.
+
+        Steps (each may fail -- the whole method is best-effort):
+
+          1. Resolve the model in the resolver (should never fail
+             given ``_initialize_embedding`` already validated
+             that the model_key is in the snapshot, but a
+             race-free resolver can still raise).
+          2. Determine the vector dimension:
+             a. ``resolved.known_dimensions`` (from metadata),
+             b. ``vec_repo.vec0_dimension`` (in-session cache --
+                set if the worker already ran this process),
+             c. read from disk via ``sqlite_master`` (persistent
+                cache across boots),
+             d. probe the model endpoint (slow, only on first
+                boot with embedding enabled).
+          3. Build the embedder, hydration adapter,
+             ``SqliteVecProvider``, and ``HybridMemoryProvider``.
+          4. Commit ``self._vec_provider`` and
+             ``self._hybrid_provider``.
+
+        On any failure: log a warning, null out both fields (so
+        the ``provider`` property falls through to FTS), and
+        return ``False``. The caller (``_initialize_embedding``)
+        continues normally -- the worker still writes embeddings;
+        only the read path stays on FTS until the operator fixes
+        the underlying issue and restarts.
+
+        See also
+        --------
+        * ``HybridMemoryProvider`` (``omweb.memory.manager.hybrid_provider``)
+        * ``SqliteVecProvider``   (``peldrun.memory.retrieval.vector_search``)
+        * ``SqliteVectorHydration`` (``omweb.memory.storage.vector_hydration``)
+        """
+        # ---- 1. Resolve the model in the resolver ------------
+        try:
+            resolved = resolver.resolve(model_key)
+        except Exception as exc:
+            logger.warning(
+                "MemoryService._build_hybrid_provider: resolver "
+                "cannot resolve model_key %r: %s",
+                model_key,
+                exc,
+            )
+            return False
+
+        # ---- 2. Determine dimensions -------------------------
+        dimensions = await self._resolve_embedding_dimensions(
+            resolved=resolved,
+            vec_repo=vec_repo,
+            db_path=db_path,
+        )
+        if dimensions is None or dimensions <= 0:
+            logger.info(
+                "MemoryService: hybrid retrieval DISABLED -- "
+                "vector dimensions for model %r could not be "
+                "resolved (probe failed or model unreachable). "
+                "Retrieval will remain FTS-only until the next "
+                "restart succeeds in probing. The embedding "
+                "worker still runs and writes vectors -- this "
+                "only affects the READ path.",
+                model_key,
+            )
+            return False
+
+        # ---- 2b. Ensure vec0 schema + auto-reindex -----------
+        #
+        # Two things happen here:
+        #
+        #   1. ``ensure_vec0_table(dimensions)`` guarantees the
+        #      table is at the correct dimension AND uses cosine
+        #      metric. If either check fails -- dimension drift
+        #      after a model switch, or a legacy L2 table from
+        #      before the FIX-VEC0-COSINE patch -- the table is
+        #      dropped and recreated. This is safe: the source
+        #      of truth is ``memory_embeddings``, and vec0 is a
+        #      pure index.
+        #
+        #   2. If the vec0 table is EMPTY after the ensure call
+        #      (the state right after a fresh rebuild, OR on a
+        #      brand-new deployment), reindex from
+        #      ``memory_embeddings`` for the ACTIVE model. This
+        #      is what turns an empty index back into a
+        #      populated one WITHOUT requiring the operator to
+        #      click Reindex manually. Typical cost: <1s for
+        #      thousands of rows.
+        #
+        # Both steps are best-effort: a failure here logs a
+        # warning but does NOT abort the hybrid build (search
+        # would degrade to FTS-only, which is still better than
+        # no search at all).
+        try:
+            await vec_repo.ensure_vec0_table(dimensions)
+            existing_count = await vec_repo.count_vec0_rows()
+            if existing_count == 0:
+                logger.info(
+                    "MemoryService: vec0 is empty after schema "
+                    "check (fresh build or cosine migration); "
+                    "reindexing from memory_embeddings for "
+                    "model %r/%r at dim %d.",
+                    resolved.model_id,
+                    resolved.model_version,
+                    dimensions,
+                )
+                indexed = await vec_repo.reindex_namespace(
+                    model_id=resolved.model_id,
+                    model_version=resolved.model_version,
+                    dimension=dimensions,
+                )
+                logger.info(
+                    "MemoryService: auto-reindex wrote %d "
+                    "vector(s) into vec0.",
+                    indexed,
+                )
+            else:
+                logger.debug(
+                    "MemoryService: vec0 already populated "
+                    "(%d rows); skipping auto-reindex.",
+                    existing_count,
+                )
+        except Exception as reindex_err:
+            logger.warning(
+                "MemoryService: vec0 schema check / auto-reindex "
+                "failed (search will be FTS-only until manual "
+                "reindex): %s",
+                reindex_err,
+                exc_info=True,
+            )
+
+        # ---- 3. Build the collaborator chain -----------------
+        embedder = None
+        try:
+            from omweb.memory.storage.vector_hydration import (
+                SqliteVectorHydration,
+            )
+            from peldrun.memory.retrieval.vector_search import (
+                SqliteVecProvider,
+            )
+            from peldrun.memory.embeddings.provider import (
+                OpenAICompatEmbeddingProvider,
+            )
+            from omweb.memory.manager.hybrid_provider import (
+                HybridMemoryProvider,
+            )
+
+            # Hydration: converts vector-search ids into full
+            # MemoryEntry instances, filtering by scope. Reuses
+            # the SAME SqliteMemoryRepository instance the
+            # embedding worker holds -- no second connection
+            # stack, no duplicated schema setup.
+            hydration = SqliteVectorHydration(mem_repo)
+
+            # Long-lived embedder for the READ path. The worker
+            # creates its own short-lived embedder per job (see
+            # its invariant #1); this one lives for the lifetime
+            # of the pipeline and is closed in
+            # ``_close_embedding`` when ``_vec_provider`` is
+            # nulled.
+            embedder = OpenAICompatEmbeddingProvider(
+                base_url=resolved.base_url,
+                api_key=resolved.api_key,
+                model_id=resolved.model_id,
+                model_version=resolved.model_version,
+                dimensions=dimensions,
+                extra_headers=resolved.extra_headers or None,
+            )
+
+            # Vector search provider: composes embedder +
+            # backend + hydration. Implements the ``search``
+            # surface HybridMemoryProvider consumes.
+            vec_provider = SqliteVecProvider(
+                embedding_provider=embedder,
+                vector_backend=vec_repo,
+                hydration_backend=hydration,
+                model_id=resolved.model_id,
+                model_version=resolved.model_version,
+                dimensions=dimensions,
+            )
+
+            # Hybrid: wraps the FTS provider (from lifecycle)
+            # and the vector provider. Delegates ALL non-search
+            # methods to FTS via ``__getattr__``.
+            hybrid = HybridMemoryProvider(
+                fts_provider=self._lifecycle.provider,
+                vec_provider=vec_provider,
+            )
+
+            # ---- 4. Commit state -------------------------
+            self._vec_provider = vec_provider
+            self._hybrid_provider = hybrid
+
+            logger.info(
+                "MemoryService: hybrid retrieval ENABLED "
+                "(dimensions=%d, model=%r, rrf_k=%d). Search "
+                "will fuse FTS (BM25) with vector similarity.",
+                dimensions,
+                resolved.model_id,
+                hybrid.rrf_k,
+            )
+            return True
+
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: hybrid provider construction "
+                "failed -- retrieval will remain FTS-only: %s",
+                exc,
+                exc_info=True,
+            )
+            self._hybrid_provider = None
+            self._vec_provider = None
+            # Best-effort cleanup of the orphaned embedder
+            # (its HTTP client should be released explicitly;
+            # relying on GC is fragile when the process keeps
+            # running for a long time).
+            if embedder is not None:
+                try:
+                    await embedder.close()
+                except Exception:
+                    pass
+            return False
+
+    async def _resolve_embedding_dimensions(
+        self,
+        *,
+        resolved,
+        vec_repo: "SqliteVecRepository",
+        db_path: Path,
+    ) -> Optional[int]:
+        """Return the vector dimension for the active model, or ``None``.
+
+        Resolution order (fastest / cheapest first):
+
+          1. ``resolved.known_dimensions`` -- persisted in
+             ``models_metadata.json`` by a previous successful
+             probe (future optimisation -- currently ``None``
+             because the worker does not persist, but the
+             plumbing is there).
+          2. ``vec_repo.vec0_dimension`` -- in-session cache. Set
+             if the worker already ran in THIS process (e.g.
+             ``reload_settings`` triggered a rebuild after the
+             worker processed jobs).
+          3. Read from disk via ``sqlite_master`` -- survives
+             process restarts. Skips the probe entirely on
+             subsequent boots after the table has been created.
+          4. Probe the model endpoint (HTTP call). SLOW path,
+             used only on truly first boot with embedding enabled
+             AND no prior vec0 table.
+
+        Every step is wrapped in its own try/except -- a failure
+        in one step falls through to the next, never aborts the
+        chain with an exception.
+        """
+        if resolved.known_dimensions is not None:
+            return resolved.known_dimensions
+
+        try:
+            if vec_repo.vec0_dimension > 0:
+                return vec_repo.vec0_dimension
+        except Exception:
+            pass
+
+        try:
+            existing = await asyncio.to_thread(
+                self._probe_existing_dimension, db_path,
+            )
+            if existing > 0:
+                return existing
+        except Exception:
+            pass
+
+        if resolved.base_url is None:
+            logger.debug(
+                "MemoryService._resolve_embedding_dimensions: no "
+                "base_url for %r; cannot probe.",
+                resolved.model_id,
+            )
+            return None
+
+        from peldrun.memory.embeddings.provider import (
+            OpenAICompatEmbeddingProvider,
+        )
+        try:
+            probed = await OpenAICompatEmbeddingProvider.probe_dimensions(
+                base_url=resolved.base_url,
+                api_key=resolved.api_key,
+                model_id=resolved.model_id,
+            )
+            if isinstance(probed, int) and probed > 0:
+                logger.info(
+                    "MemoryService: probed %r dimensions = %d "
+                    "(first boot with embedding enabled).",
+                    resolved.model_id,
+                    probed,
+                )
+                return probed
+            logger.warning(
+                "MemoryService: probe_dimensions for %r returned "
+                "an invalid value: %r",
+                resolved.model_id,
+                probed,
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: probe_dimensions for %r failed: %s",
+                resolved.model_id,
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def _probe_existing_dimension(db_path: Path) -> int:
+        """Read the vec0 dimension from disk, if the table exists.
+
+        Opens a short-lived connection, reads ``sqlite_master.sql``
+        for ``memory_vectors``, parses ``FLOAT[N]``. Does NOT load
+        the sqlite-vec extension (not needed -- ``sqlite_master``
+        is plain SQLite).
+
+        Returns 0 when the file, the table, or the parse fails.
+        Callers (``_resolve_embedding_dimensions``) treat 0 as
+        "no cached dimension" and move to the probe step.
+        """
+        import sqlite3
+
+        from omweb.memory.storage.vector_repository import (
+            SqliteVecRepository,
+        )
+
+        if not db_path.exists():
+            return 0
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            try:
+                return SqliteVecRepository._read_existing_vec0_dimension(
+                    conn
+                )
+            finally:
+                conn.close()
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Internal: usage recording
