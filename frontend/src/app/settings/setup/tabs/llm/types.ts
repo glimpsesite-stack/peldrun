@@ -321,6 +321,29 @@ export interface ModelItemCardProps {
    * `_merge_metadata_entries` then preserves across rescans.
    */
   onToggleMemory?: () => void;
+  /**
+   * Optional handler for the "Set as Embedding" button.
+   *
+   * Rendered by `ModelItemCard` ONLY when ALL of these hold:
+   *   1. the handler is provided (this prop is not undefined);
+   *   2. `capabilities.isEmbedding === true` (the provider scan
+   *      auto-detected the model as an embedding model);
+   *   3. `capabilities.embeddingSource !== "manual"` (the user has
+   *      NOT yet confirmed the designation — otherwise the button
+   *      is replaced by the "Selected" indicator).
+   *
+   * When clicked, the handler writes
+   * `capability_sources.is_embedding = "manual"` while keeping
+   * `capabilities.is_embedding = true`. The backend's
+   * `_merge_metadata_entries` rule 2 then preserves this manual
+   * designation across every future Scan Models run.
+   *
+   * Distinct from `onToggleMemory` — memory is user-authored and
+   * applies to ANY chat model, while embedding confirmation only
+   * makes sense for models the provider already reports as
+   * embedding-capable.
+   */
+  onSetEmbedding?: () => void;
   onRemove: () => void;
   onOpenInfo: () => void;
 }

@@ -18,6 +18,7 @@ import { showToast } from "@/components/ui/ToastNotification";
 import {
   inferModelCapabilities,
   getLocalMetadataVault,
+  toggleModelEmbedding,
   toggleModelMemory,
 } from "@/lib/modelMetadata";
 import { ModelItemCard } from "./ModelItemCard";
@@ -114,6 +115,32 @@ export function LocalEnginesTab({
 
   const handleToggleMemory = (modelId: string) => {
     toggleModelMemory(modelId);
+    _bumpMemoryRefresh((n) => n + 1);
+  };
+
+  // ------------------------------------------------------------------
+  // Embedding confirmation handler.
+  //
+  // The "Embedding" button in `ModelItemCard` only appears when a
+  // model is auto-detected as embedding (isEmbedding === true) but
+  // the user has NOT yet confirmed it (embeddingSource !== "manual").
+  // Clicking the button is a one-way operation: it promotes the
+  // auto-detected source to "manual" while keeping isEmbedding true.
+  //
+  // `forceState = true` is passed deliberately — the button means
+  // "confirm", not "toggle". If the user could accidentally un-set
+  // it here, the very next Scan Models run would silently re-mark
+  // the model as embedding via the provider scan, and the button
+  // would reappear as if nothing happened. Making the action
+  // one-way is the only way to keep the "Selected" badge meaningful.
+  //
+  // The local re-render bumper (`_bumpMemoryRefresh`) is reused
+  // because its ONLY job is to force the parent component to
+  // re-read the vault — the naming is a legacy holdover, the effect
+  // is identical.
+  // ------------------------------------------------------------------
+  const handleSetEmbedding = (modelId: string) => {
+    toggleModelEmbedding(modelId, true);
     _bumpMemoryRefresh((n) => n + 1);
   };
 
@@ -406,6 +433,7 @@ export function LocalEnginesTab({
                     onSetPrimary={() => assignDetectedModel(m, "primary")}
                     onSetVision={() => assignDetectedModel(m, "vision")}
                     onToggleMemory={() => handleToggleMemory(m)}
+                    onSetEmbedding={() => handleSetEmbedding(m)}
                     onRemove={() => handleRemoveLMModel(m)}
                     onOpenInfo={() => onOpenModelInfo(m)}
                   />
@@ -646,6 +674,7 @@ export function LocalEnginesTab({
                       );
                     }}
                     onToggleMemory={() => handleToggleMemory(m)}
+                    onSetEmbedding={() => handleSetEmbedding(m)}
                     onRemove={() => handleRemoveOllamaModel(m)}
                     onOpenInfo={() => onOpenModelInfo(m)}
                   />

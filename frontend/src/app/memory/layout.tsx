@@ -107,7 +107,7 @@ export default function MemoryLayout({
 
   // ---- Post-mount: full layout ----------------------------------
   return (
-    <div className="relative h-full w-full overflow-y-auto bg-custom text-foreground font-sans flex flex-col">
+    <div className="relative h-full w-full overflow-y-auto bg-setbg text-foreground font-sans flex flex-col">
       {/* ============ Ambient background ============ */}
       <div
         className="pointer-events-none absolute inset-0 overflow-hidden"

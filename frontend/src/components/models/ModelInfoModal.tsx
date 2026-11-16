@@ -1334,12 +1334,12 @@ function MemoryBox({ caps, onToggle }: MemoryBoxProps) {
           <div className="min-w-0">
             <div className="flex items-center gap-1.5 flex-wrap">
               <span className="text-xs font-semibold text-foreground">
-                Memory Model (RAG / Vector)
+                Memory Model
               </span>
               <StatusBadge variant="on-manual" />
             </div>
             <span className="text-[10px] text-cyan-600 dark:text-cyan-400 font-semibold block mt-0.5">
-              ✓ Designated by you for RAG / vector memory
+              ✓ Selecting a model for memory extraction
             </span>
             <span
               className="text-[9px] text-muted-foreground block truncate"
@@ -1370,12 +1370,12 @@ function MemoryBox({ caps, onToggle }: MemoryBoxProps) {
         <div className="min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-xs font-semibold text-foreground">
-              Memory Model (RAG / Vector)
+              Memory Model
             </span>
             <StatusBadge variant="unknown" />
           </div>
           <span className="text-[10px] text-muted-foreground block mt-0.5">
-            Not designated — mark this model to route RAG / vector-memory
+            Not designated — mark this model to for memory extraction
             traffic to it
           </span>
         </div>

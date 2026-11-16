@@ -12,6 +12,7 @@ import {
   Square,
   Brain,
   Eye,
+  Hash,
   Wrench,
   Save,
   Plus,
@@ -23,8 +24,8 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   fetchModelFacts,
-  getLocalMetadataVault,
   inferModelCapabilities,
+  toggleModelEmbedding,
 } from "@/lib/modelMetadata";
 import type { ModelFacts, CapabilitySource } from "@/lib/modelMetadata";
 
@@ -391,17 +392,41 @@ export function SavedModelsManagerModal({
               const isDefault = defaultModel === modelId;
 
               const facts = modelFactsMap[modelId];
+              // Pass `null` (not `{}`) as `explicitMeta` so
+              // `inferModelCapabilities` looks up the vault via
+              // `lookupModelMetadata`, honoring composite keys
+              // (`provider::model`, `provider::connection::model`)
+              // and every capability field written by
+              // `toggleModelMemory` / `toggleModelEmbedding`.
+              //
+              // The previous `{}` was a truthy value, so the reader
+              // took the "explicit metadata" branch and never
+              // consulted the vault — which is why `isMemory` had to
+              // be read separately and `isEmbedding` was invisible.
               const inferredCaps =
-                inferModelCapabilities(modelId, {}, providerId) || {};
+                inferModelCapabilities(modelId, null, providerId) || {};
 
-              // Memory is user-authored and lives ONLY in the local
-              // vault (never in `facts` — the catalog has no provider
-              // counterpart for it). Reading it here directly means
-              // the badge reflects the latest toggle without waiting
-              // for the catalog overlay.
-              const isMemory =
-                getLocalMetadataVault()[modelId]?.capabilities?.memory ===
-                true;
+              // Memory and Embedding are user-authored and live in
+              // the local vault. Reading them via
+              // `inferModelCapabilities` guarantees the badge
+              // reflects the latest toggle, including the `manual`
+              // source that suppresses the false-positive auto-
+              // detection.
+              const isMemory = inferredCaps.isMemory;
+
+              const isEmbedding = inferredCaps.isEmbedding;
+              const embeddingSource = inferredCaps.embeddingSource;
+
+              // Confirm button — visible only when the model was
+              // auto-detected as embedding and NOT yet confirmed by
+              // the user. Same rule as `ModelItemCard`.
+              const showEmbeddingConfirmButton =
+                isEmbedding && embeddingSource !== "manual";
+
+              // "Selected" badge — visible only after confirmation.
+              // Coexists with the base Embedding badge.
+              const showEmbeddingSelectedBadge =
+                isEmbedding && embeddingSource === "manual";
 
               let isVision = inferredCaps.isVision;
               let isTools = inferredCaps.isTools;
@@ -483,24 +508,77 @@ export function SavedModelsManagerModal({
                       onClick={(e) => e.stopPropagation()}
                     >
                       {isSelected && (
-                        <button
-                          type="button"
-                          onClick={() => setDefaultModel(modelId)}
-                          className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all ${
-                            isDefault
-                              ? "bg-emerald-500 text-white shadow-2xs"
-                              : "bg-muted text-muted-foreground hover:text-foreground"
-                          }`}
-                          title="Set as Default Model for this Provider"
-                        >
-                          {isDefault ? "Default" : "Set Default"}
-                        </button>
+                        <>
+                          {/* Confirm-as-embedding button. Same
+                              visibility rule as `ModelItemCard`:
+                              shown only when the provider flagged
+                              the model as embedding AND the user has
+                              not yet confirmed it. Clicking writes
+                              `capability_sources.is_embedding =
+                              "manual"` via `toggleModelEmbedding`,
+                              then bumps `metadataVersion` so the
+                              badge row re-reads the vault on the
+                              next paint. */}
+                          {showEmbeddingConfirmButton && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                toggleModelEmbedding(modelId, true);
+                                setMetadataVersion((v) => v + 1);
+                              }}
+                              className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all flex items-center gap-1 bg-orange-500/15 text-orange-700 dark:text-orange-400 hover:bg-orange-500/25"
+                              title="Confirm this model as an embedding model. The confirmation survives every future Scan Models run."
+                            >
+                              <Hash size={10} />
+                              <span>Embedding</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setDefaultModel(modelId)}
+                            className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all ${
+                              isDefault
+                                ? "bg-emerald-500 text-white shadow-2xs"
+                                : "bg-muted text-muted-foreground hover:text-foreground"
+                            }`}
+                            title="Set as Default Model for this Provider"
+                          >
+                            {isDefault ? "Default" : "Set Default"}
+                          </button>
+                        </>
                       )}
                     </div>
                   </div>
 
                   {/* Capability badges — same rendering rules as discovery modal */}
                   <div className="flex flex-wrap items-center gap-1.5 pl-6 font-sans">
+                    {/* Base Embedding badge — informational, carries
+                        the source in the tooltip. Rendered for any
+                        embedding model regardless of confirmation
+                        status. */}
+                    {isEmbedding && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-orange-800 text-slate-100"
+                        title={`Embedding — ${sourceHint(
+                          embeddingSource
+                        )}. Not for chat; use /embeddings (RAG, semantic search).`}
+                      >
+                        <Hash size={10} /> Embedding
+                      </span>
+                    )}
+                    {/* "Selected" badge — appears ONLY after the user
+                        has confirmed via the action-row button. The
+                        confirmation (`source = "manual"`) is preserved
+                        across rescans by the backend's
+                        `_merge_metadata_entries` rule 2. */}
+                    {showEmbeddingSelectedBadge && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/25"
+                        title="You have confirmed this model as an embedding model. The designation survives every future rescan."
+                      >
+                        <Check size={10} /> Selected
+                      </span>
+                    )}
                     {isMemory && (
                       <span
                         className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20"

@@ -83,16 +83,30 @@ export interface InferredCapabilities {
    * rescans via `_merge_metadata_entries` rule 2.
    */
   isMemory: boolean;
+  /**
+   * Embedding designation — the effective flag as seen by the UI.
+   *
+   * Sources, in priority order:
+   *   1. `capabilities.is_embedding` (canonical, carries a source in
+   *      `capability_sources.is_embedding`).
+   *   2. `is_embedding` top-level (legacy entries written before the
+   *      capability-source migration).
+   *
+   * Never inferred from a name pattern at render time.
+   */
+  isEmbedding: boolean;
 
   visionState: "supported" | "unsupported" | "unknown";
   toolsState: "supported" | "unsupported" | "unknown";
   reasoningState: "supported" | "unsupported" | "unknown";
   memoryState: "supported" | "unsupported" | "unknown";
+  embeddingState: "supported" | "unsupported" | "unknown";
 
   visionSource: CapabilitySource;
   toolsSource: CapabilitySource;
   reasoningSource: CapabilitySource;
   memorySource: CapabilitySource;
+  embeddingSource: CapabilitySource;
 
   reasoningMode: string;
   reasoningEffortLevels: string[];
@@ -264,7 +278,7 @@ export async function fetchModelFacts(
 
 function toggleBooleanCapability(
   modelKey: string,
-  field: "vision" | "trained_for_tool_use" | "memory",
+  field: "vision" | "trained_for_tool_use" | "memory" | "is_embedding",
   forceState?: boolean
 ): boolean {
   const vault = getLocalMetadataVault();
@@ -275,6 +289,8 @@ function toggleBooleanCapability(
       ? currentCaps.isVision
       : field === "memory"
       ? currentCaps.isMemory
+      : field === "is_embedding"
+      ? currentCaps.isEmbedding
       : currentCaps.isTools;
   const nextState = typeof forceState === "boolean" ? forceState : !currentBool;
 
@@ -292,6 +308,13 @@ function toggleBooleanCapability(
       ...currentSources,
       [field]: "manual",
     },
+    // Keep the legacy top-level `is_embedding` field in sync with
+    // `capabilities.is_embedding` for the embedding case. The
+    // backend performs the same sync server-side via
+    // `_merge_metadata_entries`; doing it locally means the UI
+    // reflects the change immediately, without a round-trip. For
+    // vision / tools / memory the spread is a no-op.
+    ...(field === "is_embedding" ? { is_embedding: nextState } : {}),
   } as unknown as ModelMetadata;
 
   saveLocalMetadataVault({ [modelKey]: updatedMeta }, true);
@@ -332,6 +355,34 @@ export function toggleModelMemory(
   if (typeof window === "undefined") return false;
   if (!modelKey || !modelKey.trim()) return false;
   return toggleBooleanCapability(modelKey, "memory", forceState);
+}
+
+/**
+ * Set the "embedding" designation for a model.
+ *
+ * Called exclusively by the Embedding button in `ModelItemCard`,
+ * which passes an EXPLICIT `forceState`:
+ *
+ *   * `forceState = true`  — the model is auto-detected as
+ *     embedding (`source !== "manual"`); clicking confirms it.
+ *     Writes `capabilities.is_embedding = true` with
+ *     `capability_sources.is_embedding = "manual"` and syncs the
+ *     legacy top-level field.
+ *
+ *   * `forceState = false` — the model is already confirmed
+ *     (`source === "manual"`); clicking removes the designation
+ *     entirely. The badge disappears on the next render.
+ *
+ * `capability_sources.is_embedding = "manual"` survives every future
+ * Scan Models run via `_merge_metadata_entries` rule 2 (backend).
+ */
+export function toggleModelEmbedding(
+  modelKey: string | null | undefined,
+  forceState?: boolean
+): boolean {
+  if (typeof window === "undefined") return false;
+  if (!modelKey || !modelKey.trim()) return false;
+  return toggleBooleanCapability(modelKey, "is_embedding", forceState);
 }
 
 export function toggleModelReasoning(
@@ -452,7 +503,8 @@ export async function fetchServerMetadata(): Promise<
             localSources.vision === "manual" ||
             localSources.trained_for_tool_use === "manual" ||
             localSources.reasoning === "manual" ||
-            localSources.memory === "manual";
+            localSources.memory === "manual" ||
+            localSources.is_embedding === "manual";
           if (hasManualOverride) {
             merged[key] = {
               ...(merged[key] || {}),
@@ -543,14 +595,17 @@ export function inferModelCapabilities(
       isTools: false,
       isReasoning: false,
       isMemory: false,
+      isEmbedding: false,
       visionState: "unknown",
       toolsState: "unknown",
       reasoningState: "unknown",
       memoryState: "unknown",
+      embeddingState: "unknown",
       visionSource: "unknown",
       toolsSource: "unknown",
       reasoningSource: "unknown",
       memorySource: "unknown",
+      embeddingSource: "unknown",
       reasoningMode: "unreported",
       reasoningEffortLevels: [],
       reasoningDefaultEffort: null,
@@ -631,6 +686,28 @@ export function inferModelCapabilities(
     typeof meta.capabilities?.memory === "boolean"
       ? meta.capabilities.memory
       : undefined;
+  // Embedding flag can live in two places:
+  //   - `capabilities.is_embedding` (canonical, carries a source);
+  //   - `is_embedding` top-level (legacy, set by older scans).
+  //
+  // Capability layer wins when present. The `unknown` widening is
+  // required because `ModelCapabilities` has no index signature, so
+  // a direct cast to `Record<string, unknown>` is rejected by
+  // TypeScript (TS2352) — routing through `unknown` is the standard
+  // widening pattern already used throughout this file.
+  let embeddingBool: boolean | undefined;
+  const capsRaw = meta.capabilities as unknown as
+    | Record<string, unknown>
+    | undefined;
+  if (capsRaw && typeof capsRaw.is_embedding === "boolean") {
+    embeddingBool = capsRaw.is_embedding;
+  } else {
+    const legacyTopLevel = (meta as unknown as { is_embedding?: unknown })
+      .is_embedding;
+    if (typeof legacyTopLevel === "boolean") {
+      embeddingBool = legacyTopLevel;
+    }
+  }
 
   const asState = (
     v: boolean | undefined
@@ -641,6 +718,7 @@ export function inferModelCapabilities(
   const toolsState = asState(toolsBool);
   const reasoningState = asState(reasoningBool);
   const memoryState = asState(memoryBool);
+  const embeddingState = asState(embeddingBool);
 
   // ------------------------------------------------------------------
   // Reasoning mode resolution.
@@ -665,6 +743,7 @@ export function inferModelCapabilities(
   const isVision = visionBool === true;
   const isTools = toolsBool === true;
   const isMemory = memoryBool === true;
+  const isEmbedding = embeddingBool === true;
 
   // ------------------------------------------------------------------
   // Source annotations — only meaningful when the value is known.
@@ -681,6 +760,10 @@ export function inferModelCapabilities(
   const toolsSource = asSource(toolsBool, explicitSources.trained_for_tool_use);
   const reasoningSource = asSource(reasoningBool, explicitSources.reasoning);
   const memorySource = asSource(memoryBool, explicitSources.memory);
+  const embeddingSource = asSource(
+    embeddingBool,
+    explicitSources.is_embedding
+  );
 
   // ------------------------------------------------------------------
   // Reasoning sub-config (from metadata only).
@@ -739,14 +822,17 @@ export function inferModelCapabilities(
     isTools,
     isReasoning,
     isMemory,
+    isEmbedding,
     visionState,
     toolsState,
     reasoningState,
     memoryState,
+    embeddingState,
     visionSource,
     toolsSource,
     reasoningSource,
     memorySource,
+    embeddingSource,
     reasoningMode,
     reasoningEffortLevels: effortLevels,
     reasoningDefaultEffort: defaultEffort,

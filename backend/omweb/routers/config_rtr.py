@@ -268,7 +268,20 @@ def save_metadata_cache(new_meta: dict) -> None:
 # Merge-aware persistence (used by /fetch-models)
 # ---------------------------------------------------------------------------
 
-_CAPABILITY_FIELDS = ("vision", "trained_for_tool_use", "reasoning", "memory")
+_CAPABILITY_FIELDS = (
+    "vision",
+    "trained_for_tool_use",
+    "reasoning",
+    "memory",
+    # User-confirmed embedding designation. Auto-detected values are
+    # written with source "provider_live" during Scan Models; the
+    # frontend's "Embedding" button promotes the source to "manual",
+    # which `_merge_metadata_entries` rule 2 then preserves across
+    # every future rescan. The `/embedding-models` endpoint reads the
+    # effective flag to answer "which models are embedding-capable
+    # for this provider".
+    "is_embedding",
+)
 
 _SCALAR_FIELDS = (
     "max_context_length",
@@ -315,6 +328,17 @@ def _merge_metadata_entries(existing: dict, new: dict) -> dict:
     if isinstance(new.get("quantization"), dict):
         result["quantization"] = new["quantization"]
 
+    # provider_id — provenance of the last discovery that touched this
+    # entry. Preserve the existing value unless the new entry carries
+    # a non-empty replacement. Explicitly rejecting empty strings
+    # ensures a legacy entry (written before discovery started tagging
+    # provider_id) keeps whatever value it already has, and a scan
+    # without a provider context cannot silently erase a previously
+    # assigned value.
+    new_pid = new.get("provider_id")
+    if isinstance(new_pid, str) and new_pid.strip():
+        result["provider_id"] = new_pid.strip()
+
     # Defensive extraction: a hand-edited or legacy entry may store
     # ``capabilities`` as a list (e.g. LM Studio's raw ["tool_use"])
     # instead of the dict of booleans our parser produces. dict(list)
@@ -360,6 +384,17 @@ def _merge_metadata_entries(existing: dict, new: dict) -> dict:
 
     result["capabilities"] = existing_caps
     result["capability_sources"] = existing_sources
+
+    # Keep the legacy top-level ``is_embedding`` field in sync with
+    # ``capabilities.is_embedding``. The top-level field predates the
+    # capability-source migration and is still consumed by
+    # ``/memory-models`` output, by older entries, and by the
+    # ``/embedding-models`` endpoint's fallback path. Both
+    # representations MUST agree so that a manual confirmation in the
+    # UI is immediately visible to every consumer, including a
+    # subsequent ``/embedding-models`` query.
+    if "is_embedding" in existing_caps:
+        result["is_embedding"] = bool(existing_caps["is_embedding"])
 
     # capability_details: same manual-preservation rule.
     existing_details = dict(result.get("capability_details") or {})
@@ -669,7 +704,9 @@ async def _discover_via_adapter(
             pass
 
 
-def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
+def _parse_adapter_model_list(
+    raw_list: list, provider_id: str = ""
+) -> Tuple[list, dict]:
     """
     Normalize the heterogeneous model list shapes returned by native
     adapters into the ``models_metadata.json`` format.
@@ -764,6 +801,14 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
             "display_name": (
                 item.get("display_name") or mid
             ),
+            # Provenance of the discovery. Used by
+            # `_rebuild_embedding_models_index` to attribute
+            # embedding-capable models to their provider even when
+            # they were discovered but not selected for `savedModels`.
+            # Empty string when the caller has no provider context
+            # (legacy probes); `_merge_metadata_entries` ignores empty
+            # strings so this cannot erase an existing value.
+            "provider_id": (provider_id or "").strip(),
         }
 
         # Context / output limits — multiple field names across adapters.
@@ -892,9 +937,28 @@ def _parse_adapter_model_list(raw_list: list) -> Tuple[list, dict]:
         # The embedding flag takes precedence over the provider's own
         # ``type`` value — guarantees the frontend badge is shown even
         # when a provider mislabels an embedding model as "llm".
+        #
+        # Mirror the flag into ``capabilities.is_embedding`` so that:
+        #   * the UI has a single authoritative source to read
+        #     (`inferModelCapabilities` reads `capabilities` first);
+        #   * a manual confirmation (source = "manual") can override
+        #     the auto-detected value via rule 2 in
+        #     `_merge_metadata_entries`;
+        #   * the value survives the merge-aware persistence path,
+        #     whereas the legacy top-level field alone does not
+        #     participate in the rule-based merge.
+        #
+        # `setdefault` (rather than direct assignment) preserves any
+        # capabilities dict already prepared by the provider so that
+        # the block below can still add vision / tools / reasoning
+        # without losing the embedding entry.
         if is_embedding:
             entry["is_embedding"] = True
             entry["type"] = "embeddings"
+            entry.setdefault("capabilities", {})["is_embedding"] = True
+            entry.setdefault("capability_sources", {})[
+                "is_embedding"
+            ] = "provider_live"
 
         # ------------------------------------------------------------------
         # [FIX-LMSTUDIO-CAPS-V2] Extract the provider's capabilities.
@@ -1260,6 +1324,334 @@ async def get_memory_models_endpoint():
     return {"ok": True, "models": models}
 
 
+# ---------------------------------------------------------------------------
+# Embedding-models discovery
+# ---------------------------------------------------------------------------
+
+
+def _read_models_vault() -> Dict[str, Any]:
+    """Read ``models_vault.json`` from the shared storage root.
+
+    The vault is the single source of truth for which provider owns
+    a given model (``provider_package_models`` / ``cloud_vault`` /
+    ``custom_endpoints`` / ``lmstudio_vault`` / ``ollama_vault``).
+    Returns ``{}`` on any failure — callers degrade gracefully to a
+    ``None`` provider id instead of raising.
+    """
+    vault_path = STORAGE_ROOT / "models_vault.json"
+    if not vault_path.exists():
+        return {}
+    try:
+        with open(vault_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        logger.debug("Failed to read models_vault.json: %s", exc)
+        return {}
+
+
+def _resolve_provider_for_model(
+    model_key: str, vault: Dict[str, Any]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve ``(provider_id, provider_name)`` for a model key.
+
+    Resolution order (first match wins):
+
+      1. Composite key form (``"provider::model"``) — authoritative
+         because it was written explicitly by the caller.
+      2. ``provider_package_models`` — Store -> Providers packages.
+      3. ``cloud_vault`` — cloud provider connections.
+      4. ``custom_endpoints`` — user-defined OpenAI-compatible
+         endpoints.
+      5. ``lmstudio_vault`` / ``ollama_vault`` — local providers.
+
+    Returns ``(None, None)`` when the model cannot be attributed to
+    any provider. This is possible when the model was saved to
+    metadata manually without ever being attached to a provider.
+    Callers MUST treat this as "provider unknown", not "no provider".
+    """
+    if not isinstance(model_key, str) or not model_key:
+        return None, None
+
+    # (1) Composite key form.
+    if "::" in model_key:
+        parts = model_key.split("::")
+        if len(parts) >= 2 and parts[0]:
+            return parts[0], parts[0]
+
+    # (2) Provider packages.
+    pkg_models = vault.get("provider_package_models") or {}
+    if isinstance(pkg_models, dict):
+        for pkg_id, entry in pkg_models.items():
+            if not isinstance(entry, dict):
+                continue
+            saved = entry.get("savedModels") or []
+            if not isinstance(saved, list):
+                saved = []
+            if model_key in saved or entry.get("model") == model_key:
+                # Prefer the human-readable connection name when
+                # present so the UI can render "GigaChat Personal"
+                # instead of the raw package id.
+                conns = vault.get("provider_connections") or []
+                display = pkg_id
+                if isinstance(conns, list):
+                    for c in conns:
+                        if (
+                            isinstance(c, dict)
+                            and c.get("provider_package_id") == pkg_id
+                            and isinstance(c.get("name"), str)
+                            and c["name"].strip()
+                        ):
+                            display = c["name"].strip()
+                            break
+                return pkg_id, display
+
+    # (3) Cloud providers.
+    clouds = vault.get("cloud_vault") or []
+    if isinstance(clouds, list):
+        for cp in clouds:
+            if not isinstance(cp, dict):
+                continue
+            cp_saved = cp.get("savedModels") or []
+            if not isinstance(cp_saved, list):
+                cp_saved = []
+            if model_key in cp_saved or cp.get("model") == model_key:
+                cp_id = cp.get("id") or cp.get("providerId")
+                if cp_id:
+                    cp_name = cp.get("name") or cp_id
+                    return str(cp_id), str(cp_name)
+
+    # (4) Custom endpoints.
+    customs = vault.get("custom_endpoints") or []
+    if isinstance(customs, list):
+        for ce in customs:
+            if not isinstance(ce, dict):
+                continue
+            ce_saved = ce.get("savedModels") or []
+            if not isinstance(ce_saved, list):
+                ce_saved = []
+            if model_key in ce_saved or ce.get("defaultModel") == model_key:
+                ce_id = ce.get("providerId") or ce.get("id")
+                if ce_id:
+                    ce_name = ce.get("name") or ce_id
+                    return str(ce_id), str(ce_name)
+
+    # (5) Local providers.
+    lm = vault.get("lmstudio_vault")
+    if isinstance(lm, dict):
+        lm_saved = lm.get("savedModels") or []
+        if not isinstance(lm_saved, list):
+            lm_saved = []
+        if model_key in lm_saved or lm.get("model") == model_key:
+            return "lmstudio", "LM Studio"
+
+    ol = vault.get("ollama_vault")
+    if isinstance(ol, dict):
+        ol_saved = ol.get("savedModels") or []
+        if not isinstance(ol_saved, list):
+            ol_saved = []
+        if model_key in ol_saved or ol.get("model") == model_key:
+            return "ollama", "Ollama"
+
+    return None, None
+
+
+def _rebuild_embedding_models_index(
+    vault: Dict[str, Any],
+) -> Dict[str, list]:
+    """Build a per-provider index of embedding-capable models.
+
+    Walks ``models_metadata.json`` and emits ``{provider_id: [model_id]}``
+    for every entry whose effective ``is_embedding`` flag is True.
+
+    Provenance resolution, in priority order:
+
+      1. ``entry["provider_id"]`` — written by discovery since the
+         ``provider_id`` change. Authoritative: works even for
+         discovered-but-not-selected models (i.e. models that never
+         entered any provider's ``savedModels`` array).
+      2. ``_resolve_provider_for_model(key, vault)`` — legacy fallback
+         based on ``savedModels`` lookups. Only finds models that were
+         previously saved.
+
+    Entries that cannot be attributed to a provider are silently
+    skipped — there is no meaningful provider to file them under, and
+    surfacing a synthetic "unknown" bucket would mislead callers.
+
+    The result is sorted per-provider and de-duplicated within each
+    provider's list so the persisted vault file is stable across
+    rescans.
+    """
+    metadata: Dict[str, Any] = {}
+    if METADATA_CACHE.exists():
+        try:
+            with open(METADATA_CACHE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except Exception:
+            return {}
+
+    index: Dict[str, set] = {}
+
+    for key, entry in metadata.items():
+        if not isinstance(entry, dict):
+            continue
+
+        caps = entry.get("capabilities")
+        is_embedding = (
+            (isinstance(caps, dict) and caps.get("is_embedding") is True)
+            or entry.get("is_embedding") is True
+        )
+        if not is_embedding:
+            continue
+
+        pid = entry.get("provider_id")
+        if not isinstance(pid, str) or not pid.strip():
+            # Fallback for entries written before discovery started
+            # tagging provider_id. Only finds saved models.
+            resolved_pid, _ = _resolve_provider_for_model(key, vault)
+            pid = resolved_pid
+        if not isinstance(pid, str) or not pid.strip():
+            continue
+
+        # Prefer the explicit `key` field, then the trailing segment
+        # of a composite key, then the raw key.
+        model_id = entry.get("key")
+        if not isinstance(model_id, str) or not model_id:
+            model_id = key.split("::")[-1] if "::" in key else key
+        if not isinstance(model_id, str) or not model_id:
+            continue
+
+        index.setdefault(pid.strip(), set()).add(model_id)
+
+    return {pid: sorted(models) for pid, models in sorted(index.items())}
+
+
+@router.get("/embedding-models")
+async def get_embedding_models_endpoint():
+    """Return models designated as embedding models.
+
+    A model qualifies when its **effective** ``is_embedding`` flag is
+    ``True``. Effective flag resolution, in priority order:
+
+      1. ``capabilities.is_embedding`` when present — the canonical
+         field, carries a provenance in
+         ``capability_sources.is_embedding`` and is preserved across
+         rescans when the source is ``manual``.
+      2. ``is_embedding`` at the top level — legacy field populated
+         by older scans before the capability-source migration. Used
+         only when the capability layer has no entry for it.
+
+    The response shape is designed so a downstream caller can build
+    an embedding router without ever reading the vault::
+
+        {
+          "ok": true,
+          "models": [
+            {
+              "key": "text-embedding-3-small",
+              "model_id": "text-embedding-3-small",
+              "provider_id": "openai",
+              "provider_name": "OpenAI",
+              "display_name": "text-embedding-3-small",
+              "type": "embeddings",
+              "source": "manual" | "provider_live" | ...
+            },
+            ...
+          ]
+        }
+
+    ``provider_id`` and ``provider_name`` are ``null`` when the
+    model cannot be attributed to any provider in
+    ``models_vault.json``. Callers MUST treat that as "provider
+    unknown", not "no provider".
+    """
+    metadata: Dict[str, Any] = {}
+    if METADATA_CACHE.exists():
+        try:
+            with open(METADATA_CACHE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                metadata = loaded
+        except Exception as exc:
+            logger.warning("Failed to read metadata cache: %s", exc)
+
+    vault = _read_models_vault()
+
+    models: list = []
+    for key, entry in metadata.items():
+        if not isinstance(entry, dict):
+            continue
+
+        caps = entry.get("capabilities")
+        if not isinstance(caps, dict):
+            caps = {}
+
+        sources = entry.get("capability_sources")
+        if not isinstance(sources, dict):
+            sources = {}
+
+        # Effective embedding flag, mirroring the frontend's
+        # `inferModelCapabilities` resolution order exactly.
+        if "is_embedding" in caps:
+            is_embedding = caps["is_embedding"] is True
+            source = sources.get("is_embedding")
+        else:
+            # Legacy entry — read the top-level field, which was
+            # always populated by the provider scan, so treat it as
+            # a live fact from the provider.
+            is_embedding = entry.get("is_embedding") is True
+            source = "provider_live" if is_embedding else None
+
+        if not is_embedding:
+            continue
+
+        if not isinstance(source, str) or not source:
+            # Defensive default: an entry marked embedding without a
+            # source is, by definition, manually authored — no
+            # automated writer produces such an entry.
+            source = "manual"
+
+        provider_id, provider_name = _resolve_provider_for_model(key, vault)
+
+        # Extract the bare model id. A composite key has the form
+        # "provider::model" or "provider::conn::model"; the last
+        # segment is the model id. The metadata entry itself may
+        # carry a canonical `key` field, which takes precedence.
+        model_id = entry.get("key") or key.split("::")[-1]
+
+        models.append(
+            {
+                "key": key,
+                "model_id": model_id,
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "display_name": entry.get("display_name") or model_id,
+                "type": entry.get("type") or "embeddings",
+                "source": source,
+            }
+        )
+
+    # Deterministic ordering keeps diffing and UI rendering stable.
+    models.sort(
+        key=lambda m: (m.get("provider_id") or "", m.get("model_id") or "")
+    )
+
+    return {
+        "ok": True,
+        # Flat list (backward compatible with existing callers).
+        "models": models,
+        # Per-provider view — matches the `embedding_models` section
+        # persisted in `models_vault.json`. Consumers that need "what
+        # embedding models belong to provider X" can read either
+        # source; both are guaranteed identical because they are
+        # produced by the same `_rebuild_embedding_models_index`
+        # helper.
+        "by_provider": _rebuild_embedding_models_index(vault),
+    }
+
+
 @router.get("")
 @router.get("/")
 async def get_config():
@@ -1349,9 +1741,29 @@ async def update_models_metadata(payload: UpdateMetadataRequest):
     """
     try:
         save_metadata_cache_merge(payload.metadata)
-        return {"ok": True, "message": "Metadata persisted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    # Rebuild the per-provider embedding index in `models_vault.json`
+    # so it stays consistent with the metadata just written. This is
+    # the write path used by `toggleModelEmbedding` (frontend) — the
+    # ONLY place a manual `capability_sources.is_embedding = "manual"`
+    # reaches disk.
+    #
+    # The rebuild is best-effort: a failure here must not fail the
+    # metadata save that already succeeded.
+    try:
+        vault = load_vault_from_disk()
+        vault["embedding_models"] = _rebuild_embedding_models_index(vault)
+        save_vault_to_disk(vault)
+    except Exception as idx_err:
+        logger.debug(
+            "[update_models_metadata] embedding index rebuild failed "
+            "(non-fatal): %s",
+            idx_err,
+        )
+
+    return {"ok": True, "message": "Metadata persisted successfully"}
 
 
 class TestLLMRequest(BaseModel):
@@ -1594,10 +2006,25 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
                 "display_name": m.get("display_name")
                 or m.get("displayName")
                 or mid_str,
+                # Provenance of the discovery. `p_id` is captured
+                # from the enclosing `_fetch_available_models_impl`
+                # scope. Same rationale as in
+                # `_parse_adapter_model_list`.
+                "provider_id": (p_id or "").strip(),
             }
             if is_embedding:
                 entry["is_embedding"] = True
                 entry["type"] = "embeddings"
+                # Mirror into the capability layer — same rationale
+                # as in `_parse_adapter_model_list`. Keeps the two
+                # discovery branches (native adapter, generic HTTP)
+                # producing byte-identical metadata for embeddings.
+                entry.setdefault("capabilities", {})[
+                    "is_embedding"
+                ] = True
+                entry.setdefault("capability_sources", {})[
+                    "is_embedding"
+                ] = "provider_live"
             if ctx:
                 entry["max_context_length"] = int(ctx)
             if out:
@@ -1693,7 +2120,9 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
     if native_id:
         adapter_models = await _discover_via_adapter(native_id, base, api_key)
         if adapter_models:
-            adapter_ids, adapter_meta = _parse_adapter_model_list(adapter_models)
+            adapter_ids, adapter_meta = _parse_adapter_model_list(
+                adapter_models, p_id
+            )
             if adapter_ids:
                 model_ids = adapter_ids
                 metadata = adapter_meta
@@ -1749,7 +2178,7 @@ async def _fetch_available_models_impl(payload: FetchModelsRequest):
                 )
                 if _ext_models:
                     _ext_ids, _ext_meta = _parse_adapter_model_list(
-                        _ext_models
+                        _ext_models, p_id
                     )
                     if _ext_ids:
                         model_ids = _ext_ids
@@ -2117,6 +2546,24 @@ DEFAULT_VAULT = {
         "savedModels": [],
     },
     "scanned_models": [],
+    # Per-provider index of embedding-capable models.
+    #
+    # Rebuilt automatically by `_rebuild_embedding_models_index` on
+    # every write to `models_vault.json` or `models_metadata.json`.
+    # Structure::
+    #
+    #     {
+    #       "<provider_id>": ["model-a", "model-b"],
+    #       "cloudflare-ai": ["@cf/pfnet/plamo-embedding-1b"],
+    #       ...
+    #     }
+    #
+    # This is intentionally a PROJECTION over `models_metadata.json`:
+    # the source of truth for "is this model embedding-capable" is
+    # always the metadata entry (which carries `capabilities.is_embedding`
+    # and `provider_id`). This key is a denormalized convenience for
+    # downstream callers who prefer a per-provider view.
+    "embedding_models": {},
 }
 
 
@@ -2198,6 +2645,13 @@ async def save_models_vault(payload: dict = Body(...)):
     ]:
         if key in payload:
             current[key] = payload[key]
+    # Rebuild the per-provider embedding index after every write.
+    # The index is a projection of `models_metadata.json` filtered by
+    # each provider's ownership, so any change to `savedModels` /
+    # `provider_connections` / `provider_package_models` may change
+    # which embeddings are reachable — this call keeps the persisted
+    # view in sync without requiring a separate client round-trip.
+    current["embedding_models"] = _rebuild_embedding_models_index(current)
     save_vault_to_disk(current)
     return {"status": "success", "vault": current}
 
@@ -2461,6 +2915,9 @@ def save_provider_connection(connection: dict) -> dict:
         existing.append(conn)
 
     vault["provider_connections"] = existing
+    # Rebuild the embedding index — a package connection may add or
+    # remove ownership of previously-discovered models.
+    vault["embedding_models"] = _rebuild_embedding_models_index(vault)
     save_vault_to_disk(vault)
     return conn
 
@@ -2488,6 +2945,9 @@ def delete_provider_connection(connection_id: str) -> bool:
         return False
 
     vault["provider_connections"] = filtered
+    # Rebuild the embedding index — the deleted connection may have
+    # been the sole owner of some embedding-capable model.
+    vault["embedding_models"] = _rebuild_embedding_models_index(vault)
     save_vault_to_disk(vault)
     return True
 

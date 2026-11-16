@@ -38,12 +38,12 @@ const ACCENT_STYLES: Record<
   MemorySectionAccent,
   { line: string; icon: string }
 > = {
-  primary: { line: 'via-primary/60', icon: 'text-primary' },
-  emerald: { line: 'via-emerald-500/60', icon: 'text-emerald-500' },
-  rose: { line: 'via-rose-500/60', icon: 'text-rose-500' },
-  amber: { line: 'via-amber-500/60', icon: 'text-amber-500' },
-  cyan: { line: 'via-cyan-500/60', icon: 'text-cyan-500' },
-  purple: { line: 'via-purple-500/60', icon: 'text-purple-500' },
+  primary: { line: 'via-primary/10', icon: 'text-primary' },
+  emerald: { line: 'via-emerald-500/10', icon: 'text-emerald-500' },
+  rose: { line: 'via-rose-500/10', icon: 'text-rose-500' },
+  amber: { line: 'via-amber-500/10', icon: 'text-amber-500' },
+  cyan: { line: 'via-cyan-500/10', icon: 'text-cyan-500' },
+  purple: { line: 'via-purple-500/10', icon: 'text-purple-500' },
 };
 
 export interface MemorySectionProps {
@@ -85,7 +85,7 @@ export function MemorySection({
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5, delay, ease: EASE_OUT_EXPO }}
       className={cn(
-        'relative rounded-md bg-gigbg shadow-sm',
+        'relative rounded-md bg-muted shadow-sm',
         hasHeader ? 'space-y-5 p-5' : 'p-5',
         className,
       )}

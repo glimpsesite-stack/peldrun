@@ -258,6 +258,38 @@ export function ModelDiscoveryModal({
     });
   };
 
+  // ------------------------------------------------------------------
+  // Confirm an auto-detected embedding designation.
+  //
+  // One-way operation: flips the source from "provider_live" to
+  // "manual" while keeping capabilities.is_embedding = true. There is
+  // no companion "unconfirm" path in the UI — the base Embedding
+  // badge reflects the FACT that the provider reports the model as
+  // embedding, and the "Selected" badge reflects the USER'S
+  // confirmation. Removing one without the other would be ambiguous,
+  // so the flow is intentionally one-way.
+  //
+  // The manual source survives every future Scan Models run via
+  // `_merge_metadata_entries` rule 2 on the backend.
+  // ------------------------------------------------------------------
+  const confirmEmbeddingCapability = (modelId: string) => {
+    setModelsMetadata((prev) => {
+      const next = { ...prev };
+      const entry = { ...(next[modelId] || {}) };
+      const caps = { ...(entry.capabilities || {}) };
+      const sources = { ...(entry.capability_sources || {}) };
+      caps.is_embedding = true;
+      sources.is_embedding = "manual";
+      entry.capabilities = caps;
+      entry.capability_sources = sources;
+      // Keep the legacy top-level field in sync so the render guard
+      // below sees the confirmation on the very next paint.
+      entry.is_embedding = true;
+      next[modelId] = entry;
+      return next;
+    });
+  };
+
   const handleSave = () => {
     const list = Array.from(selectedModels);
     onSaveModels({
@@ -466,15 +498,29 @@ export function ModelDiscoveryModal({
               const isDefault = defaultModel === modelId;
               const meta = modelsMetadata[modelId] || {};
 
-              // Embedding detection — mirrors the backend flag added in
-              // `_parse_adapter_model_list` and `_parse_model_list`.
-              // The name-based fallback is defensive: entries persisted
-              // before the backend started writing `is_embedding` will
-              // still render the badge correctly.
+              // Embedding detection — same priority order used by
+              // `inferModelCapabilities`:
+              //   1. capabilities.is_embedding (canonical).
+              //   2. legacy top-level is_embedding.
+              //   3. type === "embeddings" (provider metadata).
+              //   4. name pattern (defensive fallback for entries
+              //      that predate the flag).
+              //
+              // The confirm button is shown ONLY when the source is
+              // not already "manual" (i.e. the user has not yet
+              // confirmed). Once confirmed, the button is replaced
+              // by the "Selected" badge in the badges row.
               const isEmbedding =
+                meta.capabilities?.is_embedding === true ||
                 meta.is_embedding === true ||
                 meta.type === "embeddings" ||
                 modelId.toLowerCase().includes("embedding");
+              const embeddingSource: string | undefined =
+                meta.capability_sources?.is_embedding;
+              const showEmbeddingConfirmButton =
+                isEmbedding && embeddingSource !== "manual";
+              const showEmbeddingSelectedBadge =
+                isEmbedding && embeddingSource === "manual";
 
               // Manual "memory" designation — user-authored flag,
               // distinct from the auto-detected `isEmbedding`. Set via
@@ -620,6 +666,19 @@ export function ModelDiscoveryModal({
                             <Archive size={10} />
                             <span>{isMemory ? "Memory" : "Mark Memory"}</span>
                           </button>
+                          {showEmbeddingConfirmButton && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                confirmEmbeddingCapability(modelId)
+                              }
+                              className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-sans font-semibold transition-all flex items-center gap-1 bg-orange-500/15 text-orange-700 dark:text-orange-400 hover:bg-orange-500/25"
+                              title="Confirm this model as an embedding model. The confirmation survives every future Scan Models run."
+                            >
+                              <Hash size={10} />
+                              <span>Embedding</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => {
@@ -659,6 +718,14 @@ export function ModelDiscoveryModal({
                         title="Embedding model — not for chat. Use the /embeddings endpoint (RAG, semantic search). Cannot be set as the default chat model."
                       >
                         <Hash size={10} /> Embedding
+                      </span>
+                    )}
+                    {showEmbeddingSelectedBadge && (
+                      <span
+                        className="flex items-center gap-1 text-[9.5px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/25"
+                        title="You have confirmed this model as an embedding model. The designation survives every future rescan."
+                      >
+                        <Check size={10} /> Selected
                       </span>
                     )}
                     {isMemory && (

@@ -6,7 +6,9 @@ import { motion } from "framer-motion";
 import {
   Archive,
   Brain,
+  Check,
   Eye,
+  Hash,
   HelpCircle,
   Info,
   Trash2,
@@ -29,6 +31,8 @@ function sourceLabel(source: string): string {
   switch (source) {
     case "manual":
       return "Set manually by the user";
+    case "provider_live":
+      return "Detected from the provider's live scan";
     case "model_metadata":
       return "Declared in model metadata";
     case "provider_catalog":
@@ -85,6 +89,7 @@ export function ModelItemCard({
   onSetPrimary,
   onSetVision,
   onToggleMemory,
+  onSetEmbedding,
   onRemove,
   onOpenInfo,
 }: ModelItemCardProps) {
@@ -93,7 +98,31 @@ export function ModelItemCard({
     capabilities.isVision ||
     capabilities.isTools ||
     capabilities.isReasoning ||
-    capabilities.isMemory === true;
+    capabilities.isMemory === true ||
+    // Embedding counts as a capability so the badges row renders even
+    // when the model has no other capability. Without this, a pure
+    // embedding model would hide its own Embedding / Selected badges.
+    capabilities.isEmbedding === true;
+
+  // Embedding button visibility rules:
+  //   * isEmbedding === true     — the provider scan flagged this as
+  //                                an embedding model.
+  //   * source !== "manual"      — the user has not yet confirmed it.
+  //                                After confirmation, the button is
+  //                                replaced by the "Selected" badge
+  //                                (see the badges row below).
+  //   * onSetEmbedding provided  — the caller opted into the feature.
+  const showEmbeddingButton =
+    Boolean(onSetEmbedding) &&
+    capabilities.isEmbedding === true &&
+    capabilities.embeddingSource !== "manual";
+
+  // The "Selected" badge appears after confirmation. It coexists
+  // with the base Embedding badge (which remains the source of truth
+  // for the fact that the model IS embedding-capable).
+  const showEmbeddingSelectedBadge =
+    capabilities.isEmbedding === true &&
+    capabilities.embeddingSource === "manual";
   const hasAnyInfoBadge =
     Boolean(capabilities.paramsDisplay) ||
     Boolean(capabilities.quantDisplay) ||
@@ -210,6 +239,26 @@ export function ModelItemCard({
             </button>
           )}
 
+          {/* Embedding confirm button — appears ONLY on models the
+              provider flagged as embedding (isEmbedding === true) and
+              that the user has NOT yet confirmed
+              (embeddingSource !== "manual"). Clicking writes
+              capability_sources.is_embedding = "manual" while keeping
+              capabilities.is_embedding = true, which the backend's
+              _merge_metadata_entries preserves across every rescan.
+              Once confirmed, this button disappears and the "Selected"
+              badge appears in the badges row. */}
+          {showEmbeddingButton && (
+            <button
+              type="button"
+              onClick={onSetEmbedding}
+              className="px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-orange-500/15 text-orange-700 dark:text-orange-400 hover:bg-orange-500/25 cursor-pointer transition-all hover:scale-105"
+              title="Confirm this model as an embedding model. The confirmation is preserved across every future Scan Models run."
+            >
+              Embedding
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onRemove}
@@ -226,6 +275,37 @@ export function ModelItemCard({
           the source, so the user knows whether to trust it. */}
       {(hasAnyCapability || hasAnyInfoBadge) && (
         <div className="flex flex-wrap items-center gap-1 font-sans">
+          {/* Base Embedding badge — informational, mirrors the
+              DiscoveryModal style (orange-800 filled). Shown only when
+              the effective embedding flag is true. Carries the
+              provenance in the tooltip so the user knows whether it
+              came from the provider scan or their own confirmation. */}
+          {capabilities.isEmbedding === true && (
+            <span
+              className="flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-sm bg-orange-800 text-slate-100"
+              title={sourceLabel(
+                capabilities.embeddingSource || "provider_live"
+              )}
+            >
+              <Hash size={9} /> Embedding
+            </span>
+          )}
+
+          {/* "Selected" badge — NEW, appears only after the user has
+              confirmed the embedding designation via the action-row
+              button. Rendered NEXT TO the base Embedding badge so the
+              user sees both facts at once: "this model is embedding"
+              AND "I have confirmed it". The confirmation (source =
+              "manual") is preserved across rescans by the backend. */}
+          {showEmbeddingSelectedBadge && (
+            <span
+              className="flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-sm bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/25"
+              title="You have confirmed this model as an embedding model. The designation survives every future rescan."
+            >
+              <Check size={9} /> Selected
+            </span>
+          )}
+
           {capabilities.isMemory === true && (
             <span
               className="flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded-sm bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 border border-cyan-500/20"
