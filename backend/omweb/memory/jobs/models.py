@@ -628,11 +628,385 @@ class MemoryJob(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Embedding job type (Phase 4)
+# ---------------------------------------------------------------------------
+#
+# Phase 4's vector search requires every "embedding-eligible" memory
+# to have a precomputed vector under the currently-active model.
+# This is the durable job row that tracks that work:
+#
+#   * enqueued when a memory is created/updated and the active
+#     embedding settings designate a model,
+#   * drained by ``EmbeddingWorker`` (Task 4.4.2), which embeds the
+#     memory's content and persists the vector,
+#   * SEPARATE from ``memory_jobs`` because the two have different
+#     lifecycle requirements:
+#
+#       memory_jobs             memory_embedding_jobs
+#       ------------            ---------------------
+#       FIFO per-chat           Independent per-memory
+#       Cursor advanced on      No cursor
+#         completion
+#       Lease-based heartbeat   Timeout-based stale recovery
+#       Chat-scoped (chat_id,   Memory-scoped (memory_id only)
+#         scope, snapshot)
+#
+# Mixing them into one table would force every embedding job to
+# carry fields (chat_id, scope_type, scope_id, snapshot hash,
+# cursor snapshot) that embeddings do not use -- and would force
+# the embedding worker to satisfy cursor invariants that are
+# meaningless for its task. Two tables, two models, two queues.
+
+
+class EmbeddingJobStatus(str, Enum):
+    """Lifecycle status of a ``memory_embedding_jobs`` row.
+
+    States mirror ``MemoryJobStatus`` for API/UI consistency, but
+    the transitions differ:
+
+        pending       -> queued, awaiting a worker.
+        running       -> claimed by a worker. Short-lived
+                         (embeddings complete in seconds), so no
+                         heartbeat -- only a timeout-based
+                         ``recover_stale_running``.
+        retry_pending -> scheduled for retry at ``next_retry_at``.
+        completed     -> embedding persisted (or already present
+                         and up-to-date).
+        failed        -> exceeded max_attempts, or hit a permanent
+                         error (auth, model not offered,
+                         dimension mismatch).
+        cancelled     -> operator action (no Phase-4 UI, defined
+                         for completeness and future cleanup).
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    RETRY_PENDING = "retry_pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True for states the job can never transition out of."""
+        return self in (
+            EmbeddingJobStatus.COMPLETED,
+            EmbeddingJobStatus.FAILED,
+            EmbeddingJobStatus.CANCELLED,
+        )
+
+    @property
+    def is_claimable(self) -> bool:
+        """True for states a worker can pick up in ``claim_next()``."""
+        return self in (
+            EmbeddingJobStatus.PENDING,
+            EmbeddingJobStatus.RETRY_PENDING,
+        )
+
+
+class EmbeddingJob(BaseModel):
+    """One row of ``memory_embedding_jobs`` -- one unit of embedding work.
+
+    1:1 mirror of the SQL schema created by ``_apply_v4`` in
+    ``migrations.py``, minus one deliberate omission: this model
+    does NOT carry an ``idempotency_key`` column. Deduplication is
+    enforced by a **UNIQUE index** on the natural key
+    ``(memory_id, model_id, model_version, content_version)`` --
+    which the ``EmbeddingOutbox`` creates on open (see its
+    docstring). The two representations are equivalent for
+    deduplication, and the natural-key form has the additional
+    benefit of expressing the business intent directly in the
+    index definition.
+
+    Minimum sufficient fields
+    -------------------------
+    The job stores only what is needed to:
+
+      1. identify which memory to embed (``memory_id``);
+      2. identify which vector space to produce (``model_id`` +
+         ``model_version``);
+      3. track retries (``attempts``, ``error_*``);
+      4. record cost (``cost_nano_usd``).
+
+    The memory's **content** is NOT stored here. The worker
+    re-reads it from ``memories`` on every attempt. Rationale:
+
+      * An embedding must reflect the memory's CURRENT content.
+        A cached copy at enqueue time would produce a vector for
+        stale text if the user edited the memory between enqueue
+        and processing.
+
+      * Storage duplication is avoided. The content already lives
+        in ``memories.content``; storing it twice in the same
+        database grows the file by the size of the memory corpus
+        for zero benefit.
+
+    No ``scope_type`` / ``scope_id``
+    ---------------------------------
+    Embeddings are scope-agnostic: the vector of "User loves
+    coffee" is identical regardless of which project scope the
+    memory belongs to. The retrieval layer filters by scope when
+    it joins hits against ``memories``, not here.
+
+    No lease / heartbeat
+    --------------------
+    Each embedding is one API call plus one DB write -- typically
+    a few hundred milliseconds to a few seconds. A crashed worker
+    leaves the job in ``running``; ``recover_stale_running``
+    (in the outbox) flips it back to ``retry_pending`` after a
+    fixed timeout. This is simpler and cheaper than the
+    lease-based heartbeat the extraction worker uses, which is
+    justified there by multi-minute LLM calls.
+
+    No snapshot hash
+    ----------------
+    The worker re-reads memory content on every attempt. If the
+    content changed since enqueue, the new embedding is
+    generated and overwrites the old one (both in
+    ``memory_embeddings`` and in the ``memory_vectors`` vec0
+    index). This is the DESIRED behavior: a fresh vector for
+    edited content is always better than a rejected job that
+    leaves the memory without a vector.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        populate_by_name=True,
+    )
+
+    # ------------------------- identity ------------------------------------
+
+    job_id: str = Field(
+        default_factory=lambda: f"eemb_{uuid4().hex[:16]}",
+        description=(
+            "Stable job identifier. 'eemb_' prefix (embedding) + "
+            "16 hex chars. The distinct prefix from the extraction "
+            "queue's 'mjob_' allows greps and log filters to "
+            "separate the two job families without joining any "
+            "table."
+        ),
+    )
+
+    # ------------------------- target --------------------------------------
+
+    memory_id: str = Field(
+        ...,
+        description=(
+            "The memory entry this job embeds. Reference to "
+            "``memories.memory_id``. Not declared as a SQL "
+            "FOREIGN KEY: a memory can be purged while its "
+            "embedding job is queued -- the worker treats "
+            "'memory no longer exists' as a terminal fail "
+            "(MEMORY_NOT_FOUND), which is a clearer error than "
+            "a constraint violation that would block the delete."
+        ),
+    )
+
+    # ------------------------- model identity ------------------------------
+
+    model_id: str = Field(
+        ...,
+        description=(
+            "Provider-reported model identifier (e.g. "
+            "'text-embedding-3-small'). Combined with "
+            "``model_version``, defines the vector space "
+            "(namespace). Matches the corresponding field on "
+            "``memory_embeddings``'s primary key so the worker's "
+            "upsert writes to the correct namespace."
+        ),
+    )
+    model_version: str = Field(
+        ...,
+        description=(
+            "Opaque version string for the model. Usually equals "
+            "``model_id``. Distinct when a provider versions "
+            "models independently (rare; e.g. Cohere's model "
+            "revisions)."
+        ),
+    )
+    content_version: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Monotonic counter for the CONTENT this embedding "
+            "targets. Starts at 1. Phase 5 consolidation "
+            "increments it when rewriting a memory's content; "
+            "the new value produces a fresh idempotency key, so "
+            "a re-embed job is accepted where the natural key "
+            "would otherwise have been considered already "
+            "processed. In Phase 4, always 1."
+        ),
+    )
+
+    # ------------------------- status --------------------------------------
+
+    status: EmbeddingJobStatus = Field(
+        default=EmbeddingJobStatus.PENDING,
+        description="Current lifecycle status.",
+    )
+    attempts: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of failed attempts so far. Incremented by "
+            "``EmbeddingOutbox.fail()`` and ``.retry()`` (same "
+            "semantics as ``MemoryJob.attempts``: it counts total "
+            "failed attempts, not remaining retries)."
+        ),
+    )
+    max_attempts: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Attempts before the job transitions to ``failed``. "
+            "3 matches the extraction-jobs default: enough to "
+            "absorb a transient network error, not so many that "
+            "a genuinely broken model spams the API with retries."
+        ),
+    )
+
+    # ------------------------- timing --------------------------------------
+
+    created_at: float = Field(
+        default_factory=time.time,
+        description=(
+            "Enqueue timestamp (Unix seconds). Preserved across "
+            "requeues so an old job retains its original FIFO slot "
+            "when the operator retries it manually."
+        ),
+    )
+    started_at: Optional[float] = Field(
+        default=None,
+        description=(
+            "First claim timestamp. Used by "
+            "``recover_stale_running`` to detect a worker that "
+            "died mid-embedding: any row with "
+            "``status='running'`` and "
+            "``started_at < now - stale_timeout`` is flipped back "
+            "to ``retry_pending`` on the next worker startup."
+        ),
+    )
+    completed_at: Optional[float] = Field(
+        default=None,
+        description="Terminal-state transition timestamp.",
+    )
+    next_retry_at: Optional[float] = Field(
+        default=None,
+        description=(
+            "Earliest time the job may be claimed again after a "
+            "retryable failure. NULL when the job is not "
+            "scheduled for retry (pending, running, or terminal)."
+        ),
+    )
+
+    # ------------------------- errors --------------------------------------
+
+    error_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "Machine-readable error code. Known values: "
+            "MEMORY_NOT_FOUND, MODEL_UNAVAILABLE, "
+            "DIMENSION_MISMATCH, TRANSPORT_ERROR, "
+            "WORKER_TIMEOUT, INTERNAL_ERROR. Set on the "
+            "transition to failed and on every retry."
+        ),
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description="Human-readable error detail for the audit log.",
+    )
+
+    # ------------------------- cost ---------------------------------------
+
+    cost_nano_usd: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Cost of the SUCCESSFUL embedding call, in nano-USD. "
+            "0 for local models that do not charge, and 0 on "
+            "failed attempts (the provider rejected the request "
+            "before consuming tokens). Cumulative only for the "
+            "single attempt that succeeded."
+        ),
+    )
+
+    # ------------------------- validators ----------------------------------
+
+    @field_validator(
+        "job_id",
+        "memory_id",
+        "model_id",
+        "model_version",
+        mode="after",
+    )
+    @classmethod
+    def _validate_required_strings(cls, v: str, info: Any) -> str:
+        """Trim and non-empty-check every required identifier.
+
+        Matches ``MemoryJob._validate_required_strings`` -- the
+        two classes share the same trimming policy so a bug in
+        one cannot produce jobs that are accepted by the other.
+        """
+        if not isinstance(v, str):
+            raise ValueError(
+                f"{info.field_name} must be a string, "
+                f"got {type(v).__name__}"
+            )
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                f"{info.field_name} must not be empty"
+            )
+        return stripped
+
+    # ------------------------- derived properties --------------------------
+
+    @property
+    def is_terminal(self) -> bool:
+        """See ``EmbeddingJobStatus.is_terminal``."""
+        return self.status.is_terminal
+
+    @property
+    def is_claimable(self) -> bool:
+        """See ``EmbeddingJobStatus.is_claimable``."""
+        return self.status.is_claimable
+
+    def is_retry_exhausted(self) -> bool:
+        """True when ``attempts >= max_attempts``."""
+        return self.attempts >= self.max_attempts
+
+    # ------------------------- helpers -------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-safe dict for logging / API responses."""
+        return {
+            "job_id": self.job_id,
+            "memory_id": self.memory_id,
+            "model_id": self.model_id,
+            "model_version": self.model_version,
+            "content_version": self.content_version,
+            "status": self.status.value,
+            "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "next_retry_at": self.next_retry_at,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+            "cost_nano_usd": self.cost_nano_usd,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 __all__ = [
+    "EmbeddingJob",
+    "EmbeddingJobStatus",
     "MemoryJob",
     "MemoryJobStatus",
     "MemoryJobType",

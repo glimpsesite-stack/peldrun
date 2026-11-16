@@ -67,6 +67,8 @@ from peldrun.memory.domain.enums import (
     MemoryScope,
 )
 from omweb.memory.jobs.models import (
+    EmbeddingJob,
+    EmbeddingJobStatus,
     MemoryJob,
     MemoryJobStatus,
     MemoryJobType,
@@ -1926,12 +1928,787 @@ class MemoryOutbox:
 
 
 # ---------------------------------------------------------------------------
+# EmbeddingOutbox (Phase 4)
+# ---------------------------------------------------------------------------
+#
+# Durable queue for ``memory_embedding_jobs`` rows. The queue is
+# intentionally SIMPLER than ``MemoryOutbox``:
+#
+#   * No per-chat FIFO -- embeddings are independent per (memory,
+#     model) pair; there is no ordering requirement across jobs.
+#
+#   * No cursor tracking -- embedding jobs do not advance any
+#     cursor. A job that fails can simply be retried without
+#     "skipping turns".
+#
+#   * No lease heartbeat -- embedding calls complete in seconds;
+#     a crashed worker is detected via a fixed ``stale_running``
+#     timeout rather than an expiring lease.
+#
+#   * Natural-key deduplication -- the unique index on
+#     ``(memory_id, model_id, model_version, content_version)``
+#     rejects duplicate enqueues at the storage layer, exactly the
+#     role ``idempotency_key`` plays for ``MemoryOutbox``. The
+#     index is created in ``open()`` because the v4 migration
+#     created the TABLE without a UNIQUE constraint (so existing
+#     v4 databases already-created are picked up by an idempotent
+#     CREATE UNIQUE INDEX IF NOT EXISTS).
+#
+# Requeue-on-failed behavior
+# --------------------------
+# Unlike ``MemoryOutbox.enqueue()`` (which raises ``DuplicateJobError``
+# on ANY conflict), ``EmbeddingOutbox.enqueue()`` treats a conflict
+# against a job in a TERMINAL FAILED or CANCELLED state as a
+# **requeue**: the existing row is reset to ``pending`` with
+# ``attempts=0``, error fields cleared, and returned. This is
+# the desired semantics for the caller:
+#
+#   * "embed this memory" is a declaration of intent, not a
+#     one-shot request -- if a previous attempt failed, the
+#     caller's intent is still "make sure this gets embedded";
+#
+#   * a conflict against a PENDING / RUNNING / RETRY_PENDING job
+#     means work is already in flight -- the caller can safely
+#     treat it as "already enqueued" and move on;
+#
+#   * a conflict against a COMPLETED job means the embedding
+#     exists at the requested ``content_version`` -- also a
+#     no-op, since there is nothing left to do.
+#
+# Thread safety
+# -------------
+# Same pattern as ``MemoryOutbox``: one SQLite connection per
+# process (not per thread -- the async lock serializes calls),
+# WAL mode, all sync work in a thread via ``asyncio.to_thread``.
+
+
+class EmbeddingOutbox:
+    """Durable FIFO queue for ``memory_embedding_jobs`` rows.
+
+    One instance per process. Both the extraction worker and the
+    embedding worker can coexist on the same database -- they use
+    DIFFERENT tables (``memory_jobs`` vs. ``memory_embedding_jobs``),
+    and both connect via WAL. There is no interference.
+
+    Lifecycle::
+
+        outbox = EmbeddingOutbox(db_path)
+        await outbox.open()
+        await outbox.enqueue(EmbeddingJob(...))
+        job = await outbox.claim_next()
+        ...
+        await outbox.close()
+
+    ``open()`` and ``close()`` are idempotent.
+    """
+
+    _DEFAULT_STALE_RUNNING_SECONDS: int = 300
+    """Seconds after which a ``running`` job is presumed dead.
+
+    300s (5 min) exceeds the default 30s per-call timeout in
+    ``OpenAICompatEmbeddingProvider`` by an order of magnitude,
+    leaving ample headroom for slow networks and provider hiccups
+    without false-positive stale detection. Configurable via the
+    constructor and per-call in ``recover_stale_running``.
+    """
+
+    def __init__(
+        self,
+        db_path: Union[str, Path],
+        *,
+        busy_timeout_ms: int = 60_000,
+        stale_running_seconds: int = _DEFAULT_STALE_RUNNING_SECONDS,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        db_path
+            Path to the SQLite database. Same file as the
+            extraction outbox and memory repository are fine --
+            each class opens its own connection under WAL.
+        busy_timeout_ms
+            Wait time before a writer raises "database is locked".
+        stale_running_seconds
+            Timeout for ``recover_stale_running``. See the class
+            attribute above for the default rationale.
+        """
+        self._db_path = str(db_path)
+        self._busy_timeout_ms = int(busy_timeout_ms)
+        self._stale_running_seconds = int(stale_running_seconds)
+        if self._stale_running_seconds <= 0:
+            raise ValueError(
+                f"stale_running_seconds must be positive, got "
+                f"{self._stale_running_seconds}"
+            )
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def open(self) -> None:
+        """Open the connection and create the natural-key unique index.
+
+        Idempotent. The unique index is created here (not in the
+        migration) so that EXISTING v4 databases -- created before
+        this class was introduced -- pick it up on the next start.
+        ``CREATE UNIQUE INDEX IF NOT EXISTS`` makes the operation
+        safe on every open.
+        """
+        if self._conn is not None:
+            return
+        self._conn = await asyncio.to_thread(self._open_sync)
+
+    def _open_sync(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            timeout=self._busy_timeout_ms / 1000.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+
+        # Natural-key uniqueness. The v4 migration created the
+        # table WITHOUT this constraint (so that the schema
+        # remained purely additive and did not force a schema
+        # version bump the moment deduplication was needed).
+        # Creating the index here:
+        #
+        #   * upgrades existing v4 databases transparently,
+        #   * is idempotent (IF NOT EXISTS),
+        #   * keeps the deduplication contract adjacent to the
+        #     code that relies on it.
+        #
+        # A fresh installation gets the constraint immediately
+        # on the outbox's first ``open()`` call, long before any
+        # job is enqueued.
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_embedding_jobs_natural_key
+            ON memory_embedding_jobs(
+                memory_id, model_id, model_version, content_version
+            )
+            """
+        )
+        conn.commit()
+        logger.info(
+            "EmbeddingOutbox opened: path=%r busy_timeout=%dms "
+            "stale_running=%ds",
+            self._db_path,
+            self._busy_timeout_ms,
+            self._stale_running_seconds,
+        )
+        return conn
+
+    async def close(self) -> None:
+        """Close the connection (idempotent)."""
+        if self._conn is None:
+            return
+        conn = self._conn
+        self._conn = None
+        await asyncio.to_thread(conn.close)
+        logger.info("EmbeddingOutbox closed.")
+
+    def _require_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError(
+                "EmbeddingOutbox is not open; call `await open()` first."
+            )
+        return self._conn
+
+    # ------------------------------------------------------------------
+    # Enqueue
+    # ------------------------------------------------------------------
+
+    async def enqueue(self, job: EmbeddingJob) -> EmbeddingJob:
+        """Insert ``job`` or requeue it if a failed/cancelled row exists.
+
+        Semantics
+        ---------
+        * No existing row with the same natural key
+            -> INSERT, return the passed-in ``job``.
+        * Existing row in ``failed`` / ``cancelled``
+            -> RESET the row to ``pending`` (attempts=0, error
+               fields cleared, timestamps cleared), return the
+               refreshed row.
+        * Existing row in ``pending`` / ``running`` /
+          ``retry_pending`` / ``completed``
+            -> Raise ``DuplicateJobError(existing.job_id)``.
+
+        The choice between requeue and DuplicateJobError is
+        documented in the module-level section above; the short
+        version is that a terminal-failure row should be
+        reactivated rather than replaced.
+
+        Raises
+        ------
+        DuplicateJobError
+            When the existing job is in a non-terminal state or
+            completed. The exception's ``existing_job_id`` points
+            the caller at the already-present row.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(self._enqueue_sync, job)
+
+    def _enqueue_sync(self, job: EmbeddingJob) -> EmbeddingJob:
+        conn = self._require_conn()
+
+        values = self._embedding_job_to_row_values(job)
+        columns = ", ".join(values.keys())
+        placeholders = ", ".join("?" for _ in values)
+        sql = (
+            f"INSERT INTO memory_embedding_jobs ({columns}) "
+            f"VALUES ({placeholders}) "
+            f"ON CONFLICT(memory_id, model_id, model_version, "
+            f"content_version) DO NOTHING"
+        )
+
+        with conn:
+            cur = conn.execute(sql, tuple(values.values()))
+            inserted = cur.rowcount > 0
+
+        if inserted:
+            logger.info(
+                "Enqueued embedding job %s (memory=%s model=%s/%s v%d)",
+                job.job_id,
+                job.memory_id,
+                job.model_id,
+                job.model_version,
+                job.content_version,
+            )
+            return job
+
+        # Conflict -- read the existing row and decide.
+        existing_row = conn.execute(
+            """
+            SELECT * FROM memory_embedding_jobs
+            WHERE memory_id = ?
+              AND model_id = ?
+              AND model_version = ?
+              AND content_version = ?
+            """,
+            (
+                job.memory_id,
+                job.model_id,
+                job.model_version,
+                job.content_version,
+            ),
+        ).fetchone()
+        if existing_row is None:
+            # Should be unreachable: the ON CONFLICT DO NOTHING
+            # only fires on the natural-key unique index, so a
+            # matching row MUST exist. Reaching this branch means
+            # the index was dropped externally -- surface a clear
+            # error instead of silently doing nothing.
+            raise RuntimeError(
+                f"Enqueue conflict for memory={job.memory_id!r} "
+                f"model={job.model_id!r}/{job.model_version!r} "
+                f"v{job.content_version} but no matching row was "
+                f"found. The unique index "
+                f"idx_embedding_jobs_natural_key may have been "
+                f"dropped externally."
+            )
+
+        existing_status = existing_row["status"]
+        existing_job_id = existing_row["job_id"]
+
+        if existing_status in ("failed", "cancelled"):
+            # Requeue path -- reset the row to pending. The
+            # caller's intent ("make sure this gets embedded")
+            # is honored by giving the job another attempt.
+            now = time.time()
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE memory_embedding_jobs
+                    SET status = 'pending',
+                        attempts = 0,
+                        started_at = NULL,
+                        completed_at = NULL,
+                        next_retry_at = NULL,
+                        error_code = NULL,
+                        error_message = NULL,
+                        cost_nano_usd = 0
+                    WHERE job_id = ?
+                      AND status IN ('failed', 'cancelled')
+                    """,
+                    (existing_job_id,),
+                )
+            refreshed = conn.execute(
+                "SELECT * FROM memory_embedding_jobs "
+                "WHERE job_id = ?",
+                (existing_job_id,),
+            ).fetchone()
+            logger.info(
+                "Requeued embedding job %s (was %s).",
+                existing_job_id,
+                existing_status,
+            )
+            return self._row_to_embedding_job(refreshed)
+
+        # Non-terminal or completed -- raise DuplicateJobError.
+        raise DuplicateJobError(existing_job_id)
+
+    # ------------------------------------------------------------------
+    # Claim
+    # ------------------------------------------------------------------
+
+    async def claim_next(
+        self, worker_id: str
+    ) -> Optional[EmbeddingJob]:
+        """Claim the oldest claimable job, or None.
+
+        ``worker_id`` is used only for logging -- embedding jobs
+        do not have a lease-owner column because they complete in
+        seconds. A crashed worker is detected via
+        ``recover_stale_running`` (fixed timeout on
+        ``started_at``), not a heartbeat.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._claim_next_sync, worker_id
+            )
+
+    def _claim_next_sync(
+        self, worker_id: str
+    ) -> Optional[EmbeddingJob]:
+        conn = self._require_conn()
+        now = time.time()
+
+        # Retry up to 3 times in case another process claims the
+        # same candidate between our SELECT and our UPDATE. Under
+        # SQLite's writer lock, this race window is tiny; the
+        # retry exists only to avoid spurious ``None`` returns in
+        # multi-process deployments.
+        for _attempt in range(3):
+            with conn:
+                row = conn.execute(
+                    """
+                    SELECT job_id FROM memory_embedding_jobs
+                    WHERE status IN ('pending', 'retry_pending')
+                      AND (next_retry_at IS NULL
+                           OR next_retry_at <= ?)
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    (now,),
+                ).fetchone()
+                if row is None:
+                    return None
+                job_id = row["job_id"]
+
+                cur = conn.execute(
+                    """
+                    UPDATE memory_embedding_jobs
+                    SET status = 'running',
+                        started_at = ?
+                    WHERE job_id = ?
+                      AND status IN ('pending', 'retry_pending')
+                    """,
+                    (now, job_id),
+                )
+            if cur.rowcount > 0:
+                refreshed = conn.execute(
+                    "SELECT * FROM memory_embedding_jobs "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if refreshed is None:
+                    # Extremely unlikely -- row vanished between
+                    # our UPDATE and SELECT. Return None and let
+                    # the caller retry.
+                    return None
+                logger.info(
+                    "Claimed embedding job %s by %s (memory=%s)",
+                    job_id,
+                    worker_id,
+                    refreshed["memory_id"],
+                )
+                return self._row_to_embedding_job(refreshed)
+            # Race lost -- loop and try the next candidate.
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Complete / fail / retry / cancel
+    # ------------------------------------------------------------------
+
+    async def complete(
+        self, job_id: str, *, cost_nano_usd: int = 0
+    ) -> None:
+        """Transition the job to ``completed``.
+
+        ``cost_nano_usd`` records the cost of the successful
+        embedding call. Failed attempts do not accumulate here
+        (each retry starts from ``cost_nano_usd=0`` at the
+        schema level; only the successful attempt sets it).
+        """
+        async with self._lock:
+            await asyncio.to_thread(
+                self._complete_sync, job_id, cost_nano_usd
+            )
+
+    def _complete_sync(
+        self, job_id: str, cost_nano_usd: int
+    ) -> None:
+        conn = self._require_conn()
+        now = time.time()
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE memory_embedding_jobs
+                SET status = 'completed',
+                    completed_at = ?,
+                    cost_nano_usd = ?,
+                    error_code = NULL,
+                    error_message = NULL
+                WHERE job_id = ?
+                """,
+                (now, int(cost_nano_usd), job_id),
+            )
+            if cur.rowcount == 0:
+                raise JobNotFoundError(job_id)
+        logger.info(
+            "Completed embedding job %s (cost=%d nano-USD)",
+            job_id,
+            int(cost_nano_usd),
+        )
+
+    async def fail(
+        self,
+        job_id: str,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        """Transition the job to ``failed`` and increment ``attempts``."""
+        async with self._lock:
+            await asyncio.to_thread(
+                self._fail_sync, job_id, error_code, error_message
+            )
+
+    def _fail_sync(
+        self, job_id: str, error_code: str, error_message: str
+    ) -> None:
+        conn = self._require_conn()
+        now = time.time()
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE memory_embedding_jobs
+                SET status = 'failed',
+                    attempts = attempts + 1,
+                    completed_at = ?,
+                    error_code = ?,
+                    error_message = ?
+                WHERE job_id = ?
+                """,
+                (now, error_code, error_message, job_id),
+            )
+            if cur.rowcount == 0:
+                raise JobNotFoundError(job_id)
+        logger.warning(
+            "Failed embedding job %s (%s): %s",
+            job_id,
+            error_code,
+            error_message,
+        )
+
+    async def retry(
+        self,
+        job_id: str,
+        next_retry_at: float,
+        *,
+        error_code: str = "TRANSPORT_ERROR",
+        error_message: str = "",
+    ) -> None:
+        """Schedule a retry. Increments ``attempts``."""
+        async with self._lock:
+            await asyncio.to_thread(
+                self._retry_sync,
+                job_id,
+                next_retry_at,
+                error_code,
+                error_message,
+            )
+
+    def _retry_sync(
+        self,
+        job_id: str,
+        next_retry_at: float,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE memory_embedding_jobs
+                SET status = 'retry_pending',
+                    attempts = attempts + 1,
+                    next_retry_at = ?,
+                    error_code = ?,
+                    error_message = ?
+                WHERE job_id = ?
+                """,
+                (next_retry_at, error_code, error_message, job_id),
+            )
+            if cur.rowcount == 0:
+                raise JobNotFoundError(job_id)
+        logger.info(
+            "Scheduled retry for embedding job %s at %.0f",
+            job_id,
+            next_retry_at,
+        )
+
+    async def cancel(self, job_id: str) -> None:
+        """Transition the job to ``cancelled``.
+
+        Does NOT require a non-terminal state -- the caller's
+        action is authoritative. Matches ``MemoryOutbox.cancel``.
+        """
+        async with self._lock:
+            await asyncio.to_thread(self._cancel_sync, job_id)
+
+    def _cancel_sync(self, job_id: str) -> None:
+        conn = self._require_conn()
+        now = time.time()
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE memory_embedding_jobs
+                SET status = 'cancelled',
+                    completed_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            if cur.rowcount == 0:
+                raise JobNotFoundError(job_id)
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
+
+    async def recover_stale_running(
+        self, *, stale_timeout_seconds: Optional[int] = None
+    ) -> int:
+        """Requeue jobs stuck in ``running`` past a timeout.
+
+        Called on worker startup. Detects jobs left behind by a
+        crashed or killed worker: ``status='running'`` with
+        ``started_at`` older than the timeout.
+
+        Parameters
+        ----------
+        stale_timeout_seconds
+            Override for this call. ``None`` uses the instance's
+            configured value.
+
+        Returns
+        -------
+        int
+            Number of rows recovered.
+        """
+        timeout = (
+            int(stale_timeout_seconds)
+            if stale_timeout_seconds is not None
+            else self._stale_running_seconds
+        )
+        if timeout <= 0:
+            raise ValueError(
+                f"stale_timeout_seconds must be positive, got {timeout}"
+            )
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._recover_stale_running_sync, timeout
+            )
+
+    def _recover_stale_running_sync(self, timeout: int) -> int:
+        conn = self._require_conn()
+        now = time.time()
+        threshold = now - timeout
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE memory_embedding_jobs
+                SET status = 'retry_pending',
+                    attempts = attempts + 1,
+                    next_retry_at = ?,
+                    error_code = 'WORKER_TIMEOUT',
+                    error_message = 'Worker died before completing'
+                WHERE status = 'running'
+                  AND (started_at IS NULL OR started_at <= ?)
+                """,
+                (now, threshold),
+            )
+            count = cur.rowcount
+        if count > 0:
+            logger.warning(
+                "Recovered %d stale embedding job(s) at startup",
+                count,
+            )
+        return count
+
+    # ------------------------------------------------------------------
+    # Read helpers
+    # ------------------------------------------------------------------
+
+    async def get_by_id(
+        self, job_id: str
+    ) -> Optional[EmbeddingJob]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_by_id_sync, job_id
+            )
+
+    def _get_by_id_sync(
+        self, job_id: str
+    ) -> Optional[EmbeddingJob]:
+        conn = self._require_conn()
+        row = conn.execute(
+            "SELECT * FROM memory_embedding_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return (
+            self._row_to_embedding_job(row) if row is not None else None
+        )
+
+    async def list_jobs(
+        self,
+        *,
+        status: Optional[Union[EmbeddingJobStatus, str]] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[EmbeddingJob]:
+        """List jobs with optional status filter, newest first."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._list_jobs_sync, status, limit, offset
+            )
+
+    def _list_jobs_sync(
+        self,
+        status: Optional[Union[EmbeddingJobStatus, str]],
+        limit: int,
+        offset: int,
+    ) -> List[EmbeddingJob]:
+        conn = self._require_conn()
+        limit_int = max(1, min(int(limit), 200))
+        offset_int = max(0, int(offset))
+
+        if status is None:
+            sql = (
+                "SELECT * FROM memory_embedding_jobs "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            )
+            params: List[Any] = [limit_int, offset_int]
+        else:
+            status_value = (
+                status.value
+                if isinstance(status, EmbeddingJobStatus)
+                else str(status)
+            )
+            sql = (
+                "SELECT * FROM memory_embedding_jobs "
+                "WHERE status = ? "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            )
+            params = [status_value, limit_int, offset_int]
+
+        rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_embedding_job(r) for r in rows]
+
+    async def count_jobs(
+        self,
+        *,
+        status: Optional[Union[EmbeddingJobStatus, str]] = None,
+    ) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._count_jobs_sync, status
+            )
+
+    def _count_jobs_sync(
+        self,
+        status: Optional[Union[EmbeddingJobStatus, str]],
+    ) -> int:
+        conn = self._require_conn()
+        if status is None:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM memory_embedding_jobs"
+            ).fetchone()
+        else:
+            status_value = (
+                status.value
+                if isinstance(status, EmbeddingJobStatus)
+                else str(status)
+            )
+            row = conn.execute(
+                "SELECT COUNT(*) FROM memory_embedding_jobs "
+                "WHERE status = ?",
+                (status_value,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    async def count_by_status(self, status: EmbeddingJobStatus) -> int:
+        return await self.count_jobs(status=status)
+
+    # ------------------------------------------------------------------
+    # Row <-> model conversion
+    # ------------------------------------------------------------------
+
+    def _row_to_embedding_job(
+        self, row: sqlite3.Row
+    ) -> EmbeddingJob:
+        """Convert a ``memory_embedding_jobs`` row into an ``EmbeddingJob``."""
+        data: Dict[str, Any] = dict(row)
+        data["status"] = EmbeddingJobStatus(data["status"])
+        return EmbeddingJob(**data)
+
+    def _embedding_job_to_row_values(
+        self, job: EmbeddingJob
+    ) -> Dict[str, Any]:
+        """Inverse of ``_row_to_embedding_job`` -- every column, no defaults.
+
+        Column order matches the ``memory_embedding_jobs`` schema
+        (Migration v4). Keeping the dict explicit (instead of
+        relying on ``job.model_dump()``) gives us one place to
+        audit when the schema changes -- and one place that
+        raises loudly if a field is accidentally added to the
+        model without a matching column.
+        """
+        return {
+            "job_id": job.job_id,
+            "memory_id": job.memory_id,
+            "model_id": job.model_id,
+            "model_version": job.model_version,
+            "content_version": job.content_version,
+            "status": job.status.value,
+            "attempts": job.attempts,
+            "max_attempts": job.max_attempts,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "completed_at": job.completed_at,
+            "next_retry_at": job.next_retry_at,
+            "error_code": job.error_code,
+            "error_message": job.error_message,
+            "cost_nano_usd": job.cost_nano_usd,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
 __all__ = [
     "DuplicateJobError",
+    "EmbeddingOutbox",
     "JobNotFoundError",
     "JobResult",
     "MemoryOutbox",

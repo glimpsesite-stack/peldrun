@@ -97,6 +97,23 @@ export default function MemorySettingsPage() {
               className="shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 rtl:group-hover:-translate-x-0.5"
             />
           </Link>
+          <Link
+            href="/memory/diagnostics"
+            className={cn(
+              'group flex items-center justify-between gap-2 rounded-sm border border-border/60 bg-card px-3 py-2 text-[11px]',
+              'hover:border-primary/40 hover:bg-muted/40 transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-1',
+            )}
+          >
+            <span className="font-medium text-foreground">
+              {t('diagnostics.title', 'Diagnostics')}
+            </span>
+            <ArrowRight
+              size={11}
+              aria-hidden="true"
+              className="shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 rtl:group-hover:-translate-x-0.5"
+            />
+          </Link>
         </div>
       </MemorySection>
 

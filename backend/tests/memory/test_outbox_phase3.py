@@ -403,8 +403,18 @@ async def test_requeue_preserves_snapshot_hash(outbox):
 
 
 def test_migration_v3_is_current_version():
-    """The module advertises v3 as the current schema version."""
-    assert CURRENT_VERSION == 3
+    """The module advertises v3 or later as the current schema version.
+
+    The strict ``== 3`` check was correct while v3 was the highest
+    migration. v4 (Phase 4: embeddings) has since been added, so the
+    invariant this test should protect is now "v3 has been reached
+    and is still advertised" -- not "v3 is the ceiling".
+
+    The specific v3 assertions (batch table, batch_id column, index,
+    etc.) are still verified by the other tests in this file; only
+    the version-number check needed to relax from ``==`` to ``>=``.
+    """
+    assert CURRENT_VERSION >= 3
 
 
 def test_migration_v3_created_batch_table(temp_db_path):
@@ -434,13 +444,19 @@ def test_migration_v3_added_batch_id_column(temp_db_path):
 
 
 def test_migration_v3_recorded_version(temp_db_path):
-    """The highest recorded version in ``memory_schema_version`` is 3."""
+    """The highest recorded version in ``memory_schema_version`` is >= 3.
+
+    See ``test_migration_v3_is_current_version`` for the rationale on
+    relaxing ``==`` to ``>=``. v3's EFFECTS (batch table, batch_id
+    column, index, etc.) are verified independently by the other
+    tests in this file -- those assertions are untouched.
+    """
     conn = sqlite3.connect(str(temp_db_path))
     try:
         version = conn.execute(
             "SELECT MAX(version) FROM memory_schema_version"
         ).fetchone()[0]
-        assert version == 3
+        assert version >= 3
     finally:
         conn.close()
 

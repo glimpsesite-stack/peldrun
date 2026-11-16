@@ -1456,31 +1456,110 @@ def _resolve_provider_for_model(
     return None, None
 
 
+def _collect_selected_models_by_provider(
+    vault: Dict[str, Any],
+) -> Dict[str, set]:
+    """Collect every ``savedModels`` entry, grouped by provider.
+
+    Returns ``{provider_id: set(model_id)}`` covering every store
+    that can hold a per-provider model selection:
+
+      * ``cloud_vault[].savedModels`` (cloud providers)
+      * ``custom_endpoints[].savedModels`` (user-defined endpoints)
+      * ``lmstudio_vault.savedModels`` (local engine)
+      * ``ollama_vault.savedModels`` (local engine)
+      * ``provider_package_models[id].savedModels`` (Store packages)
+
+    The ``provider_id`` used here is the SAME identifier the rest of
+    the system uses for that store, so downstream consumers can
+    cross-reference the returned map with the metadata entries
+    written by discovery.
+    """
+    selected: Dict[str, set] = {}
+
+    def _push(provider_id: Any, models: Any) -> None:
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            return
+        if not isinstance(models, list):
+            return
+        bucket = selected.setdefault(provider_id.strip(), set())
+        for m in models:
+            if isinstance(m, str) and m.strip():
+                bucket.add(m.strip())
+
+    # Cloud providers.
+    clouds = vault.get("cloud_vault") or []
+    if isinstance(clouds, list):
+        for cp in clouds:
+            if isinstance(cp, dict):
+                _push(cp.get("id"), cp.get("savedModels"))
+
+    # Custom endpoints.
+    customs = vault.get("custom_endpoints") or []
+    if isinstance(customs, list):
+        for ce in customs:
+            if isinstance(ce, dict):
+                _push(
+                    ce.get("providerId") or ce.get("id"),
+                    ce.get("savedModels"),
+                )
+
+    # Local engines.
+    lm = vault.get("lmstudio_vault")
+    if isinstance(lm, dict):
+        _push("lmstudio", lm.get("savedModels"))
+
+    ol = vault.get("ollama_vault")
+    if isinstance(ol, dict):
+        _push("ollama", ol.get("savedModels"))
+
+    # Provider packages.
+    pkg_models = vault.get("provider_package_models") or {}
+    if isinstance(pkg_models, dict):
+        for pkg_id, entry in pkg_models.items():
+            if isinstance(entry, dict):
+                _push(pkg_id, entry.get("savedModels"))
+
+    return selected
+
+
 def _rebuild_embedding_models_index(
     vault: Dict[str, Any],
 ) -> Dict[str, list]:
-    """Build a per-provider index of embedding-capable models.
+    """Build a per-provider index of SELECTED embedding models.
 
-    Walks ``models_metadata.json`` and emits ``{provider_id: [model_id]}``
-    for every entry whose effective ``is_embedding`` flag is True.
+    Walks the user's selections (``savedModels`` across every store)
+    and keeps only those whose metadata declares
+    ``capabilities.is_embedding = True``. The result is::
 
-    Provenance resolution, in priority order:
+        {
+          "<provider_id>": ["embedding-model-a", "embedding-model-b"],
+          ...
+        }
 
-      1. ``entry["provider_id"]`` — written by discovery since the
-         ``provider_id`` change. Authoritative: works even for
-         discovered-but-not-selected models (i.e. models that never
-         entered any provider's ``savedModels`` array).
-      2. ``_resolve_provider_for_model(key, vault)`` — legacy fallback
-         based on ``savedModels`` lookups. Only finds models that were
-         previously saved.
+    Rationale
+    ---------
+    ``embedding_models`` is a CONSUMER-FACING index — its job is to
+    answer "which embedding models has the user chosen to use for
+    this provider?", not "which embedding models exist in the
+    provider's catalog?". A model that was discovered during Scan
+    Models but never selected must NOT appear here:
 
-    Entries that cannot be attributed to a provider are silently
-    skipped — there is no meaningful provider to file them under, and
-    surfacing a synthetic "unknown" bucket would mislead callers.
+      * RAG routers read this index to pick a default embedding
+        model. Surfacing an unselected model would route traffic to
+        a model the user never approved.
+      * The index backs a UI dropdown of "available embedding
+        models per provider". Listing unselected entries would
+        mislead the user into thinking they had already opted in.
 
-    The result is sorted per-provider and de-duplicated within each
-    provider's list so the persisted vault file is stable across
-    rescans.
+    Scope boundary
+    --------------
+    ``models_metadata.json`` intentionally stays COMPLETE (every
+    discovered model, selected or not). That file is the live memory
+    the UI reads when reopening ``ModelDiscoveryModal`` — it must
+    still list unselected models so the user can pick them on a
+    later visit. THIS function is the projection step that filters
+    the complete metadata down to the selected subset.
     """
     metadata: Dict[str, Any] = {}
     if METADATA_CACHE.exists():
@@ -1492,8 +1571,15 @@ def _rebuild_embedding_models_index(
         except Exception:
             return {}
 
-    index: Dict[str, set] = {}
+    # Which models did the user actually select, per provider?
+    selected_by_provider = _collect_selected_models_by_provider(vault)
 
+    # Which models does metadata say are embedding-capable?
+    # Key: provider_id, Value: set of model_ids. Only entries whose
+    # flag is True (per the same effective resolution used by the
+    # frontend: `capabilities.is_embedding` first, legacy top-level
+    # as fallback) qualify.
+    embedding_in_metadata: Dict[str, set] = {}
     for key, entry in metadata.items():
         if not isinstance(entry, dict):
             continue
@@ -1509,23 +1595,31 @@ def _rebuild_embedding_models_index(
         pid = entry.get("provider_id")
         if not isinstance(pid, str) or not pid.strip():
             # Fallback for entries written before discovery started
-            # tagging provider_id. Only finds saved models.
+            # tagging provider_id. Only finds saved models — which is
+            # exactly what we want here anyway, since the whole point
+            # of this function is to filter by saved models.
             resolved_pid, _ = _resolve_provider_for_model(key, vault)
             pid = resolved_pid
         if not isinstance(pid, str) or not pid.strip():
             continue
 
-        # Prefer the explicit `key` field, then the trailing segment
-        # of a composite key, then the raw key.
         model_id = entry.get("key")
         if not isinstance(model_id, str) or not model_id:
             model_id = key.split("::")[-1] if "::" in key else key
         if not isinstance(model_id, str) or not model_id:
             continue
 
-        index.setdefault(pid.strip(), set()).add(model_id)
+        embedding_in_metadata.setdefault(pid.strip(), set()).add(model_id)
 
-    return {pid: sorted(models) for pid, models in sorted(index.items())}
+    # Intersection: model must be BOTH selected AND embedding.
+    index: Dict[str, list] = {}
+    for pid, selected_models in selected_by_provider.items():
+        embedding_set = embedding_in_metadata.get(pid, set())
+        overlap = sorted(selected_models & embedding_set)
+        if overlap:
+            index[pid] = overlap
+
+    return index
 
 
 @router.get("/embedding-models")

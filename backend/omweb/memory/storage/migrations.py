@@ -95,7 +95,7 @@ logger = logging.getLogger("omweb.memory.storage.migrations")
 # ---------------------------------------------------------------------------
 
 
-CURRENT_VERSION: int = 3
+CURRENT_VERSION: int = 4
 """Highest schema version this module knows how to produce.
 
 Bump only when adding a new migration. Every bump must be paired
@@ -611,6 +611,158 @@ def _apply_v3(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# DDL -- v4 (Phase 4: embeddings metadata + embedding jobs)
+# ---------------------------------------------------------------------------
+#
+# v4 introduces the vector search foundation:
+#
+#   * ``memory_embeddings`` -- the persistent store of embedding
+#     vectors. One row per (memory_id, model_id, model_version)
+#     triple, so that:
+#
+#       - switching the embedding model does NOT corrupt old
+#         vectors (they remain, under a different namespace),
+#       - rolling back to a previous model re-uses its rows
+#         without re-embedding,
+#       - a model upgrade (same model_id, new model_version)
+#         builds a new vector space without mixing with the old.
+#
+#     The ``vector`` column is a BLOB: the repository (Task 4.4)
+#     decides the packed format. float32 is the convention, but
+#     the schema does not enforce it -- if a future model needs
+#     float16, the repository can pack accordingly and store the
+#     dimension out-of-band (see ``len(vector) // bytes_per_elem``
+#     note in ``vector_repository.py``).
+#
+#   * ``memory_embedding_jobs`` -- the durable queue for the
+#     embedding worker. Same lifecycle semantics as
+#     ``memory_jobs`` (Phase 1-A), but WITHOUT the cursor / FIFO
+#     per-chat invariants: embedding jobs are independent (one
+#     per memory per model), not sequential per chat. Multiple
+#     embedding jobs can run in parallel; the worker claims
+#     ``pending`` rows whose ``next_retry_at`` has elapsed.
+#
+# NOT created here: ``memory_vectors`` (the sqlite-vec virtual
+# table). See the module docstring's "Migration v4 does NOT
+# create vec0" note at the top of ``_apply_v4``.
+
+_V4_MEMORY_EMBEDDINGS_DDL: str = """
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id        TEXT NOT NULL,
+    model_id         TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    content_version  INTEGER NOT NULL,
+    vector           BLOB NOT NULL,
+    created_at       REAL NOT NULL,
+    PRIMARY KEY (memory_id, model_id, model_version)
+);
+"""
+
+_V4_MEMORY_EMBEDDINGS_INDEXES_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_model
+    ON memory_embeddings(model_id, model_version, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_memory
+    ON memory_embeddings(memory_id);
+"""
+
+_V4_MEMORY_EMBEDDING_JOBS_DDL: str = """
+CREATE TABLE IF NOT EXISTS memory_embedding_jobs (
+    job_id          TEXT PRIMARY KEY,
+    memory_id       TEXT NOT NULL,
+    model_id        TEXT NOT NULL,
+    model_version   TEXT NOT NULL,
+    content_version INTEGER NOT NULL DEFAULT 1,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 3,
+    created_at      REAL NOT NULL,
+    started_at      REAL,
+    completed_at    REAL,
+    next_retry_at   REAL,
+    error_code      TEXT,
+    error_message   TEXT,
+    cost_nano_usd   INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_V4_MEMORY_EMBEDDING_JOBS_INDEXES_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_embedding_jobs_pending
+    ON memory_embedding_jobs(status, next_retry_at)
+    WHERE status IN ('pending', 'retry_pending');
+
+CREATE INDEX IF NOT EXISTS idx_embedding_jobs_memory
+    ON memory_embedding_jobs(memory_id, model_id, model_version);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_jobs_created
+    ON memory_embedding_jobs(created_at DESC);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Migration v4 -- full function body
+# ---------------------------------------------------------------------------
+
+
+def _apply_v4(conn: sqlite3.Connection) -> None:
+    """Apply the Phase 4 schema: embeddings metadata + embedding jobs.
+
+    Layout
+    ------
+      1. ``memory_embeddings`` -- persistent vector store.
+      2. Two indexes: ``(model_id, model_version, created_at DESC)``
+         for "all embeddings for this model", and ``(memory_id)``
+         for "does this memory have an embedding?".
+      3. ``memory_embedding_jobs`` -- durable worker queue.
+      4. Three indexes: pending-queue scan (partial), per-memory
+         status check, and recency for the API's "recent jobs"
+         view.
+
+    Idempotency
+    -----------
+    Every statement uses ``CREATE ... IF NOT EXISTS``. No ALTER
+    TABLE, so no ``_column_exists`` guard needed. A crash between
+    the DDL and ``_record_version(conn, 4)`` re-runs the whole
+    function safely -- every object is skipped (already exists).
+
+    Migration v4 does NOT create the ``memory_vectors`` virtual table
+    -----------------------------------------------------------------
+    That table is a sqlite-vec ``vec0`` virtual table, requiring:
+
+      1. the extension to be loaded (``sqlite_vec.load(conn)``),
+      2. a FIXED dimension (``FLOAT[N]``), which is the property of
+         the currently-active embedding model.
+
+    Neither condition is guaranteed inside ``apply_schema``:
+
+      * the migration runs on the shared repository connection,
+        which does NOT load sqlite-vec by default (loading it is
+        an opt-in performed by ``vector_repository.py`` at the
+        moment it needs to write a vector),
+      * the dimension changes when the operator switches models,
+        at which point the old table must be dropped and a new
+        one created -- a per-connection operation, not a
+        once-per-schema one.
+
+    The vector_repository (Task 4.4) therefore:
+      * creates ``memory_vectors`` on first use, with the
+        active model's dimension,
+      * drops and re-creates it when the dimension changes
+        (via the reindex path),
+      * verifies the extension is loaded, raising a
+        ``MemoryUnavailableError`` when it is not.
+
+    This keeps the migration pure SQLite-versioned DDL, and
+    isolates the extension's lifecycle to the single module that
+    actually uses it.
+    """
+    conn.executescript(_V4_MEMORY_EMBEDDINGS_DDL)
+    conn.executescript(_V4_MEMORY_EMBEDDINGS_INDEXES_DDL)
+    conn.executescript(_V4_MEMORY_EMBEDDING_JOBS_DDL)
+    conn.executescript(_V4_MEMORY_EMBEDDING_JOBS_INDEXES_DDL)
+
+
+# ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
 #
@@ -627,6 +779,7 @@ _MIGRATIONS: List[Tuple[int, Any]] = [
     (1, _apply_v1),
     (2, _apply_v2),
     (3, _apply_v3),
+    (4, _apply_v4),
 ]
 
 
@@ -925,6 +1078,12 @@ def schema_status(conn: sqlite3.Connection) -> Dict[str, Any]:
         "fts_count": fts_count,
         "needs_rebuild": needs_rebuild,
         "fts5_available": _fts5_available(conn),
+        # Phase 4 diagnostics -- additive fields. Both are False/0
+        # on pre-v4 databases and on any connection where the
+        # respective extension is not loaded. Callers that expect
+        # only the pre-v4 keys are unaffected (dict access by key).
+        "vec0_available": _vec0_available(conn),
+        "embedding_count": _safe_count(conn, "memory_embeddings"),
     }
 
 
@@ -983,6 +1142,50 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
             return True
         finally:
             conn.execute("RELEASE fts5_probe")
+    except sqlite3.Error:
+        return False
+
+
+def _vec0_available(conn: sqlite3.Connection) -> bool:
+    """Return True when sqlite-vec is loaded on this connection.
+
+    Detection strategy
+    ------------------
+    The ``sqlite-vec`` extension exports a SQL function
+    ``vec_version()``. When the extension is loaded on the
+    connection, this call succeeds and returns a version string.
+    When it is not loaded, SQLite raises
+    ``OperationalError: no such function: vec_version`` -- which
+    we catch and translate to ``False``.
+
+    Why not ``SELECT * FROM pragma_module_list``?
+    ---------------------------------------------
+    The virtual-table module list can be inspected via
+    ``pragma_module_list``, and a ``vec0`` entry would indicate
+    availability. However, this pragma is only stable on recent
+    SQLite builds and its column shape has changed across minor
+    versions (3.30 vs 3.40). Calling the extension's exported
+    function is the documented, version-independent check.
+
+    Why not just try ``CREATE VIRTUAL TABLE temp.t USING
+    vec0(...)``?
+    ---------------------------------------------
+    That would CREATE and DROP a temporary table on every
+    diagnostics call -- measurable overhead in a hot path
+    (``schema_status`` runs on every repository init). The
+    ``vec_version()`` probe is a single SELECT with no DDL, no
+    locks, no I/O.
+
+    This function DOES NOT attempt to load the extension. Loading
+    is the responsibility of ``vector_repository.py`` (Task 4.4),
+    which owns the extension's lifecycle on the connection. The
+    migration only needs to DETECT whether it happens to be
+    loaded already -- a False result here is expected on a fresh
+    repository connection and is not an error.
+    """
+    try:
+        conn.execute("SELECT vec_version()").fetchone()
+        return True
     except sqlite3.Error:
         return False
 

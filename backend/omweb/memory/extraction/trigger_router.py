@@ -704,17 +704,70 @@ def _derive_scope(
 ) -> tuple[MemoryScope, str]:
     """Return (scope_type, scope_id) for a job's target scope.
 
-    * project_id present  -> (PROJECT, project_id)
-    * project_id absent   -> (CHAT, chat_id)
+    Rules
+    -----
+      * Real project       -> (PROJECT, project_id)
+      * "Regular" chat     -> (USER, "default")
 
-    The chat-scope fallback is deliberate: standalone chats
-    (default_project) should not have their memories leak into
-    the shared default project scope, which would be visible to
-    every standalone chat.
+    What counts as a "regular" chat
+    -------------------------------
+    Two situations:
+
+      1. ``project_id`` is ``None`` / empty.
+      2. ``project_id`` is the conventional sentinel
+         ``"default_project"`` -- the bucket every standalone
+         chat is auto-assigned to at session-creation time.
+
+    In both cases the operator has not put the chat into a
+    SPECIFIC project. Memories extracted from such chats are
+    about the USER (name, preferences, recurring facts) -- not
+    about a "project". Scoping them to ``project:default_project``
+    would:
+
+      * make them invisible to any chat whose ``project_id`` is
+        ``None`` (a state the codebase still produces), and
+      * make them invisible to any FUTURE chat that the operator
+        creates without first assigning a project.
+
+    User-scoping them solves both problems: every retrieval
+    path unconditionally includes ``user:default`` in
+    ``resolve_scope_refs`` (see ``peldrun.memory.domain.scope``),
+    so a memory extracted from any regular chat is immediately
+    available in every future chat.
+
+    Why ``USER`` and not ``CHAT``
+    -----------------------------
+    ``CHAT:<chat_id>`` would isolate memories to the ONE
+    conversation that produced them. That defeats the entire
+    purpose of persistent memory ("I told you my name
+    yesterday; you should know it today"). The user-scope
+    contract is exactly "durable facts about the person, not
+    about a project" -- which is what regular-chat extraction
+    actually produces.
+
+    Real projects keep their own scope
+    ----------------------------------
+    When the operator has actually created a project and
+    placed chats into it, memories about THAT project must
+    stay isolated -- ``project:<id>`` is the correct scope,
+    and this function preserves it.
+
+    The ``"default_project"`` sentinel
+    ----------------------------------
+    Hardcoded deliberately: it is a SYSTEM constant (see
+    ``project_manager.DEFAULT_PROJECT_ID`` at the backend
+    level), not a user-visible name. Making it configurable
+    would be over-engineering for a value that has never
+    changed in the codebase's history. If a future refactor
+    renames it, one search-and-replace here is cheaper than
+    a settings migration.
     """
-    if project_id:
+    # Sentinel: the auto-assigned "no real project" bucket.
+    _DEFAULT_PROJECT_SENTINEL = "default_project"
+
+    if project_id and project_id != _DEFAULT_PROJECT_SENTINEL:
         return MemoryScope.PROJECT, project_id
-    return MemoryScope.CHAT, chat_id
+    return MemoryScope.USER, "default"
 
 
 async def compute_snapshot_from_file_async(
