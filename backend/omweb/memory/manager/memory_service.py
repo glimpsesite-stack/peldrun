@@ -541,6 +541,57 @@ class MemoryService:
         """
         return self._vec_repository
 
+    @property
+    def last_search_mode(self) -> str:
+        """Strategy used by the most recent memory search.
+
+        One of:
+
+          * ``"hybrid"`` -- both FTS and vector contributed and
+            their ranked lists were fused via RRF.
+          * ``"vector"`` -- vector search produced results but
+            FTS returned nothing (or failed).
+          * ``"fts"``    -- FTS-only (the default; also the result
+            when vector search was skipped for filter reasons,
+            returned no results, or raised).
+
+        The property NEVER returns ``"none"`` -- ``"fts"`` is the
+        correct honest answer for both "no hybrid exists" and
+        "hybrid exists but has not searched yet". A distinct
+        ``"none"`` would mislead callers into thinking memory
+        search is unconfigured, when in fact pure FTS search may
+        be fully operational.
+
+        Read by ``POST /api/memory/search`` to include a
+        ``search_mode`` field in its response, so the operator
+        can verify whether semantic recall actually contributed
+        to the results they are looking at. Also useful for
+        diagnostics dashboards that want to confirm hybrid is
+        wired correctly.
+
+        The property is safe to call at any time -- when hybrid
+        is not initialized (embedding disabled, no model selected,
+        or startup failed), it returns ``"fts"`` without raising,
+        which is the correct answer: pure FTS was the only
+        available strategy.
+        """
+        if self._hybrid_provider is None:
+            # No hybrid pipeline -- by definition, the effective
+            # search strategy is FTS-only. Do NOT return "none"
+            # here: "none" is for "the service hasn't searched
+            # yet", which is different from "no hybrid exists".
+            # The caller of this property is typically building a
+            # response right after a search, and "fts" is a
+            # meaningful, accurate value.
+            return "fts"
+        mode = self._hybrid_provider.last_search_mode
+        # ``last_search_mode`` on the hybrid is None only BEFORE
+        # its first search. After a search, it is one of
+        # "hybrid" / "vector" / "fts". Callers reach this
+        # property post-search, so None is practically impossible
+        # -- but default to "fts" defensively.
+        return mode if mode is not None else "fts"
+
     def get_extraction_trigger(self) -> Optional[str]:
         """Return the current ``extraction_trigger`` mode or ``None``.
 
@@ -2138,6 +2189,51 @@ class MemoryService:
                 "MemoryService: embedding skipped -- provider %r "
                 "is not sqlite_fts.",
                 settings.provider_id,
+            )
+            return
+
+        # ---- 2b. Verify sqlite-vec is available -------------
+        #
+        # [TASK 4.12a-2] Fail FAST before the worker is built.
+        #
+        # Without this gate, a deployment with
+        # ``embedding.enabled=True`` but missing the
+        # ``sqlite-vec`` package would build the worker, let it
+        # claim jobs, call the embedding provider N times, and
+        # only THEN fail with ``Vec0UnavailableError`` on the
+        # first vec0 write attempt -- retrying until each job's
+        # ``max_attempts`` is exhausted.
+        #
+        # The check costs one :memory: connection (<20 ms). The
+        # alternative costs one wasted API call per memory per
+        # reindex attempt. Cheap insurance against a
+        # configuration mistake that would otherwise be invisible
+        # in the boot log.
+        #
+        # Failure mode: log at ERROR and return WITHOUT building
+        # the pipeline. The embedding worker is not created, so
+        # no jobs are ever claimed. The outbox remains on disk
+        # with any existing ``pending`` jobs -- they survive the
+        # restart and can be processed once the operator installs
+        # the missing package. Memory retrieval continues to
+        # operate on FTS (no semantic recall) during this
+        # degraded state, which is the correct behavior.
+        from omweb.memory.storage.vector_repository import (
+            SqliteVecRepository,
+        )
+        if not SqliteVecRepository.probe_availability():
+            logger.error(
+                "MemoryService: embedding.enabled=True but "
+                "sqlite-vec cannot be loaded on this Python "
+                "installation. The embedding pipeline CANNOT "
+                "start. Jobs already in the outbox will remain "
+                "'pending' until sqlite-vec is installed. "
+                "Install with:  pip install sqlite-vec  "
+                "(a precompiled wheel exists for CPython 3.11+ "
+                "on Windows, macOS, and Linux). Then restart "
+                "the server. Memory retrieval will continue to "
+                "serve results via FTS (keyword-only, no "
+                "semantic recall) during this degraded state."
             )
             return
 

@@ -281,6 +281,35 @@ class HybridMemoryProvider:
         self._vec_provider: SqliteVecProvider = vec_provider
         self._rrf_k: int = rrf_k
 
+        #: Records the strategy used by the MOST RECENT
+        #: ``search_ranked`` call. One of:
+        #:
+        #:   * ``"hybrid"`` -- both FTS and vector produced results
+        #:                    and were fused via RRF.
+        #:   * ``"vector"`` -- vector succeeded but FTS returned
+        #:                    nothing (or FTS raised).
+        #:   * ``"fts"``    -- FTS-only (either by choice, or because
+        #:                    the vector path was inapplicable /
+        #:                    returned nothing / raised).
+        #:
+        #: Read by ``MemoryService.last_search_mode`` and surfaced
+        #: through ``POST /api/memory/search`` so the operator can
+        #: verify whether semantic recall actually contributed to
+        #: a given result set.
+        #:
+        #: ``None`` until the first ``search_ranked`` call -- a
+        #: fresh instance has no history to report.
+        #:
+        #: Concurrency: this is diagnostic state, not load-bearing.
+        #: If two searches overlap on the same process, the second
+        #: overwrites the first's mode. Acceptable because (a) the
+        #: value informs UI display only, (b) PELDRUN memory is
+        #: single-process per host (WAL on a local SQLite file --
+        #: no cross-process sharing). A future refactor to return
+        #: ``(results, mode)`` would eliminate the shared state but
+        #: is not required for the diagnostic use case.
+        self._last_search_mode: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Delegation
     # ------------------------------------------------------------------
@@ -414,12 +443,22 @@ class HybridMemoryProvider:
         "no results", which is the correct behavior for a
         search endpoint.
         """
+        # Reset the last-mode tracker at the START of every call.
+        # This guarantees the reported mode belongs to THIS search
+        # -- not to a previous one whose flow happened to skip the
+        # setter (e.g. an early return that bypassed the branches
+        # below). Every return path from here on is responsible
+        # for updating ``_last_search_mode`` to its actual
+        # strategy.
+        self._last_search_mode = None
+
         # Fast path: nothing to search.
         if (
             limit <= 0
             or not scope_refs
             or not isinstance(query, str)
         ):
+            self._last_search_mode = "fts"
             return await self._fts_provider.search_ranked(
                 query, scope_refs, limit, **filters
             )
@@ -427,6 +466,7 @@ class HybridMemoryProvider:
         # Decide whether vector participates.
         use_vec = self._should_use_vector(query, filters)
         if not use_vec:
+            self._last_search_mode = "fts"
             return await self._fts_provider.search_ranked(
                 query, scope_refs, limit, **filters
             )
@@ -476,12 +516,23 @@ class HybridMemoryProvider:
         # verbatim. This preserves each side's native relevance
         # scale, which the ranker downstream understands better
         # than a one-sided RRF normalization would.
-        if not vec_result:
+        if not vec_result and fts_result:
+            self._last_search_mode = "fts"
             return fts_result
-        if not fts_result:
+        if not fts_result and vec_result:
+            self._last_search_mode = "vector"
             return vec_result
+        if not fts_result and not vec_result:
+            # Both sides empty (either they had nothing, or
+            # both raised and were reset to []). Report "fts"
+            # because that is what the caller effectively
+            # received from their perspective -- no results,
+            # no semantic contribution.
+            self._last_search_mode = "fts"
+            return []
 
         # ---- Both sides produced results -- fuse with RRF ---
+        self._last_search_mode = "hybrid"
         return self._rrf_merge(fts_result, vec_result, limit)
 
     # ------------------------------------------------------------------
@@ -592,6 +643,25 @@ class HybridMemoryProvider:
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
+
+    @property
+    def last_search_mode(self) -> Optional[str]:
+        """Strategy used by the most recent ``search_ranked`` call.
+
+        Returns ``None`` before any search runs; otherwise one of
+        ``"hybrid"``, ``"vector"``, or ``"fts"``. See
+        ``_last_search_mode`` in ``__init__`` for the semantics
+        of each value.
+
+        The result reflects the FIRST decision that determined the
+        outcome, not a post-hoc reconstruction: if both sides
+        produced results, it is ``"hybrid"``; if only one side
+        did, it is that side's tag. This is exactly what the
+        operator wants -- a reliable indicator that "did semantic
+        recall actually contribute?" -- rather than a synthesized
+        guess after the fact.
+        """
+        return self._last_search_mode
 
     @property
     def rrf_k(self) -> int:

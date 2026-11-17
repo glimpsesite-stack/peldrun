@@ -526,6 +526,25 @@ async def search_endpoint(body: _SearchBody) -> JSONResponse:
     formatted = format_memory_context(context)
     results = [_entry_to_dict(entry) for entry in context.memories]
 
+    # Determine the effective search strategy for the response.
+    # ``service.last_search_mode`` reflects what the memory
+    # provider ACTUALLY did for this query:
+    #   * "hybrid" -- both FTS and vector ran, results fused
+    #   * "vector" -- vector-only (FTS had nothing)
+    #   * "fts"    -- FTS-only (default, or vector unavailable)
+    #
+    # The field is diagnostic-only -- the caller should not branch
+    # on it, but it lets the UI show "Hybrid" vs "Keyword" next to
+    # the search box so the operator can verify configuration.
+    search_mode = "fts"
+    try:
+        search_mode = service.last_search_mode
+    except Exception:
+        # Defensive: a bug in the property must not break search.
+        # Fall back to the default ("fts") which is the honest
+        # description of a pure-lexical deployment.
+        pass
+
     return JSONResponse(
         status_code=http_status.HTTP_200_OK,
         content={
@@ -533,6 +552,9 @@ async def search_endpoint(body: _SearchBody) -> JSONResponse:
             "query": body.query, "scope_refs": list(scope_refs),
             "router_decision": context.router_decision,
             "ranker_version": context.ranker_version,
+            # Diagnostic field (Phase 4): which strategy actually
+            # produced this result set. See the comment above.
+            "search_mode": search_mode,
             "count": len(results),
             "used_tokens": context.used_tokens,
             "token_budget": context.token_budget,

@@ -87,6 +87,16 @@ from omweb.routers import (
 # memory_rtr.router; see the include comment below for ordering).
 from omweb.memory.api.memory_crud import router as memory_crud
 
+# Phase 4: periodic auto-batch scheduler.
+#
+# Imported at module level (not lazily inside lifespan) because
+# ``BatchScheduler`` itself has no runtime dependency on
+# ``MemoryService`` -- it only holds a TYPE_CHECKING import, so
+# the module loads without touching the memory service tree.
+# Importing at the top lets the lifespan hook reference the
+# class once, in block 0e below, without an inline import.
+from omweb.memory.jobs.batch_scheduler import BatchScheduler
+
 # Tool Bundles Subsystem router
 from omweb.routers.store import bundles as store_bundles
 
@@ -382,6 +392,67 @@ async def lifespan(app: FastAPI):
             exc_info=True,
         )
 
+    # 0e. Start the Batch Scheduler (Phase 4).
+    #
+    # Runs AFTER the extraction worker (0c) and the embedding
+    # worker (0d) because it depends on components BOTH of those
+    # blocks may have created:
+    #
+    #   * ``batch_service`` (from the extraction pipeline, block
+    #     0c) -- the scheduler calls
+    #     ``batch_service.create_batch`` and
+    #     ``batch_service.list_batches``. If extraction is
+    #     disabled, ``batch_service is None`` and the scheduler
+    #     reads that state via ``_read_schedule_hours``,
+    #     returning None and idling. That is the CORRECT
+    #     degraded behavior -- no crash, no spurious work.
+    #
+    #   * ``settings.ai.batch_auto_schedule_hours`` -- read from
+    #     the current settings on every tick, so a settings
+    #     change via PATCH /api/memory/settings takes effect
+    #     within 60 seconds WITHOUT a restart. The scheduler
+    #     does not cache the value.
+    #
+    # Scheduling behavior summary:
+    #
+    #   * ``batch_enabled=False`` -> scheduler idles (60s polls).
+    #   * ``batch_auto_schedule_hours=None`` -> scheduler idles
+    #     until the operator sets a value.
+    #   * ``batch_auto_schedule_hours=N`` -> waits N hours
+    #     (interruptible in 60s slices), then creates a batch
+    #     IF no other batch is RUNNING or PAUSED.
+    #
+    # Failure handling: any exception here is logged at WARNING
+    # and NEVER blocks startup. ``_batch_scheduler`` is
+    # explicitly set to None BEFORE the try so the shutdown
+    # block below can always check ``is not None`` without a
+    # ``NameError`` on partial-init failure.
+    _batch_scheduler: Optional[BatchScheduler] = None
+    try:
+        _sched_svc = get_memory_service()
+        if _sched_svc is not None:
+            _batch_scheduler = BatchScheduler(_sched_svc)
+            await _batch_scheduler.start()
+            logger.info(
+                "BatchScheduler started (poll_interval=60s); "
+                "auto-batch will run when "
+                "`batch_auto_schedule_hours` is set in the AI "
+                "settings. This is a no-op until then."
+            )
+        else:
+            logger.debug(
+                "BatchScheduler: memory service unavailable; "
+                "scheduler not started."
+            )
+    except Exception as exc:
+        logger.warning(
+            "Batch scheduler startup failed (non-fatal; "
+            "auto-batch unavailable until restart): %s",
+            exc,
+            exc_info=True,
+        )
+        _batch_scheduler = None
+
     # 1. Start Resource Monitor subsystem
     try:
         from omweb.services.resource_monitor_service import (
@@ -656,6 +727,46 @@ async def lifespan(app: FastAPI):
             "(non-fatal): %s",
             exc,
         )
+
+    # 3-prior. [PHASE 4] Stop the Auto-Batch Scheduler BEFORE the
+    # extraction worker (block 3b) and before the memory service
+    # shutdown (block 4).
+    #
+    # Ordering rationale:
+    #
+    #   * The scheduler's ``_run_loop`` calls
+    #     ``batch_service.create_batch`` and
+    #     ``batch_service.list_batches``, both of which touch the
+    #     extraction outbox. Stopping the scheduler FIRST
+    #     guarantees no in-flight tick races the extraction
+    #     worker's shutdown (block 3b, which calls
+    #     ``stop_extraction_worker``) or the outbox close (block
+    #     4, inside ``shutdown_memory_service``).
+    #
+    #   * ``BatchScheduler.stop()`` has a 10s timeout -- generous
+    #     for a scheduler whose only blocking operation is a
+    #     DB write that completes in single-digit milliseconds.
+    #     The 10s cap exists to bound the worst case where
+    #     ``create_batch`` hits a wedged SQLite transaction; the
+    #     scheduler's own ``stop()`` cancels the run task after
+    #     the timeout, so shutdown cannot hang indefinitely.
+    #
+    #   * ``_batch_scheduler`` was initialized to ``None`` at the
+    #     top of block 0e, so ``is not None`` is safe even when
+    #     startup failed partway through. The outer try/except
+    #     catches any exception from ``stop()`` -- a broken
+    #     scheduler shutdown must not prevent the extraction
+    #     worker or the memory service from shutting down.
+    if _batch_scheduler is not None:
+        try:
+            await _batch_scheduler.stop(timeout_seconds=10)
+            logger.info("BatchScheduler stopped cleanly.")
+        except Exception as exc:
+            logger.warning(
+                "Batch scheduler stop failed (non-fatal): %s",
+                exc,
+            )
+        _batch_scheduler = None
 
     # 3b. [PHASE 1-C] Stop the Memory Extraction Worker BEFORE the
     # memory service shutdown below.

@@ -376,6 +376,96 @@ class SqliteVecRepository:
         except Exception:
             return ""
 
+    @classmethod
+    def probe_availability(cls) -> bool:
+        """Return True when sqlite-vec can load on a test connection.
+
+        [TASK 4.12a-2] This is the preflight gate that
+        ``MemoryService._initialize_embedding`` calls BEFORE
+        constructing the pipeline. Without it, a deployment that
+        has ``embedding.enabled=True`` but is missing the
+        ``sqlite-vec`` package would:
+
+          1. Build the worker.
+          2. Let it claim jobs from the embedding outbox.
+          3. Send 10-100+ HTTP requests to the embedding
+             provider (LM Studio / OpenAI / Ollama) to fetch
+             vectors.
+          4. Fail on the FIRST vec0 write attempt with
+             ``Vec0UnavailableError``.
+          5. Retry each job until ``max_attempts`` is
+             exhausted -- burning API quota for a failure
+             that was predictable BEFORE any of it started.
+
+        The cost of this check is ONE ``:memory:`` connection
+        that loads the extension and is immediately closed --
+        roughly 5-20 milliseconds on a typical machine. The
+        cost of NOT having it is one wasted API call per
+        memory per reindex attempt (potentially hundreds).
+
+        Design notes
+        ------------
+        * **Uses ``:memory:`` SQLite**, not the real DB. Reason:
+          we only need to verify that the extension CAN be
+          loaded. Touching the real DB here would create a
+          connection that must be managed by the caller, and
+          would not add any information -- the extension is
+          either loadable on this Python build or it is not,
+          and that fact is per-process, not per-database.
+
+        * **Fails silently to ``False``**, not to an exception.
+          The CALLER decides what to do with the boolean --
+          currently, log an ERROR and skip the pipeline. A
+          future caller might want to try a degraded path
+          (e.g. FTS-only), and an exception here would force
+          every caller to wrap in try/except.
+
+        * **Idempotent and cheap.** Calling it multiple times
+          opens a fresh ``:memory:`` connection each time --
+          total overhead <100ms across a boot cycle. Not worth
+          caching because the whole point is to run it once
+          during initialization.
+
+        Returns
+        -------
+        bool
+            ``True`` if the extension loaded successfully on a
+            throwaway connection. ``False`` for every failure
+            mode: package missing (``ImportError``), wheel
+            incompatible with the Python/SQLite build,
+            sandbox forbidding extension loads, corrupt
+            binary. The operator sees the specific reason in
+            the ERROR log emitted by ``_initialize_embedding``,
+            not from this method (which stays silent by
+            design).
+        """
+        try:
+            import sqlite_vec  # noqa: F401
+        except ImportError:
+            return False
+
+        test_conn = None
+        try:
+            test_conn = sqlite3.connect(":memory:")
+            # Match the exact sequence ``_ensure_extension_loaded``
+            # uses -- enable, load, disable. A different sequence
+            # would not actually prove that the real code path
+            # will work.
+            test_conn.enable_load_extension(True)
+            try:
+                sqlite_vec.load(test_conn)
+            finally:
+                test_conn.enable_load_extension(False)
+            return True
+        except Exception:
+            return False
+        finally:
+            if test_conn is not None:
+                try:
+                    test_conn.close()
+                except sqlite3.Error:
+                    pass
+
     # ------------------------------------------------------------------
     # vec0 table management
     # ------------------------------------------------------------------

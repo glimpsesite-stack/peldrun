@@ -57,6 +57,7 @@ import {
 } from '../lib/constants';
 import { useSearchMemories } from '../api/mutations';
 import { cn } from '../lib/cn';
+import { SearchModeBadge } from './SearchModeBadge';
 
 // ---------------------------------------------------------------------------
 // Props
@@ -201,6 +202,11 @@ export function SimilarMemoriesPanel({
   const data = searchMutation.data;
   const results: MemoryEntry[] = data?.results ?? [];
   const dropped = data?.dropped_for_budget ?? 0;
+  // Diagnostic: which retrieval strategy produced `results`.
+  // Typed narrowly so the badge cannot silently render an
+  // unrecognized mode. `undefined` when the response field is
+  // absent (older backend) -- the badge then renders nothing.
+  const searchMode = data?.search_mode;
 
   return (
     <div
@@ -222,6 +228,19 @@ export function SimilarMemoriesPanel({
             />
             {t('entry.similar.checking')}
           </span>
+        )}
+        {/* Mode badge: rendered only after a completed search
+            that returned a mode field. Kept on the SAME line as
+            the title so the panel's vertical footprint is
+            unchanged -- the whole point of the badge is
+            glanceability, not decoration. `ms-auto` pushes it
+            to the trailing edge so it does not compete with the
+            title for reading priority. */}
+        {!isPending && searchMode !== undefined && (
+          <SearchModeBadge
+            mode={searchMode}
+            className="ms-auto"
+          />
         )}
       </div>
 

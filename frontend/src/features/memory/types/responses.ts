@@ -337,6 +337,41 @@ export interface SearchMemoryResponse extends MemoryOkEnvelope {
   scope_refs: MemoryScopeRefString[];
   router_decision: RouterDecision;
   ranker_version: string;
+
+  /**
+   * Which retrieval strategy actually produced `results`.
+   *
+   *   * `"hybrid"` -- FTS (BM25) AND vector (cosine) both
+   *                   returned candidates; their ranked lists
+   *                   were fused via Reciprocal Rank Fusion.
+   *
+   *   * `"vector"` -- vector search returned candidates but FTS
+   *                   produced none (typical for pure-semantic
+   *                   queries with no lexical overlap with any
+   *                   stored entry).
+   *
+   *   * `"fts"`    -- FTS-only. Either the vector path was not
+   *                   applicable (embedding disabled, model
+   *                   unreachable, non-active status filter),
+   *                   or it returned nothing, or it raised and
+   *                   the hybrid degraded.
+   *
+   * Diagnostic field. The caller SHOULD NOT branch on it to
+   * alter behavior -- it exists so the operator can SEE that
+   * semantic recall contributed (or did not) to what they are
+   * looking at. The `SearchModeBadge` component in
+   * `components/SearchModeBadge.tsx` renders it as a chip next
+   * to the "Similar memories" header.
+   *
+   * The backend field is `service.last_search_mode` and is
+   * ALWAYS one of these three literals on a successful response.
+   * The type reflects that guarantee -- do not widen it to
+   * `string` "just in case". A new mode added server-side must
+   * be reflected here explicitly so the badge cannot silently
+   * fall back to an unlabeled default.
+   */
+  search_mode: 'fts' | 'vector' | 'hybrid';
+
   count: number;
   used_tokens: number;
   token_budget: number;
