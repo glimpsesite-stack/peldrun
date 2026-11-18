@@ -25,6 +25,7 @@ import {
 import { useMemorySettings } from '../../../features/memory/api/queries';
 import { SettingsForm } from '../../../features/memory/components/SettingsForm';
 import { AISettingsForm } from '../../../features/memory/components/AISettingsForm';
+import { MemoryRetrievalSettingsForm } from '../../../features/memory/components/MemoryRetrievalSettingsForm';
 import { MemorySection } from '../../../features/memory/components/MemorySection';
 import { cn } from '../../../features/memory/lib/cn';
 
@@ -113,14 +114,19 @@ export default function MemorySettingsPage() {
           <SettingsForm />
         </section>
 
-        {/* ============ Semantic search (Phase 4) ============ */}
+        {/* ============ Semantic search (Phase 4 + Phase 5A) ============ */}
         <section
           id="semantic"
           className={cn(
-            'transition-all duration-200',
+            'transition-all duration-200 space-y-6',
             activeTab === 'semantic' ? 'block' : 'hidden',
           )}
         >
+          {/* Retrieval strategy: mode, fusion tuning, LLM reranker. */}
+          <MemoryRetrievalSettingsForm />
+
+          {/* Embedding model: pointer to the dedicated page that
+              manages model selection, reindex, and dimension state. */}
           <MemorySection
             icon={Brain}
             title={t('settings.sections.semanticSearch')}

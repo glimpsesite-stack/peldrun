@@ -234,6 +234,7 @@ class HybridMemoryProvider:
         fts_provider: MemoryProvider,
         vec_provider: SqliteVecProvider,
         rrf_k: int = _DEFAULT_RRF_K,
+        reranker: Optional[Any] = None,
     ) -> None:
         """Construct the hybrid wrapper.
 
@@ -250,6 +251,20 @@ class HybridMemoryProvider:
             signal.
         rrf_k
             Smoothing constant for RRF. Defaults to 60.
+        reranker
+            Optional Phase 5A LLM reranker. When supplied AND
+            active (see ``CrossEncoderReranker.is_active``) AND
+            the search produces a hybrid fusion, its ``rerank``
+            coroutine is invoked AFTER ``_rrf_merge`` and BEFORE
+            the caller receives results. The reranker is a
+            NO-OP when not configured (no model selected) and
+            gracefully degrades to RRF ordering on any failure
+            (timeout, parse error, provider down) -- so passing
+            ``None`` (the default) and passing an INACTIVE
+            reranker produce IDENTICAL search behavior. Stored
+            as ``Any`` rather than a concrete type to keep this
+            module decoupled from
+            ``peldrun.memory.retrieval.reranker``.
 
         Raises
         ------
@@ -280,12 +295,31 @@ class HybridMemoryProvider:
         self._fts_provider: MemoryProvider = fts_provider
         self._vec_provider: SqliteVecProvider = vec_provider
         self._rrf_k: int = rrf_k
+        #: Phase 5A: optional LLM-based reranker. ``None`` when
+        #: disabled in settings or when no model is configured --
+        #: in that case ``search_ranked`` skips the rerank step
+        #: entirely, so the search path is unchanged from
+        #: Phase 4.
+        #:
+        #: Stored as ``Any`` (not a typed reference to
+        #: ``peldrun.memory.retrieval.reranker.CrossEncoderReranker``)
+        #: to keep this module decoupled from the concrete
+        #: reranker implementation. Any object exposing an async
+        #: ``rerank(query, candidates, top_k)`` coroutine and a
+        #: ``last_rerank_succeeded: bool`` property is compatible.
+        self._reranker: Optional[Any] = reranker
 
         #: Records the strategy used by the MOST RECENT
         #: ``search_ranked`` call. One of:
         #:
+        #:   * ``"hybrid+rerank"`` -- both FTS and vector contributed,
+        #:                    their ranked lists were fused via RRF,
+        #:                    and the fused result was re-ordered
+        #:                    by the Phase 5A LLM reranker.
         #:   * ``"hybrid"`` -- both FTS and vector produced results
-        #:                    and were fused via RRF.
+        #:                    and were fused via RRF. (Either no
+        #:                    reranker is configured OR the reranker
+        #:                    fell back to RRF ordering.)
         #:   * ``"vector"`` -- vector succeeded but FTS returned
         #:                    nothing (or FTS raised).
         #:   * ``"fts"``    -- FTS-only (either by choice, or because
@@ -294,8 +328,8 @@ class HybridMemoryProvider:
         #:
         #: Read by ``MemoryService.last_search_mode`` and surfaced
         #: through ``POST /api/memory/search`` so the operator can
-        #: verify whether semantic recall actually contributed to
-        #: a given result set.
+        #: verify whether semantic recall and/or LLM reranking
+        #: actually contributed to a given result set.
         #:
         #: ``None`` until the first ``search_ranked`` call -- a
         #: fresh instance has no history to report.
@@ -532,8 +566,63 @@ class HybridMemoryProvider:
             return []
 
         # ---- Both sides produced results -- fuse with RRF ---
+        fused = self._rrf_merge(fts_result, vec_result, limit)
+
+        # ---- Optional: LLM-based reranking (Phase 5A) -------
+        #
+        # The reranker is applied ONLY to the fused hybrid
+        # results, never to the single-source branches above.
+        # Reasons:
+        #
+        #   * The reranker's prompt was designed to re-order
+        #     candidates whose scores are already RRF-fused --
+        #     its job is to refine an ALREADY blended
+        #     ordering, not to compete with a single source's
+        #     native scale (BM25 or cosine).
+        #
+        #   * The reference §6.3 specifies "after RRF fusion,
+        #     before the ranker" -- i.e. the hybrid path only.
+        #
+        #   * Cost: single-source searches (FTS-only via
+        #     filter incompatibility, vector-only after FTS
+        #     failure, etc.) pay no LLM cost. Those paths are
+        #     typically fast-fallback states where adding an
+        #     LLM call would make the degradation WORSE.
+        #
+        # ``self._reranker`` is None when the operator has
+        # not enabled reranking in settings. Even when present,
+        # the reranker itself is a NO-OP if no model is
+        # configured (see ``CrossEncoderReranker.is_active``) --
+        # so ``rerank()`` returns its input unchanged with
+        # negligible overhead.
+        if self._reranker is not None and len(fused) > 1:
+            reranked = await self._reranker.rerank(
+                query, fused, top_k=limit,
+            )
+            # ``last_rerank_succeeded`` distinguishes "the LLM
+            # actually re-ordered the results" from "the
+            # reranker fell back to RRF ordering". Both cases
+            # return the correct result set (rerank is
+            # no-worse-than-input by contract), but only the
+            # former deserves the ``"hybrid+rerank"`` tag --
+            # otherwise the operator sees a misleading
+            # diagnostic.
+            #
+            # ``getattr(..., False)`` tolerates a reranker
+            # implementation (e.g. a test mock) that does not
+            # expose the property -- falls back to "assume
+            # failed", which keeps ``_last_search_mode`` at
+            # the conservative ``"hybrid"``.
+            if getattr(
+                self._reranker, "last_rerank_succeeded", False
+            ):
+                self._last_search_mode = "hybrid+rerank"
+            else:
+                self._last_search_mode = "hybrid"
+            return reranked
+
         self._last_search_mode = "hybrid"
-        return self._rrf_merge(fts_result, vec_result, limit)
+        return fused
 
     # ------------------------------------------------------------------
     # Fusion internals
@@ -649,17 +738,20 @@ class HybridMemoryProvider:
         """Strategy used by the most recent ``search_ranked`` call.
 
         Returns ``None`` before any search runs; otherwise one of
-        ``"hybrid"``, ``"vector"``, or ``"fts"``. See
-        ``_last_search_mode`` in ``__init__`` for the semantics
-        of each value.
+        ``"hybrid+rerank"``, ``"hybrid"``, ``"vector"``, or
+        ``"fts"``. See ``_last_search_mode`` in ``__init__`` for
+        the semantics of each value.
 
         The result reflects the FIRST decision that determined the
         outcome, not a post-hoc reconstruction: if both sides
-        produced results, it is ``"hybrid"``; if only one side
-        did, it is that side's tag. This is exactly what the
-        operator wants -- a reliable indicator that "did semantic
-        recall actually contribute?" -- rather than a synthesized
-        guess after the fact.
+        produced results and the reranker improved them, it is
+        ``"hybrid+rerank"``; if both sides produced results but
+        no reranker applied (or the reranker fell back), it is
+        ``"hybrid"``; if only one side produced, it is that
+        side's tag. This is exactly what the operator wants -- a
+        reliable indicator that "did semantic recall and/or LLM
+        reranking actually contribute?" -- rather than a
+        synthesized guess after the fact.
         """
         return self._last_search_mode
 
@@ -678,12 +770,30 @@ class HybridMemoryProvider:
         """The wrapped vector provider (for tests + diagnostics)."""
         return self._vec_provider
 
+    @property
+    def reranker(self) -> Optional[Any]:
+        """The optional Phase 5A LLM reranker, or ``None``.
+
+        Exposed for diagnostics and for ``MemoryService`` (which
+        needs to distinguish "hybrid but no reranker" from
+        "hybrid+reranker disabled in settings" when building
+        the ``search_mode`` diagnostic surfaced through
+        ``POST /api/memory/search``).
+        """
+        return self._reranker
+
     def __repr__(self) -> str:
+        reranker_desc = (
+            repr(self._reranker)
+            if self._reranker is not None
+            else "None"
+        )
         return (
             f"HybridMemoryProvider("
             f"fts={type(self._fts_provider).__name__}, "
             f"vec={type(self._vec_provider).__name__}, "
-            f"rrf_k={self._rrf_k})"
+            f"rrf_k={self._rrf_k}, "
+            f"reranker={reranker_desc})"
         )
 
 

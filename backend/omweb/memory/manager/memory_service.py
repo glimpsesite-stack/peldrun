@@ -2816,25 +2816,56 @@ class MemoryService:
                 dimensions=dimensions,
             )
 
+            # Phase 5A: build the optional LLM reranker.
+            #
+            # Returns None ONLY when no LLM model is resolvable
+            # at all (no extraction model AND no fallback marked
+            # memory model). When a model IS configured, the
+            # reranker is ALWAYS built -- the runtime gate for
+            # ``retrieval.rerank_enabled`` happens INSIDE
+            # ``CrossEncoderReranker.rerank()`` via
+            # ``rerank_enabled_provider``. This is why
+            # ``reload_settings`` toggling the flag takes effect
+            # on the NEXT search WITHOUT a rebuild: the reranker
+            # instance already exists; only the runtime gate
+            # needs to flip. See ``_build_reranker_if_configured``
+            # for the full rationale.
+            reranker = self._build_reranker_if_configured()
+
             # Hybrid: wraps the FTS provider (from lifecycle)
             # and the vector provider. Delegates ALL non-search
             # methods to FTS via ``__getattr__``.
             hybrid = HybridMemoryProvider(
                 fts_provider=self._lifecycle.provider,
                 vec_provider=vec_provider,
+                reranker=reranker,
             )
 
             # ---- 4. Commit state -------------------------
             self._vec_provider = vec_provider
             self._hybrid_provider = hybrid
 
+            if reranker is not None:
+                rerank_status = (
+                    "ON"
+                    if reranker.is_active
+                    else "NO-OP (model unresolved)"
+                )
+                rerank_suffix = " and rerank via LLM"
+            else:
+                rerank_status = "off (no model configured)"
+                rerank_suffix = ""
+
             logger.info(
                 "MemoryService: hybrid retrieval ENABLED "
-                "(dimensions=%d, model=%r, rrf_k=%d). Search "
-                "will fuse FTS (BM25) with vector similarity.",
+                "(dimensions=%d, model=%r, rrf_k=%d, "
+                "reranker=%s). Search will fuse FTS (BM25) with "
+                "vector similarity%s.",
                 dimensions,
                 resolved.model_id,
                 hybrid.rrf_k,
+                rerank_status,
+                rerank_suffix,
             )
             return True
 
@@ -2857,6 +2888,231 @@ class MemoryService:
                 except Exception:
                     pass
             return False
+
+    def _build_reranker_if_configured(self) -> Optional[Any]:
+        """Build the Phase 5A reranker if an LLM model is available.
+
+        Returns
+        -------
+        Optional[Any]
+            A ``CrossEncoderReranker`` instance, or ``None``.
+
+            Returns ``None`` when:
+              * no ``settings.ai`` is available at all (the
+                extraction subsystem is completely unconfigured);
+              * no ``settings.ai.extraction`` model is configured
+                AND no fallback marked-memory model exists;
+              * ``CrossEncoderReranker`` construction raises
+                (logged at WARNING; search remains hybrid-only).
+
+            Returns a reranker INSTANCE whenever a model IS
+            resolvable -- regardless of the CURRENT value of
+            ``retrieval.rerank_enabled``. The runtime gate for
+            that flag lives INSIDE ``rerank()`` via
+            ``rerank_enabled_provider``, so flipping the flag
+            at runtime takes effect on the NEXT search WITHOUT
+            a rebuild. This method therefore does NOT check
+            ``rerank_enabled`` itself -- the check is deferred
+            to the runtime gate.
+
+        Design rationale
+        ----------------
+        Building the reranker eagerly (when a model is
+        configured) rather than lazily-on-first-search has
+        three benefits:
+
+          1. **Reload-safe without rebuild**: flipping
+             ``rerank_enabled`` from False to True in
+             ``reload_settings`` takes effect immediately.
+             The instance already exists; only the runtime
+             gate needs to flip. No hybrid rebuild, no
+             restart.
+
+          2. **Boot-time diagnostics**: the log line emitted
+             here shows the operator exactly what is running,
+             including whether reranking is currently enabled.
+
+          3. **Fail-fast on misconfiguration**: a broken
+             model config surfaces at construction time
+             (logged) rather than at the first search (silent
+             degradation).
+
+        The cost is trivial: object construction is pure
+        allocation (no I/O). The LLM gateway is lazy -- it
+        connects only on the first ``generate_structured``
+        call. Even when ``rerank_enabled=False``, building the
+        reranker costs microseconds and consumes zero network
+        resources.
+
+        Never raises. All failure modes log at WARNING and
+        return ``None``.
+        """
+        try:
+            # ---- 1. Settings gate -------------------------
+            settings = self._lifecycle.settings
+            ai = getattr(settings, "ai", None)
+            if ai is None:
+                logger.debug(
+                    "MemoryService: no AI settings; reranker "
+                    "will not be built (search stays hybrid-only)."
+                )
+                return None
+
+            extraction = getattr(ai, "extraction", None)
+            if extraction is None:
+                logger.debug(
+                    "MemoryService: no extraction model config; "
+                    "reranker will not be built."
+                )
+                return None
+
+            provider_id = getattr(extraction, "provider_id", None)
+            model_id = getattr(extraction, "model_id", None)
+
+            # ---- 2. Resolve provider via fallbacks --------
+            # Same inference path as ``_model_config_provider``
+            # in ``_initialize_extraction`` -- reuse the
+            # existing static helpers so no duplicate logic.
+            if model_id and not provider_id:
+                inferred = self._resolve_model_provider(
+                    str(model_id)
+                )
+                if inferred is not None:
+                    provider_id = inferred
+                    logger.debug(
+                        "MemoryService: inferred provider %r "
+                        "for reranker model %r.",
+                        provider_id, model_id,
+                    )
+
+            if not model_id:
+                fallback = self._resolve_first_memory_model()
+                if fallback is not None:
+                    provider_id, model_id = fallback
+                    logger.debug(
+                        "MemoryService: using first marked memory "
+                        "model %r::%r for reranker.",
+                        provider_id, model_id,
+                    )
+
+            if not provider_id or not model_id:
+                logger.info(
+                    "MemoryService: no model resolved for "
+                    "reranker (provider=%r, model=%r); search "
+                    "remains hybrid-only. Configure a model in "
+                    "Settings -> Memory -> AI to enable.",
+                    provider_id, model_id,
+                )
+                return None
+
+            # ---- 3. Build the gateway ---------------------
+            # Same pattern as _initialize_extraction, but
+            # simpler: no "has_real_transport" gate. The
+            # reranker is a READ-side feature -- a broken
+            # transport degrades to RRF ordering on the first
+            # search; it never leaves stuck jobs or a corrupt
+            # cursor.
+            from omweb.memory.extraction.gateway import (
+                MemoryModelGateway,
+            )
+
+            transport = None
+            if self._transport_provider is not None:
+                try:
+                    transport = self._transport_provider()
+                except Exception as exc:
+                    logger.warning(
+                        "MemoryService: transport_provider "
+                        "raised during reranker construction; "
+                        "falling through to default transport: "
+                        "%s", exc,
+                    )
+                    transport = None
+
+            extra_body = dict(
+                getattr(extraction, "extraction_extra_body", {})
+                or {}
+            )
+
+            gateway = MemoryModelGateway(
+                transport=transport,
+                force_openai_compat=True,
+                extraction_extra_body=extra_body,
+            )
+
+            # ---- 4. Runtime enabled-flag reader -----------
+            # Reads the LIVE settings on every rerank() call.
+            # ``self._lifecycle`` is stable (its ``settings``
+            # field is atomically swapped by reload_settings),
+            # so this closure always sees the current flag --
+            # no rebuild, no restart, no race.
+            def _rerank_enabled_provider() -> bool:
+                try:
+                    cur = self._lifecycle.settings
+                    cur_ret = getattr(cur, "retrieval", None)
+                    if cur_ret is None:
+                        return False
+                    return bool(
+                        getattr(cur_ret, "rerank_enabled", False)
+                    )
+                except Exception:
+                    # Fail-closed: a broken settings reader
+                    # must not accidentally trigger LLM
+                    # calls on every search (cost risk).
+                    return False
+
+            # ---- 5. Construct the reranker -----------------
+            from peldrun.memory.retrieval.reranker import (
+                CrossEncoderReranker,
+            )
+
+            retrieval = getattr(settings, "retrieval", None)
+            reranker = CrossEncoderReranker(
+                gateway=gateway,
+                provider_id=str(provider_id),
+                model_id=str(model_id),
+                rerank_max_candidates=int(
+                    getattr(
+                        retrieval, "rerank_max_candidates", 20,
+                    )
+                    if retrieval is not None else 20
+                ),
+                rerank_batch_size=int(
+                    getattr(retrieval, "rerank_batch_size", 5)
+                    if retrieval is not None else 5
+                ),
+                timeout_seconds=float(
+                    getattr(
+                        retrieval, "rerank_timeout_seconds", 3.0,
+                    )
+                    if retrieval is not None else 3.0
+                ),
+                rerank_enabled_provider=_rerank_enabled_provider,
+                connection_id="memory_rerank",
+            )
+
+            # ---- 6. Report status --------------------------
+            runtime_enabled = _rerank_enabled_provider()
+            logger.info(
+                "MemoryService: reranker constructed "
+                "(provider=%r, model=%r, "
+                "rerank_enabled=%s, batch_size=%d, "
+                "max_candidates=%d, timeout=%.1fs).",
+                provider_id, model_id,
+                runtime_enabled,
+                reranker.rerank_batch_size,
+                reranker.rerank_max_candidates,
+                reranker.timeout_seconds,
+            )
+            return reranker
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: reranker construction failed -- "
+                "search will remain hybrid-only: %s",
+                exc,
+                exc_info=True,
+            )
+            return None
 
     async def _build_hybrid_provider_in_background(
         self,

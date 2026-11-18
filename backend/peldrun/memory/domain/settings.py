@@ -881,13 +881,73 @@ class MemoryRetrievalSettings(BaseModel):
     rerank_enabled: bool = Field(
         default=False,
         description=(
-            "Phase 5 stub. When True, the router calls "
+            "Master switch for the Phase 5 reranking step. "
+            "When True AND an extraction model is configured "
+            "AND ``rerank_max_candidates > 0``, "
+            "``HybridMemoryProvider.search_ranked`` invokes "
             "``CrossEncoderReranker.rerank`` on the fused "
-            "top-K before returning results. Present in "
-            "Phase 4 so a future Phase 5 deployment does not "
-            "need a settings migration -- the router checks "
-            "this flag and skips the (not-yet-existing) "
-            "reranker in Phase 4."
+            "top-K, re-ordering candidates by LLM-scored "
+            "query relevance. When False (the default), the "
+            "search path is identical to Phase 4 -- no LLM "
+            "call, no added latency, no change to "
+            "``search_mode``. Any reranker failure (timeout, "
+            "parse error, provider down) degrades gracefully "
+            "to RRF ordering; the search endpoint never "
+            "returns an error because of the reranker."
+        ),
+    )
+    rerank_max_candidates: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Upper bound on candidates sent to the reranker "
+            "LLM per search. Candidates beyond this cap "
+            "retain their RRF position and are appended "
+            "AFTER the reranked set, so ``top_k`` larger "
+            "than this cap still returns the full count "
+            "(reranked head + RRF-ordered tail). 20 covers "
+            "the typical ``default_limit * 4`` window the "
+            "ranker/budget fitter downstream considers, so "
+            "virtually all retrievable entries get scored "
+            "at negligible extra cost. Increase only if you "
+            "routinely search with ``default_limit > 10``."
+        ),
+    )
+    rerank_timeout_seconds: float = Field(
+        default=3.0,
+        ge=1.0,
+        le=30.0,
+        description=(
+            "Per-batch wall-clock timeout for one reranker "
+            "LLM call. Applied via ``asyncio.wait_for`` "
+            "around each ``generate_structured`` call. "
+            "3.0s matches the LLM's typical latency "
+            "(sub-500ms when healthy) with headroom for "
+            "reasoning-capable models. A timeout degrades "
+            "to RRF ordering rather than failing the "
+            "search. Do NOT raise this above 10s -- the "
+            "user is waiting for a search response, and a "
+            "slow reranker is worse than no reranker."
+        ),
+    )
+    rerank_batch_size: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description=(
+            "Candidates per reranker LLM call. Controls the "
+            "number of round-trips per search: with "
+            "``rerank_max_candidates=20`` and "
+            "``rerank_batch_size=5``, a full rerank uses 4 "
+            "calls. Smaller batches parse more reliably "
+            "(shorter prompts are less likely to trigger "
+            "the model's 'ignore the schema' failure mode), "
+            "larger batches reduce per-call overhead. Set "
+            "to ``rerank_max_candidates`` (e.g. 20) for "
+            "single-call behavior -- the reference §6.3 "
+            "suggestion. Invalid values are clamped to the "
+            "reranker's own defaults at construction time."
         ),
     )
 

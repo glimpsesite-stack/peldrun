@@ -272,15 +272,50 @@ export const DEFAULT_MEMORY_EMBEDDING_SETTINGS: MemoryEmbeddingSettings = {
  *                                paper and balances both
  *                                extremes well.
  *
- *   * `rerank_enabled`        -- Phase 5 stub. When `true`, a
- *                                cross-encoder reranker will
- *                                re-score the fused top-N before
- *                                returning. Currently IGNORED by
- *                                the backend (no cross-encoder
- *                                wired yet). The settings UI
- *                                renders this as a DISABLED
- *                                toggle with a "coming soon"
- *                                tooltip.
+ *   * `rerank_enabled`        -- Phase 5A. When `true` AND an
+ *                                extraction model is configured
+ *                                in `settings.ai.extraction`, the
+ *                                backend's
+ *                                `CrossEncoderReranker.rerank`
+ *                                re-orders fused top-K candidates
+ *                                by LLM-scored query relevance.
+ *                                Default `false` preserves Phase 4
+ *                                behavior exactly (no LLM call, no
+ *                                added latency, `search_mode`
+ *                                unchanged). Any reranker failure
+ *                                (timeout, provider down, parse
+ *                                error) silently degrades to RRF
+ *                                ordering -- the search endpoint
+ *                                NEVER returns an error because of
+ *                                the reranker.
+ *
+ *   * `rerank_max_candidates` -- [1, 100] upper bound on candidates
+ *                                sent to the reranker LLM per
+ *                                search. Candidates beyond this cap
+ *                                retain their RRF position and are
+ *                                appended AFTER the reranked set.
+ *                                Default `20` balances latency
+ *                                against recall.
+ *
+ *   * `rerank_timeout_seconds`-- [1.0, 30.0] per-batch wall-clock
+ *                                timeout for one reranker LLM
+ *                                call, applied via
+ *                                `asyncio.wait_for`. A timeout
+ *                                degrades to RRF ordering. Default
+ *                                `3.0` is healthy latency +
+ *                                headroom; values above ~10s are
+ *                                discouraged because the user-
+ *                                facing search request is
+ *                                blocked for that duration.
+ *
+ *   * `rerank_batch_size`     -- [1, 20] candidates per reranker
+ *                                LLM call. Smaller batches parse
+ *                                more reliably. The reference
+ *                                spec (§6.3) suggests setting
+ *                                equal to `rerank_max_candidates`
+ *                                for single-call behavior, which
+ *                                is why the default `20` matches
+ *                                `rerank_max_candidates`'s default.
  */
 export interface MemoryRetrievalSettings {
   /** See `RetrievalMode`. Default: `"lexical"`. */
@@ -293,8 +328,14 @@ export interface MemoryRetrievalSettings {
   min_vector_similarity: number;
   /** RRF smoothing parameter [1, 100]. Default: `60`. */
   rrf_k: number;
-  /** Phase 5 stub. Currently ignored by the backend. */
+  /** Phase 5A LLM reranker master switch. Default: `false`. */
   rerank_enabled: boolean;
+  /** Reranker LLM candidate cap per search [1, 100]. Default: `20`. */
+  rerank_max_candidates: number;
+  /** Per-batch reranker LLM timeout [1.0, 30.0] seconds. Default: `3.0`. */
+  rerank_timeout_seconds: number;
+  /** Reranker LLM candidates per call [1, 20]. Default: `20`. */
+  rerank_batch_size: number;
 }
 
 /**
@@ -311,6 +352,12 @@ export const DEFAULT_MEMORY_RETRIEVAL_SETTINGS: MemoryRetrievalSettings = {
   min_vector_similarity: 0.5,
   rrf_k: 60,
   rerank_enabled: false,
+  // Phase 5A reranker defaults -- mirror the backend's Pydantic
+  // Field(...) defaults so a fresh settings form renders
+  // identically on both sides.
+  rerank_max_candidates: 20,
+  rerank_timeout_seconds: 3.0,
+  rerank_batch_size: 20,
 };
 
 // ---------------------------------------------------------------------------
@@ -584,6 +631,11 @@ export const MemoryRetrievalBounds = {
   min_lexical_score: { min: 0.0, max: 1.0 },
   min_vector_similarity: { min: 0.0, max: 1.0 },
   rrf_k: { min: 1, max: 100 },
+  // Phase 5A reranker bounds -- must match the backend's
+  // Pydantic `Field(ge=..., le=...)` declarations exactly.
+  rerank_max_candidates: { min: 1, max: 100 },
+  rerank_timeout_seconds: { min: 1.0, max: 30.0 },
+  rerank_batch_size: { min: 1, max: 20 },
 } as const;
 
 // ---------------------------------------------------------------------------
