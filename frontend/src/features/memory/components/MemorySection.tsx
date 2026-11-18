@@ -85,7 +85,7 @@ export function MemorySection({
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.5, delay, ease: EASE_OUT_EXPO }}
       className={cn(
-        'relative rounded-md bg-muted shadow-sm',
+        'relative rounded-md bg-card shadow-sm',
         hasHeader ? 'space-y-5 p-5' : 'p-5',
         className,
       )}

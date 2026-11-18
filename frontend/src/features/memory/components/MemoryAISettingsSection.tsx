@@ -602,15 +602,14 @@ export function MemoryAISettingsSection({
                       error={err('ai.batch_auto_schedule_hours')}
                       disabled={disabled}
                     >
-                      <input
-                        type="number"
-                        value={value.batch_auto_schedule_hours ?? ''}
-                        min={MemoryAIBounds.batch_auto_schedule_hours.min}
-                        max={MemoryAIBounds.batch_auto_schedule_hours.max}
-                        step={1}
-                        placeholder={t('settings.ai.batchManualOnly')}
+                      <select
+                        value={
+                          value.batch_auto_schedule_hours == null
+                            ? ''
+                            : String(value.batch_auto_schedule_hours)
+                        }
                         onChange={(e) => {
-                          const raw = e.target.value.trim();
+                          const raw = e.target.value;
                           if (raw === '') {
                             update('batch_auto_schedule_hours', null);
                             return;
@@ -622,7 +621,41 @@ export function MemoryAISettingsSection({
                         }}
                         disabled={disabled}
                         className={MEMORY_FIELD_INPUT_CLASS}
-                      />
+                      >
+                        <option value="">
+                          {t('settings.ai.batchManualOnly')}
+                        </option>
+                        <option value="1">
+                          {t(
+                            'settings.ai.batchSchedule.hourly',
+                            'Every hour (aggressive)',
+                          )}
+                        </option>
+                        <option value="6">
+                          {t(
+                            'settings.ai.batchSchedule.sixHours',
+                            'Every 6 hours',
+                          )}
+                        </option>
+                        <option value="12">
+                          {t(
+                            'settings.ai.batchSchedule.twelveHours',
+                            'Every 12 hours',
+                          )}
+                        </option>
+                        <option value="24">
+                          {t(
+                            'settings.ai.batchSchedule.daily',
+                            'Daily (recommended)',
+                          )}
+                        </option>
+                        <option value="168">
+                          {t(
+                            'settings.ai.batchSchedule.weekly',
+                            'Weekly',
+                          )}
+                        </option>
+                      </select>
                     </MemoryField>
                   </div>
                   <Link
@@ -634,6 +667,41 @@ export function MemoryAISettingsSection({
                   </Link>
                 </>
               )}
+            </div>
+
+            {/* -------- Worker heartbeat -------- */}
+            <div className="rounded-md border border-border/60 p-3 space-y-3">
+              <h4 className="text-[11px] font-semibold uppercase tracking-wider text-foreground">
+                {t('settings.ai.workerTitle', 'Worker Heartbeat')}
+              </h4>
+              <MemoryField
+                label={t(
+                  'settings.ai.snapshotHeartbeat',
+                  'Snapshot heartbeat interval (seconds)',
+                )}
+                help={t(
+                  'settings.ai.snapshotHeartbeatHelp',
+                  'How often the extraction worker re-checks the session mid-flight. Lower = faster detection, more disk I/O. Range: 1-60.',
+                )}
+                error={err('ai.snapshot_heartbeat_interval_seconds')}
+                disabled={disabled}
+              >
+                <input
+                  type="number"
+                  value={value.snapshot_heartbeat_interval_seconds}
+                  min={1}
+                  max={60}
+                  step={1}
+                  onChange={(e) =>
+                    update(
+                      'snapshot_heartbeat_interval_seconds',
+                      Number(e.target.value),
+                    )
+                  }
+                  disabled={disabled}
+                  className={MEMORY_FIELD_INPUT_CLASS}
+                />
+              </MemoryField>
             </div>
           </div>
         )}

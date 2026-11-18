@@ -42,8 +42,8 @@ import { cn } from '../lib/cn';
  * duplicating the token soup in every file.
  */
 export const MEMORY_FIELD_INPUT_CLASS =
-  'w-full bg-transparent border-0 outline-none text-xs text-foreground font-mono ' +
-  'focus:ring-0 p-1 hover:bg-muted/50 rounded transition-colors ' +
+  'w-full bg-card border-0 outline-none text-xs text-black font-mono ' +
+  'focus:ring-0 p-1 hover:bg-card hover:shadow-sm rounded transition-colors ' +
   'disabled:cursor-not-allowed disabled:opacity-60';
 
 export interface MemoryFieldProps {
@@ -85,8 +85,8 @@ export function MemoryField({
         error
           ? 'border-rose-500/60 bg-rose-500/5'
           : disabled
-            ? 'border-border/40 bg-card opacity-70'
-            : 'border-border/60 bg-card hover:border-muted/30 hover:shadow-sm',
+            ? 'border-border/40 bg-custom opacity-70'
+            : 'border-border/60 bg-muted hover:border-muted/30 hover:shadow-sm',
         className,
       )}
     >

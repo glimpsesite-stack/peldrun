@@ -2,7 +2,7 @@
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
 model = ""
-base_url = "http://100.64.25.109:1235/api/v1/"
+base_url = "http://100.64.62.33:1235/api/v1/"
 api_key = "sk-lm-krfZwsDz:zlnNrWmN20vkBeuArlvQ"
 max_tokens = 8192
 temperature = 0
@@ -54,7 +54,7 @@ use_data_analysis_agent = false
 provider = "lmstudio"
 provider_name = "LM Studio (Local)"
 model = ""
-base_url = "http://100.64.25.109:1235/api/v1/"
+base_url = "http://192.168.3.15:1235/api/v1/"
 api_key = ""
 max_tokens = 8192
 temperature = 0
@@ -112,7 +112,7 @@ estimated_cost_per_query = 0.005
 
 [search.jina]
 enabled = true
-api_key = "jina_330c240e759743cdb99eb438bcf7f336o5v3iba1AQy2dOd7MDAFIjCcTIZj"
+api_key = "jina••••••••TIZj"
 timeout = 20
 cost_per_query = 0.002
 estimated_cost_per_query = 0.002

@@ -275,6 +275,15 @@ class MemoryService:
         self._vec_provider: Optional["SqliteVecProvider"] = None
         self._hybrid_provider: Optional["HybridMemoryProvider"] = None
 
+        # [FIX-BOOT-HANG] Background task that builds the hybrid
+        # provider without blocking FastAPI startup. The build
+        # involves an HTTP ``probe_dimensions`` call to the model
+        # provider, which can hang for 30+ seconds when the
+        # provider is unreachable. Running it in a background
+        # task makes startup instant; ``service.provider`` falls
+        # through to FTS until the task succeeds.
+        self._hybrid_build_task: Optional[asyncio.Task] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -2379,38 +2388,54 @@ class MemoryService:
         self._memory_repository = mem_repo
         self._embedding_active_model_key = model_key.strip()
 
-        # ---- 9. Attempt hybrid retrieval build -----------
+        # ---- 9. Attempt hybrid retrieval build (BACKGROUND) ----
         #
-        # Best-effort. See ``_build_hybrid_provider`` for the
-        # full decision matrix. Success sets
-        # ``self._hybrid_provider`` so the ``provider`` property
-        # starts returning the hybrid wrapper; failure leaves
-        # both fields at ``None`` and the property falls through
-        # to the raw FTS provider.
+        # [FIX-BOOT-HANG] The hybrid build includes an HTTP
+        # ``probe_dimensions`` call to the model provider (LM
+        # Studio, OpenAI, ...) on the very first boot with
+        # embedding enabled and no cached vec0 table. If the
+        # provider is UNREACHABLE (LM Studio not started yet,
+        # network down, credentials wrong), that HTTP call can
+        # take 30+ seconds to time out. Running it synchronously
+        # blocks the ENTIRE FastAPI startup -- the server does
+        # not accept requests until the probe returns or fails.
+        # That is the user-visible freeze observed at boot.
         #
-        # The extra try/except here is defense in depth against
-        # a broken import or a subtle bug -- ``_build_hybrid_provider``
-        # already has its own try/except, but we do not want a
-        # hypothetical exception there to abort the WHOLE
-        # ``_initialize_embedding`` after the worker has been
-        # committed.
-        try:
-            await self._build_hybrid_provider(
+        # Fix: run the entire hybrid build in a BACKGROUND TASK.
+        # Startup returns immediately; ``service.provider`` falls
+        # through to FTS until the task succeeds (typically
+        # milliseconds when the provider is up, or up to 3
+        # seconds when it is down thanks to the probe timeout
+        # added in ``_resolve_embedding_dimensions``). Once the
+        # task completes, ``_hybrid_provider`` is populated and
+        # every subsequent search uses hybrid automatically --
+        # no restart needed.
+        #
+        # Cancellation: if a PREVIOUS hybrid build task is still
+        # running (only possible via ``reload_settings`` calling
+        # ``_initialize_embedding`` again before the previous
+        # task finished), cancel it first. Otherwise the previous
+        # task could complete AFTER the new one and set
+        # ``_hybrid_provider`` to a stale model's provider.
+        _old_task = self._hybrid_build_task
+        self._hybrid_build_task = None
+        if _old_task is not None and not _old_task.done():
+            try:
+                _old_task.cancel()
+                await _old_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        self._hybrid_build_task = asyncio.create_task(
+            self._build_hybrid_provider_in_background(
                 resolver=resolver,
                 model_key=model_key.strip(),
                 mem_repo=mem_repo,
                 vec_repo=vec_repo,
                 db_path=db_path,
-            )
-        except Exception as hybrid_err:
-            logger.warning(
-                "MemoryService: hybrid build raised unexpectedly "
-                "(non-fatal; retrieval will remain FTS-only): %s",
-                hybrid_err,
-                exc_info=True,
-            )
-            self._hybrid_provider = None
-            self._vec_provider = None
+            ),
+            name="memory-hybrid-build",
+        )
 
         logger.info(
             "MemoryService: embedding pipeline initialized "
@@ -2508,7 +2533,29 @@ class MemoryService:
         share the same DB file (WAL permits concurrent access), but
         nothing else owns references to these specific instances.
         """
-        # ---- 0. Hybrid + vec provider --------------------
+        # ---- 0a. Cancel in-flight hybrid build task ------
+        #
+        # [FIX-BOOT-HANG] If a hybrid build is still running
+        # when shutdown starts (the operator quit the server
+        # before the background probe finished), cancel it.
+        # Waiting is unnecessary -- the task's only side effect
+        # is setting ``_hybrid_provider``, which we are about
+        # to null anyway. Cancelling first (before nulling in
+        # 0b) prevents a race where the in-flight task sets
+        # ``_hybrid_provider`` back to a value AFTER we null it.
+        task = self._hybrid_build_task
+        self._hybrid_build_task = None
+        if task is not None and not task.done():
+            try:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except Exception:
+                pass
+
+        # ---- 0b. Hybrid + vec provider --------------------
         #
         # Null the hybrid wrapper BEFORE tearing down the rest
         # of the chain. The hybrid holds references to BOTH
@@ -2811,6 +2858,80 @@ class MemoryService:
                     pass
             return False
 
+    async def _build_hybrid_provider_in_background(
+        self,
+        *,
+        resolver: "EmbeddingModelResolver",
+        model_key: str,
+        mem_repo: "SqliteMemoryRepository",
+        vec_repo: "SqliteVecRepository",
+        db_path: Path,
+    ) -> None:
+        """Background wrapper around ``_build_hybrid_provider``.
+
+        [FIX-BOOT-HANG] Why this exists as a separate method:
+
+          * ``_build_hybrid_provider`` itself is unchanged --
+            it still contains the full build logic and its own
+            try/except. This method only wraps it in a
+            background task with clear log prefixes.
+
+          * ``asyncio.CancelledError`` is caught and re-raised
+            so shutdown (which cancels the task) does not log
+            as a failure -- the operator sees "cancelled
+            (server shutting down)" not "raised unexpectedly".
+
+          * All log lines start with ``[hybrid-build]`` so an
+            operator grepping the boot log can see exactly
+            when the background task started, succeeded, or
+            failed, separately from the synchronous startup
+            messages.
+
+        Never raises. ``asyncio.create_task`` has no exception
+        handler attached, so this method MUST absorb everything
+        except CancelledError (which must propagate for
+        correct task cleanup).
+        """
+        try:
+            logger.info(
+                "[hybrid-build] Starting background hybrid build "
+                "(model_key=%r). Server startup is NOT blocked; "
+                "retrieval uses FTS-only until this completes.",
+                model_key,
+            )
+            success = await self._build_hybrid_provider(
+                resolver=resolver,
+                model_key=model_key,
+                mem_repo=mem_repo,
+                vec_repo=vec_repo,
+                db_path=db_path,
+            )
+            if success:
+                logger.info(
+                    "[hybrid-build] Hybrid provider READY. All "
+                    "subsequent searches use FTS + Vector fusion."
+                )
+            else:
+                logger.warning(
+                    "[hybrid-build] Hybrid build returned False "
+                    "(probe failed or pipeline unavailable). "
+                    "Retrieval remains FTS-only until the next "
+                    "successful boot."
+                )
+        except asyncio.CancelledError:
+            logger.info(
+                "[hybrid-build] Background build cancelled "
+                "(server shutting down)."
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "[hybrid-build] Background build raised "
+                "unexpectedly: %s. Retrieval remains FTS-only.",
+                exc,
+                exc_info=True,
+            )
+
     async def _resolve_embedding_dimensions(
         self,
         *,
@@ -2871,11 +2992,43 @@ class MemoryService:
         from peldrun.memory.embeddings.provider import (
             OpenAICompatEmbeddingProvider,
         )
+
+        # [FIX-PROBE-TIMEOUT] Hard 3-second cap on the probe.
+        #
+        # Without this cap, an unreachable provider (LM Studio
+        # not yet started, network down, wrong base_url) can
+        # block the probe for the provider's default socket
+        # timeout -- commonly 30s or more. Even though the
+        # hybrid build now runs in a background task (see
+        # ``_build_hybrid_provider_in_background``), a long
+        # hang there keeps ``service.provider`` on FTS-only
+        # for the whole duration, which is confusing when the
+        # provider is genuinely just slow to warm up.
+        #
+        # 3 seconds is the right cap:
+        #   * sufficient for a healthy embedding endpoint on
+        #     a local network to respond (typical: 50-300ms),
+        #   * short enough that an unreachable endpoint does
+        #     NOT appear as a freeze -- the operator sees
+        #     "[hybrid-build] Hybrid build returned False"
+        #     within seconds,
+        #   * does not prevent recovery -- once LM Studio
+        #     starts, the operator restarts PELDRUN and the
+        #     probe succeeds normally.
+        #
+        # ``asyncio.wait_for`` raises ``asyncio.TimeoutError``
+        # on expiry; caught by the explicit branch below so the
+        # log message is precise ("timed out") rather than the
+        # generic "failed: " message.
+        _PROBE_TIMEOUT_SECONDS = 3.0
         try:
-            probed = await OpenAICompatEmbeddingProvider.probe_dimensions(
-                base_url=resolved.base_url,
-                api_key=resolved.api_key,
-                model_id=resolved.model_id,
+            probed = await asyncio.wait_for(
+                OpenAICompatEmbeddingProvider.probe_dimensions(
+                    base_url=resolved.base_url,
+                    api_key=resolved.api_key,
+                    model_id=resolved.model_id,
+                ),
+                timeout=_PROBE_TIMEOUT_SECONDS,
             )
             if isinstance(probed, int) and probed > 0:
                 logger.info(
@@ -2890,6 +3043,17 @@ class MemoryService:
                 "an invalid value: %r",
                 resolved.model_id,
                 probed,
+            )
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MemoryService: probe_dimensions for %r timed out "
+                "after %.1fs -- model provider is unreachable. "
+                "Hybrid retrieval remains FTS-only. Once the "
+                "provider is available, restart the server to "
+                "enable hybrid.",
+                resolved.model_id,
+                _PROBE_TIMEOUT_SECONDS,
             )
             return None
         except Exception as exc:
