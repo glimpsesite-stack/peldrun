@@ -626,6 +626,38 @@ export const memoryKeys = {
   },
 
   // -------------------------------------------------------------------------
+  // Agentic (Phase 6)
+  // -------------------------------------------------------------------------
+  //
+  // The agentic surface has exactly ONE cacheable read: the
+  // availability probe. `POST /search/agentic` is a mutation (its
+  // input is a live question, not a stable identifier -- same
+  // rationale as `entries.search` in mutations.ts), so it owns no
+  // key.
+  //
+  // Namespaced under `memoryKeys.all` so a global memory reset also
+  // clears the probe: if memory is disabled, agentic cannot work,
+  // and a stale `available: true` would keep offering the toggle.
+
+  agentic: {
+    /** Prefix for every agentic query. */
+    all: () => [...memoryKeys.all, 'agentic'] as const,
+
+    /**
+     * The single availability probe
+     * (`GET /api/memory/search/agentic/status`).
+     *
+     * No parameters -- the endpoint reflects the CURRENT settings,
+     * so two coexisting "is agentic available?" answers must never
+     * exist in cache. Any settings PATCH invalidates
+     * `settings.all()`, and the mutation also invalidates this key
+     * (see `usePatchSettings`) because enabling the feature
+     * changes the answer.
+     */
+    status: () => [...memoryKeys.agentic.all(), 'status'] as const,
+  },
+
+  // -------------------------------------------------------------------------
   // Automation (Phase 3)
   // -------------------------------------------------------------------------
   //

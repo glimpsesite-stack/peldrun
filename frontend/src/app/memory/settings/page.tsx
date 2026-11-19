@@ -18,6 +18,7 @@ import { useTranslation } from 'react-i18next';
 import {
   ArrowRight,
   Brain,
+  BrainCircuit,
   FolderCog,
   ListChecks,
   Settings as SettingsIcon,
@@ -26,6 +27,7 @@ import { useMemorySettings } from '../../../features/memory/api/queries';
 import { SettingsForm } from '../../../features/memory/components/SettingsForm';
 import { AISettingsForm } from '../../../features/memory/components/AISettingsForm';
 import { MemoryRetrievalSettingsForm } from '../../../features/memory/components/MemoryRetrievalSettingsForm';
+import { AgenticSettingsForm } from '../../../features/memory/components/AgenticSettingsForm';
 import { MemorySection } from '../../../features/memory/components/MemorySection';
 import { cn } from '../../../features/memory/lib/cn';
 
@@ -35,6 +37,12 @@ import { cn } from '../../../features/memory/lib/cn';
 const sidebarItems = [
   { id: 'general', labelKey: 'settings.sidebar.general', icon: SettingsIcon, defaultLabel: 'General Settings' },
   { id: 'semantic', labelKey: 'settings.sidebar.semanticSearch', icon: Brain, defaultLabel: 'Semantic Search' },
+  // Phase 6: agentic retrieval + knowledge graph. A DEDICATED tab
+  // rather than a section under "Semantic Search": both features are
+  // LLM-heavy, both are opt-in, and both have their own model +
+  // indexing prerequisites. Burying them under a tab whose heading
+  // says "embeddings" would make them undiscoverable.
+  { id: 'agentic', labelKey: 'settings.sidebar.agentic', icon: BrainCircuit, defaultLabel: 'Agentic & Graph' },
   { id: 'automation', labelKey: 'settings.sidebar.automation', icon: ListChecks, defaultLabel: 'Automation' },
   { id: 'projects', labelKey: 'settings.sidebar.projects', icon: FolderCog, defaultLabel: 'Projects' },
 ] as const;
@@ -165,6 +173,22 @@ export default function MemorySettingsPage() {
               />
             </Link>
           </MemorySection>
+        </section>
+
+        {/* ============ Agentic search + knowledge graph (Phase 6) ============ */}
+        <section
+          id="agentic"
+          className={cn(
+            'transition-all duration-200 space-y-6',
+            activeTab === 'agentic' ? 'block' : 'hidden',
+          )}
+        >
+          {/* Nine retrieval fields + four `ai` fields in one form:
+              the search flags, the agentic model, and the graph
+              INDEXING controls. Splitting them across tabs would
+              recreate the exact confusion Phase 6 ships with --
+              turning search on and never populating the graph. */}
+          <AgenticSettingsForm />
         </section>
 
         {/* ============ Automation & AI Settings ============ */}

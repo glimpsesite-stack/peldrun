@@ -98,6 +98,8 @@ import type {
   SettingsUpdateResponse,
   UpdateMemoryResponse,
 } from '../types/responses';
+// Phase 6 agentic retrieval response envelope.
+import type { AgenticSearchResponse } from '../types/agentic';
 import type {
   ExportDownloadResult,
   ExportQueryParams,
@@ -194,6 +196,12 @@ function invalidateSettingsCascade(
   // that are CURRENTLY OBSERVED. If the ReindexPanel is not
   // mounted, no network call happens.
   queryClient.invalidateQueries({ queryKey: memoryKeys.embedding.stats() });
+  // Phase 6: the agentic availability probe is a projection of
+  // settings (`retrieval.agentic_enabled` + a resolvable model), so
+  // any settings PATCH can change it. Invalidating here keeps the
+  // composer toggle honest: turning agentic ON in Settings makes the
+  // toggle usable on the next render without a page reload.
+  queryClient.invalidateQueries({ queryKey: memoryKeys.agentic.all() });
 }
 
 /**
@@ -798,6 +806,68 @@ export function useSearchMemories(
     SearchMemoriesVariables
   >({
     mutationFn: (body) => memoryClient.entries.search(body),
+    onSuccess: options.onSuccess,
+    onError: options.onError,
+    onSettled: options.onSettled,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Agentic search (Phase 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Variables for `useAgenticSearch`.
+ *
+ * Extracted from the client method (not hand-written) so the
+ * mutation cannot drift from `memoryClient.agentic.search`.
+ */
+export type AgenticSearchVariables = Parameters<
+  typeof memoryClient.agentic.search
+>[0];
+
+/**
+ * `POST /api/memory/search/agentic` -- answer a question from memory.
+ *
+ * A MUTATION for the same three reasons as `useSearchMemories`: the
+ * input is a live question (not a stable key), the caller wants a
+ * pending flag rather than cache re-renders, and the result is
+ * consumed once.
+ *
+ * Differences from `useSearchMemories` that matter to callers:
+ *
+ *   * **It is slow.** Several LLM calls; expect seconds, not
+ *     milliseconds. The UI should show a distinct
+ *     "reasoning…" state, not the ordinary search spinner.
+ *
+ *   * **A failure is not an error.** The backend returns HTTP 200
+ *     with `is_available: false` and the standard retrieval result
+ *     under `fallback`. Only genuine transport/500 failures reject.
+ *     So `onError` should be reserved for "the request itself
+ *     broke", never for "agentic was unavailable".
+ *
+ *   * **It is cancellable.** Pass `options.onCancel`-friendly UI
+ *     (or abort via the query client) if the user should be able to
+ *     stop waiting; the backend's own timeout bounds the worst case.
+ *
+ * No cache invalidation: retrieval is read-only.
+ */
+export function useAgenticSearch(
+  options: BaseMutationOptions<
+    AgenticSearchResponse,
+    AgenticSearchVariables
+  > = {},
+): UseMutationResult<
+  AgenticSearchResponse,
+  MemoryApiError,
+  AgenticSearchVariables
+> {
+  return useMutation<
+    AgenticSearchResponse,
+    MemoryApiError,
+    AgenticSearchVariables
+  >({
+    mutationFn: (body) => memoryClient.agentic.search(body),
     onSuccess: options.onSuccess,
     onError: options.onError,
     onSettled: options.onSettled,

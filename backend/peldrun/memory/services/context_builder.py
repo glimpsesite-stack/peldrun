@@ -427,6 +427,7 @@ async def build_memory_context(
     *,
     now: Optional[datetime] = None,
     allow_recency_fallback: Optional[bool] = None,
+    match_any: bool = False,
 ) -> MemoryContext:
     """... (docstring unchanged; add param description below) ...
 
@@ -591,12 +592,17 @@ async def build_memory_context(
                 query=query,
                 scope_refs=scope_refs,
                 limit=limit,
+                # FTS operator selection. Providers that ignore
+                # unknown filters (the vector backend, test doubles)
+                # are unaffected; the SQLite FTS path reads it.
+                match_any=match_any,
             )
         else:
             entries = await provider.search(
                 query=query,
                 scope_refs=scope_refs,
                 limit=limit,
+                match_any=match_any,
             )
             candidates = _assign_positional_relevance(entries)
     except Exception as exc:

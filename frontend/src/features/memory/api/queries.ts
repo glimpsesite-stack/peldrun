@@ -96,6 +96,10 @@ import type {
 } from '../types/responses';
 import type { MemorySettings } from '../types/settings';
 import type { EmbeddingModel } from '../types/embedding';
+// Phase 6 agentic availability probe. A separate import block
+// because it belongs to a different domain module, not to the
+// memory-entry response envelopes above.
+import type { AgenticStatusResponse } from '../types/agentic';
 
 // ---------------------------------------------------------------------------
 // Default stale times (milliseconds)
@@ -150,6 +154,11 @@ export const MEMORY_STALE_TIMES = {
   batches: 3_000,
   batchDetail: 3_000,
   batchEstimate: 0,
+  // Phase 6: the agentic availability probe changes ONLY when the
+  // operator edits settings, and the settings PATCH invalidates it
+  // explicitly. 30s is a safety net for a second browser tab, not
+  // the primary refresh mechanism.
+  agenticStatus: 30_000,
   // Phase 4 additions:
   //
   //   * `embeddingStats` -- 15s. The snapshot updates after
@@ -271,6 +280,36 @@ export function useMemorySettings(
       return response.settings;
     },
     staleTime: options.staleTime ?? MEMORY_STALE_TIMES.settings,
+    enabled: options.enabled ?? true,
+  });
+}
+
+/**
+ * Phase 6: is agentic retrieval offerable right now?
+ *
+ * Calls `GET /api/memory/search/agentic/status`, which is a cheap
+ * settings read -- no LLM call, no search. Consumers use it to:
+ *
+ *   * decide whether to ENABLE the composer toggle, and
+ *   * explain WHY it is unavailable (`enabled` vs `configured` are
+ *     different failures: "turn it on in Settings" vs "pick a model
+ *     in Settings → Memory → AI").
+ *
+ * `available` is the AND of the two, but the raw flags are exposed
+ * so the UI can say the useful thing rather than a generic
+ * "unavailable".
+ *
+ * `enabled: false` (the default) skips the request entirely -- a
+ * deployment that has never touched agentic should not pay a
+ * network round-trip on every composer mount.
+ */
+export function useAgenticStatus(
+  options: BaseQueryOptions = {},
+): UseQueryResult<AgenticStatusResponse, MemoryApiError> {
+  return useQuery<AgenticStatusResponse, MemoryApiError>({
+    queryKey: memoryKeys.agentic.status(),
+    queryFn: ({ signal }) => memoryClient.agentic.status({ signal }),
+    staleTime: options.staleTime ?? MEMORY_STALE_TIMES.agenticStatus,
     enabled: options.enabled ?? true,
   });
 }

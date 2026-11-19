@@ -239,6 +239,7 @@ export { ProjectCard } from './components/ProjectCard';
 export { ProjectStatsPanel } from './components/ProjectStatsPanel';
 export { BulkActionsBar } from './components/BulkActionsBar';
 export { SimilarMemoriesPanel } from './components/SimilarMemoriesPanel';
+export { AgenticSettingsForm } from './components/AgenticSettingsForm';
 export { ImportDropZone } from './components/ImportDropZone';
 export { ImportPreviewTable } from './components/ImportPreviewTable';
 export { ExportForm } from './components/ExportForm';

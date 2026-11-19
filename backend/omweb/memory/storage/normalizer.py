@@ -453,20 +453,52 @@ def normalize_for_storage(text: str) -> str:
     return result
 
 
-def normalize_query(text: str) -> str:
+def normalize_query(text: str, *, match: str = "all") -> str:
     """Normalize ``text`` into a safe FTS5 MATCH query.
 
-    The output is a space-separated sequence of word tokens ready
-    to be passed to ``memories_fts MATCH ?``. Because every token
+    Parameters
+    ----------
+    text
+        The user's search query. May be ``None`` (treated as
+        ``""``) or empty (returns ``""``).
+    text
+        The user's search query. May be ``None`` (treated as
+        ``""``) or empty (returns ``""``).
+    match
+        Token combination semantics:
+
+          * ``"all"`` (default) -- space-separated tokens, which FTS5
+            treats as an implicit **AND**: every token must appear in
+            one memory. This is the historical behaviour, unchanged
+            byte for byte.
+          * ``"any"`` -- ``token1* OR token2* OR ...`` with Arabic
+            article-prefix variants. Used for natural-language
+            retrieval (chat turns and agentic hops), where demanding
+            that EVERY word of a question appear in a single memory is
+            exactly what made real questions return nothing.
+
+    Why ``"any"`` is opt-in
+    -----------------------
+    The ``memory_search`` tool's contract is strict keyword matching:
+    an agent asking "find all decisions" must not receive entries that
+    merely share one common word. Broadening the operator there would
+    silently degrade that contract. The chat path is different -- it
+    wants RECALL, and the ranker, ``min_relevance_score``, and the
+    recency fallback downstream handle precision.
+
+    The output is a safe FTS5 MATCH expression. Because every token
     is extracted by ``\\w+`` from the ALREADY-NORMALIZED text,
     the result cannot contain:
       * quote characters (which would create phrase operators),
-      * the ``*`` prefix operator,
       * FTS5 keywords ``AND`` / ``OR`` / ``NOT`` in uppercase
         (the pipeline lowercases everything),
       * parentheses or other grouping syntax,
       * any character that ``unicode61`` would treat as a
         separator.
+
+    In ``"any"`` mode this function DOES emit the uppercase ``OR``
+    operator and a trailing ``*`` per token. Both are produced by this
+    module, never by user input, so the injection guarantee holds.
 
     This makes the query SAFE against accidental or malicious
     FTS5 operator injection: a user typing
@@ -475,12 +507,6 @@ def normalize_query(text: str) -> str:
     "match any document containing ALL of foo, or, bar, drop,
     table" -- a strict superset of the user's intent, never an
     unexpected match.
-
-    Parameters
-    ----------
-    text
-        The user's search query. May be ``None`` (treated as
-        ``""``) or empty (returns ``""``).
 
     Returns
     -------
@@ -495,6 +521,9 @@ def normalize_query(text: str) -> str:
     ------
     TypeError
         If ``text`` is neither ``str`` nor ``None``.
+    ValueError
+        If ``match`` is not ``"all"`` or ``"any"``. A typo here would
+        silently pick the wrong operator.
     """
     if not text:
         return ""
@@ -502,13 +531,193 @@ def normalize_query(text: str) -> str:
         raise TypeError(
             f"normalize_query expects str, got {type(text).__name__}"
         )
+    if match not in ("all", "any"):
+        raise ValueError(
+            f"normalize_query: match must be 'all' or 'any', "
+            f"got {match!r}"
+        )
 
     normalized = _normalize_for_storage_impl(text.strip())
     if not normalized:
         return ""
 
     tokens = _WORD_TOKEN.findall(normalized)
-    return " ".join(tokens)
+    if match == "all":
+        return " ".join(tokens)
+    return _build_any_expression(tokens)
+
+
+#: Arabic article / preposition+article prefixes used to emit extra
+#: query-token variants in ``match="any"`` mode.
+#:
+#: Why this exists: FTS5's ``unicode61`` tokenizer does not segment
+#: Arabic clitics, so ``بالقهوه`` is ONE token, completely different
+#: from the stored ``القهوه``. Without variants, an Arabic question
+#: containing an attached preposition matches nothing at all even
+#: though the fact is stored.
+#:
+#: Deliberately limited to article and preposition+article forms.
+#: Bare single-letter clitics (ب، ل، ك، ف، و) are NOT stripped: that
+#: would turn ``كود`` into ``ود`` and manufacture false matches for a
+#: one-letter gain. The original token is always emitted too, so
+#: recall can only grow.
+_ARABIC_QUERY_PREFIXES: Final[tuple[str, ...]] = (
+    "بال",
+    "كال",
+    "فال",
+    "وال",
+    "لل",
+    "ال",
+)
+
+#: Minimum token length for a wildcard variant to be emitted.
+#: One-character tokens ("i", "a", "و") would expand to ``i*`` / ``a*``
+#: and match almost every document, drowning BM25 in noise.
+_MIN_WILDCARD_TOKEN_CHARS: Final[int] = 2
+
+#: Function words that must NOT become OR terms in ``match="any"`` mode.
+#:
+#: Why: OR-ing every token means a single common word drags in the
+#: whole memory store. Measured on a real 13-memory database:
+#:
+#:   "ok i will see you next time"  -> 5/13 memories matched
+#:   "do you know me"               -> 0  (but "you"/"me"/"do" alone
+#:                                          match whenever any memory
+#:                                          contains "you")
+#:
+#: The first query is a farewell, not a memory request. Matching 5
+#: memories on the strength of "i" and "you" is not recall, it is
+#: noise that then gets injected into the prompt as if it were
+#: relevant -- the "memories have nothing to do with the context"
+#: complaint.
+#:
+#: Kept deliberately small: only words that carry no retrieval signal.
+#: A token is dropped ONLY when at least one other non-stopword token
+#: survives, so a query consisting solely of function words yields an
+#: empty expression -> zero matches -> nothing injected. That is the
+#: correct outcome for "thank you".
+_QUERY_STOPWORDS: Final[frozenset] = frozenset(
+    {
+        # English
+        "a", "an", "the", "and", "or", "but", "if", "of", "to", "in",
+        "on", "at", "for", "with", "from", "by", "as", "is", "are",
+        "was", "were", "be", "been", "am", "do", "does", "did", "will",
+        "would", "can", "could", "should", "shall", "may", "might",
+        "i", "me", "my", "mine", "you", "your", "yours", "he", "she",
+        "it", "we", "us", "they", "them", "this", "that", "these",
+        "those", "there", "here", "what", "who", "whom", "which",
+        "when", "where", "why", "how", "yes", "ok", "okay", "hi",
+        "hello", "hey", "thanks", "thank", "please", "so", "not",
+        "no", "just", "very", "too", "also", "about", "any", "all",
+        "some", "more", "most", "such", "than", "then", "now",
+        # Arabic
+        "في", "من", "الى", "على", "عن", "مع", "هو", "هي", "هم",
+        "انا", "انت", "نحن", "ما", "هل", "لا", "نعم", "و", "او",
+        "ثم", "قد", "كان", "كانت", "هذا", "هذه", "ذلك", "تلك",
+        "التي", "الذي", "يا", "مرحبا", "شكرا", "من فضلك",
+    }
+)
+
+#: Single-letter Arabic clitics that may precede the definite article
+#: (ب + ال = بال, ك + ال = كال, ...). Used ONLY to recognise and strip
+#: the clitic when the article follows it -- never as a standalone
+#: strip, which would turn ``كود`` into ``ود``.
+_SINGLE_CLITICS: Final[tuple[str, ...]] = ("ب", "ك", "ف", "و", "ل")
+
+_ARABIC_DEFINITE_ARTICLE: Final[str] = "ال"
+
+
+def _arabic_variants(token: str) -> List[str]:
+    """Return the token plus its Arabic prefix-stripped variants.
+
+    ``بالقهوه`` yields THREE forms, and the middle one is the whole
+    point::
+
+        بالقهوه   (as typed)
+        القهوه    (clitic ب stripped, article kept)  <-- matches storage
+        قهوه      (article stripped too)
+
+    Without the middle form the query could never reach a memory that
+    stores the bare article form ``القهوه``, because FTS5's prefix
+    wildcard only extends the END of a token: ``قهوه*`` does not match
+    ``القهوه``.
+
+    The original token is always first, so recall can only grow.
+    """
+    out: List[str] = [token]
+
+    # 1. Longest multi-character prefix (بال، كال، فال، وال، لل، ال).
+    for prefix in _ARABIC_QUERY_PREFIXES:
+        if token.startswith(prefix) and len(token) > len(prefix):
+            out.append(token[len(prefix):])
+            break
+
+    # 2. Single clitic followed by the article: strip the clitic only.
+    if (
+        len(token) > len(_ARABIC_DEFINITE_ARTICLE) + 1
+        and token[0] in _SINGLE_CLITICS
+        and token[1:3] == _ARABIC_DEFINITE_ARTICLE
+    ):
+        out.append(token[1:])
+
+    # 3. Peel a leading article off every form produced so far.
+    for candidate in list(out):
+        if (
+            candidate.startswith(_ARABIC_DEFINITE_ARTICLE)
+            and len(candidate) > len(_ARABIC_DEFINITE_ARTICLE)
+        ):
+            out.append(candidate[len(_ARABIC_DEFINITE_ARTICLE):])
+
+    deduped: List[str] = []
+    seen: set = set()
+    for form in out:
+        if form and form not in seen:
+            seen.add(form)
+            deduped.append(form)
+    return deduped
+
+
+def _build_any_expression(tokens: list[str]) -> str:
+    """Build an ``a* OR b* OR ...`` MATCH expression.
+
+    Each token contributes a prefix wildcard (so ``coffee`` also
+    matches ``coffees``, and ``القهو*`` matches ``القهوه``), plus one
+    variant with any Arabic article prefix removed.
+
+    Safety
+    ------
+    Tokens come from ``\\w+`` on already-normalized text, so they
+    cannot contain quotes, parentheses, ``*``, or uppercase FTS
+    keywords. The only operator text emitted here is the ``OR``
+    joiner and the per-token ``*``.
+    """
+    terms: List[str] = []
+    seen: set = set()
+
+    def _emit(term: str) -> None:
+        if len(term) < _MIN_WILDCARD_TOKEN_CHARS:
+            return
+        if term in seen:
+            return
+        seen.add(term)
+        terms.append(f"{term}*")
+
+    # Drop function words, but ONLY when a content word survives.
+    # A query made entirely of function words ("thank you") must
+    # produce an EMPTY expression -- zero matches -- so nothing is
+    # injected. Falling back to "keep them anyway" would restore the
+    # exact noise this set exists to remove.
+    content_tokens = [
+        token for token in tokens if token not in _QUERY_STOPWORDS
+    ]
+    if not content_tokens:
+        return ""
+
+    for token in content_tokens:
+        for variant in _arabic_variants(token):
+            _emit(variant)
+
+    return " OR ".join(terms)
 
 
 # ---------------------------------------------------------------------------

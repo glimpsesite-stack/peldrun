@@ -757,7 +757,24 @@ class SqliteMemoryRepository:
         if not scope_params:
             return []
 
-        normalized_query = normalize_query(query)
+        normalized_query = normalize_query(
+            query,
+            # ``match_any`` is a BEHAVIOUR flag, not a column filter:
+            # it is consumed here and never reaches
+            # ``_build_optional_filters`` (which only reads
+            # memory_type / is_pinned / tags).
+            #
+            # "any" (OR + prefix wildcards) is used by natural-language
+            # retrieval -- chat turns and agentic hops -- where
+            # requiring every word of a question to appear in one
+            # memory returned nothing for real questions, and where an
+            # Arabic clitic (بالقهوه vs القهوه) made a stored fact
+            # unreachable. The memory_search TOOL keeps the strict
+            # AND semantics it was designed around.
+            match=(
+                "any" if filters.get("match_any") else "all"
+            ),
+        )
 
         # ----- Empty-query fallback: recency listing + position scores -----
         if not normalized_query:

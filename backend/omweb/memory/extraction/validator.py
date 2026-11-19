@@ -144,6 +144,46 @@ logger = logging.getLogger("omweb.memory.extraction.validator")
 _MIN_SNIPPET_CHARS: int = 3
 _MAX_SNIPPET_CHARS: int = 200
 
+#: Sentences that assert the ASSISTANT's ignorance about the user.
+#: See the self-poisoning guard in ``validate`` for the failure loop
+#: these prevent.
+#:
+#: Every alternative is anchored on knowledge-of-the-user phrasing,
+#: never on a bare "I don't know" -- "I don't know Rust" (the user
+#: speaking about a skill) is legitimate memory content.
+_SELF_REFUSAL_PATTERN = re.compile(
+    r"(?:"
+    # English: "I don't have any other personal information about you"
+    r"(?:i\s+)?(?:do\s+not|don'?t)\s+(?:have|know)\s+(?:any\s+)?"
+    r"(?:other\s+|further\s+|more\s+)?"
+    r"(?:personal\s+)?(?:information|info|details|data|knowledge)"
+    r"|"
+    # English: "I have no information about you"
+    r"(?:i\s+)?have\s+no\s+(?:other\s+|further\s+|more\s+)?"
+    r"(?:personal\s+)?(?:information|info|details|knowledge)"
+    r"|"
+    # English: "I don't know you" / "I do not know who you are"
+    r"(?:i\s+)?(?:do\s+not|don'?t)\s+know\s+(?:you|who\s+you\s+are)"
+    r"|"
+    # English: "as an AI ... I cannot ..."
+    r"\bas\s+an?\s+(?:ai|artificial\s+intelligence|language\s+model)\b"
+    r"|"
+    # Arabic: "ليس لدي معلومات" / "لا اعرف" / "لا املك معلومات"
+    r"ل(?:ا|يس)\s+(?:لدي|عندي)\s+(?:اي\s+)?(?:معلومات|بيانات|تفاصيل)"
+    r"|"
+    r"لا\s+(?:اعرف|أعرف)\s+(?:من\s+)?(?:انت|أنت|عنت|عنك)"
+    r")",
+    re.IGNORECASE,
+)
+"""Pre-compiled self-refusal detector.
+
+Case-insensitive; Arabic diacritics are NOT matched here because
+``normalize_for_storage`` has already stripped them by the time a
+snippet reaches the source text. Both ``ا`` alef forms are listed for
+the same reason: the normalizer maps them, but a snippet echoed
+straight from a model reply may not have been through it.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Normalization
@@ -412,6 +452,42 @@ class EvidenceValidator:
                 "snippet_too_long",
                 f"snippet is {len(snippet)} chars; maximum "
                 f"is {_MAX_SNIPPET_CHARS}.",
+            )
+
+        # --- Self-poisoning guard ----------------------------------
+        #
+        # An assistant REPLY is a valid evidence source: "your manager
+        # is Sara" is a fact worth remembering even when the assistant
+        # said it. But a reply that asserts the assistant's OWN
+        # ignorance is not a fact about the user -- and storing it
+        # creates a feedback loop:
+        #
+        #   turn N     user: "do you know me?"
+        #              assistant: "I don't have any other personal
+        #                          information about you."
+        #   extraction stores that sentence as a user memory
+        #   turn N+1   retrieval injects it with relevance 1.00,
+        #              ABOVE the real memories, because it literally
+        #              contains the words of the question
+        #   model      reads "I don't have any personal information
+        #              about you" and answers "No, I don't know you"
+        #
+        # The memory becomes self-fulfilling: the more the assistant
+        # says it knows nothing, the stronger the evidence that it
+        # knows nothing. Observed exactly this on the live database
+        # ("don't have any other personal information about you" sat
+        # at rank 1 with score 1.00, outranking "User is Mohamed").
+        #
+        # The guard is deliberately NARROW: it matches sentences about
+        # the assistant's lack of knowledge ABOUT THE USER, not any
+        # occurrence of "I don't know" (a user saying "I don't know
+        # Rust" is a perfectly good memory).
+        if _SELF_REFUSAL_PATTERN.search(snippet):
+            return ValidationResult.reject(
+                "self_referential_refusal",
+                "snippet asserts the assistant's own ignorance "
+                "about the user; storing it would reinforce that "
+                "claim on every later retrieval.",
             )
 
         # --- Locate the source text --------------------------------

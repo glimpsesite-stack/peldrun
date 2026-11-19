@@ -66,8 +66,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from peldrun.memory.domain import (
     MemoryContext,
@@ -79,6 +80,8 @@ from peldrun.memory.domain import (
 from peldrun.memory.domain.enums import ExtractionTrigger
 from peldrun.memory.domain.scope import resolve_scope_refs
 from peldrun.memory.services import (
+    Route,
+    RouteDecision,
     build_empty_context,
     build_memory_context,
     classify_route,
@@ -112,6 +115,95 @@ logger = logging.getLogger("omweb.memory.manager.service")
 #
 # The type hints below are declared as strings (`"MemoryOutbox"`,
 # etc.) so mypy still resolves them without the runtime import.
+
+
+class _LazyGraphSearch:
+    """Late-binding proxy that lets the hybrid see the live graph searcher.
+
+    Why a proxy
+    -----------
+    ``MemoryService.ainitialize`` builds the HYBRID provider inside
+    ``_initialize_embedding`` and the graph inside
+    ``_initialize_graph`` afterwards. Passing ``self._graph_search``
+    directly to the hybrid would therefore always pass ``None``.
+
+    Reordering the two would fix the boot path but not the runtime
+    one: ``reload_settings`` can enable graph search without
+    rebuilding the hybrid (no embedding-model change), and the hybrid
+    would keep its stale ``None``.
+
+    A proxy resolves BOTH problems with one mechanism -- it looks up
+    the live searcher on every call. It also re-reads
+    ``retrieval.graph_search_enabled`` each time, so turning the
+    feature OFF takes effect on the very next search, with no
+    pipeline rebuild and no window where stale graph results leak.
+
+    Failure isolation
+    -----------------
+    Every failure returns ``[]`` with a WARNING. The graph is an
+    ADDITIONAL recall source; a graph problem must never turn into a
+    failed search.
+    """
+
+    __slots__ = ("_service",)
+
+    def __init__(self, service: "MemoryService") -> None:
+        self._service = service
+
+    async def find_related_for_query(
+        self,
+        query: str,
+        *,
+        scope_refs: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Any]:
+        """Delegate to the live ``GraphSearch``, or return ``[]``.
+
+        Mirrors the signature ``HybridMemoryProvider`` expects:
+        ``find_related_for_query(query, scope_refs=..., limit=...)``.
+        """
+        service = self._service
+        try:
+            retrieval = getattr(
+                service._lifecycle.settings, "retrieval", None
+            )
+            enabled = bool(
+                getattr(retrieval, "graph_search_enabled", False)
+            )
+        except Exception:
+            # Service not initialized (or being torn down).
+            enabled = False
+        if not enabled:
+            return []
+
+        searcher = getattr(service, "_graph_search", None)
+        if searcher is None:
+            return []
+        try:
+            return await searcher.find_related_for_query(
+                query,
+                scope_refs=scope_refs,
+                limit=limit,
+            )
+        except Exception as exc:  # noqa: BLE001 -- degrade only
+            logger.warning(
+                "MemoryService: graph search failed (%s: %s); "
+                "continuing without the graph source.",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
+    @property
+    def is_available(self) -> bool:
+        """True when a live searcher is currently installed."""
+        return getattr(self._service, "_graph_search", None) is not None
+
+    def __repr__(self) -> str:
+        state = (
+            "active" if self.is_available else "inactive"
+        )
+        return f"_LazyGraphSearch({state})"
 
 
 class MemoryService:
@@ -284,6 +376,69 @@ class MemoryService:
         # through to FTS until the task succeeds.
         self._hybrid_build_task: Optional[asyncio.Task] = None
 
+        # --- Knowledge graph (Phase 6) ---
+        #
+        # The graph pipeline is INDEPENDENT of the embedding pipeline
+        # in principle (it needs a repository + an LLM, not a vector
+        # index), so it may run with embedding disabled. It reuses
+        # ``_memory_repository`` when embedding built one, and
+        # otherwise opens its own repository
+        # (``_owns_graph_repository`` records which case applies so
+        # ``_close_graph`` only closes what it opened).
+        #
+        # Every field is ``None`` until ``_initialize_graph``
+        # succeeds. ``_write_pipeline_provider`` passes
+        # ``_graph_indexer`` to the write pipeline, so a ``None``
+        # indexer means "writes do not touch the graph" -- exactly
+        # the pre-Phase-6 behavior.
+        self._graph_repository: Optional[
+            "SqliteMemoryRepository"
+        ] = None
+        self._owns_graph_repository: bool = False
+        self._graph_store: Optional["GraphStore"] = None
+        self._graph_extractor: Optional["EntityExtractor"] = None
+        self._graph_indexer: Optional["GraphIndexer"] = None
+
+        #: Phase 6B: the live graph search target. ``None`` when
+        #: ``retrieval.graph_search_enabled`` is off or the graph has
+        #: not been initialized. ``HybridMemoryProvider`` receives a
+        #: ``_LazyGraphSearch`` wrapper (below) rather than this
+        #: object directly, because the hybrid is built inside
+        #: ``_initialize_embedding`` -- BEFORE ``_initialize_graph``
+        #: runs. The wrapper resolves the live value on every search,
+        #: so the ordering no longer matters and enabling the flag
+        #: later does not require rebuilding the hybrid.
+        self._graph_search: Optional["GraphSearch"] = None
+
+        # Background backfill loop. Started only when the extractor
+        # is actually configured; cancelled in ``_close_graph``.
+        self._graph_backfill_task: Optional[asyncio.Task] = None
+
+        # --- Agentic RAG (Phase 6, sub-phases 6C/6D) ---
+        #
+        # These components are reachable ONLY through
+        # ``retrieve_agentic``. They are never consulted by
+        # ``retrieve``, which must stay inside the dispatcher's
+        # per-turn latency budget -- an agentic run costs several
+        # LLM calls by design.
+        #
+        # All ``None`` until ``_initialize_agentic`` succeeds. That
+        # initializer performs NO await, so it cannot hang startup;
+        # a failure simply makes ``retrieve_agentic`` fall back to
+        # the standard path.
+        self._agentic_rewriter: Optional[
+            "QueryRewriter"
+        ] = None
+        self._agentic_synthesizer: Optional[
+            "EvidenceSynthesizer"
+        ] = None
+        self._agentic_retriever: Optional[
+            "MultiHopRetriever"
+        ] = None
+        self._agentic_orchestrator: Optional[
+            "AgenticRAGOrchestrator"
+        ] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -338,13 +493,57 @@ class MemoryService:
                 exc_info=True,
             )
 
+        # Phase 6: bring up knowledge-graph indexing if configured.
+        #
+        # Runs AFTER embedding so it can REUSE ``_memory_repository``
+        # when the embedding pipeline built one (one connection pool
+        # per process beats two competing writers on the same WAL
+        # file). It still works with embedding disabled: it opens its
+        # own repository in that case.
+        #
+        # ``_initialize_graph`` performs no await at all, so it cannot
+        # contribute to a startup hang.
+        try:
+            await self._initialize_graph()
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: graph initialization failed "
+                "(knowledge-graph indexing will be unavailable "
+                "until restart): %s",
+                exc,
+                exc_info=True,
+            )
+
+        # Apply the process-wide LLM concurrency limit BEFORE any
+        # background indexing task can start, so the very first batch
+        # write is already serialized.
+        self._apply_llm_concurrency()
+
+        # Phase 6C: build the agentic pipeline (opt-in).
+        #
+        # Also await-free, so it cannot delay startup. Gated on
+        # ``retrieval.agentic_enabled`` because an agentic run costs
+        # several LLM calls; it is never reachable from the
+        # dispatcher's per-turn ``retrieve``.
+        try:
+            await self._initialize_agentic()
+        except Exception as exc:
+            logger.warning(
+                "MemoryService: agentic initialization failed "
+                "(agentic retrieval will fall back to the standard "
+                "path): %s",
+                exc,
+                exc_info=True,
+            )
+
         logger.info(
             "MemoryService initialized (mode=%s, provider=%s, "
-            "extraction=%s, embedding=%s).",
+            "extraction=%s, embedding=%s, graph=%s).",
             self._lifecycle.settings.mode.value,
             self._lifecycle.settings.provider_id,
             "enabled" if self._outbox is not None else "disabled",
             "enabled" if self._embedding_worker is not None else "disabled",
+            "enabled" if self._graph_indexer is not None else "disabled",
         )
 
     async def aclose(self) -> None:
@@ -361,6 +560,13 @@ class MemoryService:
         if not self._initialized and not self._lifecycle.is_ready:
             return
 
+        # Close the GRAPH first: it borrows the repository's
+        # connections and dispatches background tasks. Cancelling it
+        # before the embedding pipeline tears down that repository
+        # is the only safe order -- otherwise a running backfill
+        # would issue a query against a closing connection.
+        await self._close_agentic()
+        await self._close_graph()
         # Stop embedding FIRST -- it only depends on the SQLite
         # repositories and the embedding outbox, both of which are
         # owned exclusively by this pipeline. Stopping it before
@@ -797,10 +1003,41 @@ class MemoryService:
         # ------------------------------------------------------------------
         # Classify route (deterministic -- never raises)
         # ------------------------------------------------------------------
-        route = classify_route(
-            query,
-            has_active_project=bool(project_id),
+        #
+        # [ALWAYS-RETRIEVE MODE]
+        #
+        # ``classify_route`` is a HEURISTIC gate: unless the query looks
+        # like an explicit recall request ("what did we decide…",
+        # "remember…") it returns NO_NEED, and ``build_memory_context``
+        # then returns an empty context WITHOUT searching. The patterns
+        # are English-centric, so in an Arabic deployment almost every
+        # real question classified as NO_NEED and the model never saw a
+        # single stored fact -- the memories existed, the search worked,
+        # and the user still got an amnesiac assistant.
+        #
+        # ``retrieval.always_retrieve`` (default True) turns the gate
+        # off: every non-empty turn retrieves from the user's memories,
+        # in BOTH exec modes. The route is labelled DIRECTED -- "use the
+        # query as-is" -- rather than DURING_EXECUTION, which is the
+        # tool path and would misattribute the decision in diagnostics.
+        #
+        # Scope is unchanged: ``resolve_scope_refs`` still yields
+        # ``user:<id>`` unconditionally plus project/chat when known, so
+        # this widens WHEN we search, not WHAT is visible. Scope
+        # isolation is a security boundary and is not touched here.
+        always_retrieve = bool(
+            getattr(settings.retrieval, "always_retrieve", False)
         )
+        if always_retrieve and (query or "").strip():
+            route = Route(
+                decision=RouteDecision.DIRECTED,
+                reason="always_retrieve_setting",
+            )
+        else:
+            route = classify_route(
+                query,
+                has_active_project=bool(project_id),
+            )
 
         # ------------------------------------------------------------------
         # Build context via the P1.4 pipeline
@@ -824,6 +1061,40 @@ class MemoryService:
                 route=route,
                 provider=self.provider,
                 settings=settings,
+                # [ALWAYS-RETRIEVE MODE] With the intent gate off,
+                # EVERY non-empty turn routes as DIRECTED, and
+                # DIRECTED normally enables the recency fallback when
+                # FTS finds no keyword match.
+                #
+                # We DISABLE it here. The fallback was switched on
+                # temporarily because FTS could not match natural
+                # questions (implicit AND plus unfiltered Arabic
+                # prefixes), so relevance-only injection showed
+                # nothing. That has since been fixed properly -- the
+                # "any" mode ORs prefix-wildcarded content words -- so
+                # the fallback is no longer needed and is now harmful:
+                #
+                #   "thank you"                    -> 0 keyword hits
+                #   "ok i will see you next time"  -> farewell
+                #
+                # With the fallback on, both injected the most recent
+                # memories and the agentic layer then answered "I
+                # really enjoy drinking black coffee and black tea" to
+                # a thank-you. That is the "the memories have nothing
+                # to do with the context" complaint: unrelated turns
+                # received confident, irrelevant context.
+                #
+                # `False` = search always runs, injection only on a
+                # real keyword match. `None` (gate still on) keeps the
+                # historical behaviour verbatim.
+                allow_recency_fallback=(
+                    False if always_retrieve else None
+                ),
+                # FTS operator: "any" for chat turns (recall over a
+                # natural-language question), "all" (strict AND) for
+                # the gate-on path so a deployment that keeps the
+                # heuristic gets exactly the old behaviour.
+                match_any=always_retrieve,
             )
         except Exception as exc:
             logger.warning(
@@ -847,6 +1118,295 @@ class MemoryService:
             project_id=project_id,
         )
         return context
+
+    # ------------------------------------------------------------------
+    # Agentic retrieval (Phase 6)
+    # ------------------------------------------------------------------
+
+    async def retrieve_agentic(
+        self,
+        *,
+        query: str,
+        chat_id: Optional[str],
+        project_id: Optional[str],
+        user_id: Optional[str] = None,
+        max_hops: Optional[int] = None,
+        run_id: Optional[str] = None,
+    ) -> "AgenticRetrievalResult":
+        """Agentic retrieval for a COMPLEX question.
+
+        **This method does NOT replace ``retrieve``.** ``retrieve`` is
+        called by the dispatcher on every turn and must stay in the
+        hundreds-of-milliseconds range; an agentic run issues several
+        LLM calls (rewrite + up to N gap analyses + synthesis) and
+        belongs on an explicit, opt-in path:
+
+          * ``POST /api/memory/search/agentic``,
+          * a future ``memory_search`` tool mode for agents.
+
+        The two methods share ONLY the read-only helpers
+        (``settings``, ``provider``, scope resolution). ``retrieve``'s
+        behaviour is unchanged by anything in this method.
+
+        Behaviour
+        ---------
+          1. Not initialized / disabled / misconfigured -> return a
+             result with ``is_available=False`` carrying the standard
+             ``retrieve()`` context as ``fallback_context``. No
+             exception, no 5xx.
+          2. Empty query or unresolvable scope -> same fallback.
+          3. Otherwise run the agentic pipeline under the configured
+             ``agentic_timeout_seconds`` budget. On timeout the
+             partial evidence gathered so far is returned.
+          4. Any unexpected failure -> log + fall back to
+             ``retrieve()`` and report ``error="failed"``.
+
+        Parameters
+        ----------
+        query, chat_id, project_id, user_id
+            Identical semantics to ``retrieve``.
+        max_hops
+            Optional override for ``retrieval.agentic_max_hops``.
+        run_id
+            Forwarded to ``_record_usage`` for the FALLBACK context
+            only (an agentic run is metered by the LLM gateway, not
+            by the memory usage ledger).
+
+        Returns
+        -------
+        AgenticRetrievalResult
+            Always well-formed; see
+            ``peldrun.memory.agentic.contracts``.
+        """
+        from peldrun.memory.agentic.contracts import (
+            AgenticRetrievalResult,
+        )
+
+        started = time.monotonic()
+
+        def _fallback(reason: str) -> "AgenticRetrievalResult":
+            return AgenticRetrievalResult(
+                is_available=False,
+                query=query if isinstance(query, str) else "",
+                search_mode="agentic+fallback",
+                error=reason,
+                elapsed_ms=int(
+                    (time.monotonic() - started) * 1000.0
+                ),
+            )
+
+        if not self._initialized:
+            raise RuntimeError(
+                "MemoryService is not initialized. Call "
+                "initialize_memory_service() in FastAPI lifespan "
+                "before serving requests."
+            )
+
+        retriever = self._agentic_retriever
+        orchestrator = self._agentic_orchestrator
+        pipeline = orchestrator if orchestrator is not None else retriever
+
+        if pipeline is None:
+            # Agentic is off (or failed to initialize). Degrade to
+            # the standard path so the caller still gets an answer.
+            fallback_context = await self.retrieve(
+                query=query,
+                chat_id=chat_id,
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id,
+            )
+            result = _fallback("disabled")
+            return AgenticRetrievalResult(
+                is_available=result.is_available,
+                query=result.query,
+                search_mode=result.search_mode,
+                error=result.error,
+                elapsed_ms=result.elapsed_ms,
+                fallback_context=fallback_context,
+            )
+
+        if not isinstance(query, str) or not query.strip():
+            return await self._agentic_fallback(
+                query=query,
+                chat_id=chat_id,
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id,
+                reason="empty_query",
+                started=started,
+            )
+
+        try:
+            scope_refs = resolve_scope_refs(
+                chat_id=chat_id,
+                project_id=project_id,
+                user_id=user_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "MemoryService.retrieve_agentic: scope resolution "
+                "failed (chat_id=%r, project_id=%r): %s",
+                chat_id,
+                project_id,
+                exc,
+            )
+            return await self._agentic_fallback(
+                query=query,
+                chat_id=chat_id,
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id,
+                reason="invalid_scope",
+                started=started,
+            )
+
+        settings = self._lifecycle.settings
+        timeout_seconds = float(
+            getattr(
+                settings.retrieval, "agentic_timeout_seconds", 30.0
+            )
+            or 30.0
+        )
+        threshold = float(
+            getattr(
+                settings.retrieval,
+                "agentic_confidence_threshold",
+                0.6,
+            )
+            or 0.0
+        )
+
+        try:
+            # The orchestrator owns the documented run budget and
+            # returns PARTIAL evidence when it expires. This outer
+            # wait_for is a looser backstop (budget + slack) that
+            # only fires if the pipeline ignores its own deadline --
+            # so the partial-result path normally wins the race.
+            backstop = max(1.0, timeout_seconds) + 5.0
+            multi_hop = await asyncio.wait_for(
+                self._run_agentic_pipeline(
+                    pipeline=pipeline,
+                    query=query,
+                    scope_refs=scope_refs,
+                    max_hops=max_hops,
+                ),
+                timeout=backstop,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MemoryService.retrieve_agentic: timed out after "
+                "%.1fs (query=%r, hops<=%r).",
+                timeout_seconds,
+                query[:60],
+                max_hops,
+            )
+            return await self._agentic_fallback(
+                query=query,
+                chat_id=chat_id,
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id,
+                reason="timeout",
+                started=started,
+            )
+        except Exception as exc:  # noqa: BLE001 -- documented
+            logger.warning(
+                "MemoryService.retrieve_agentic: pipeline failed "
+                "(%s: %s); falling back to standard retrieval.",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            return await self._agentic_fallback(
+                query=query,
+                chat_id=chat_id,
+                project_id=project_id,
+                user_id=user_id,
+                run_id=run_id,
+                reason="failed",
+                started=started,
+            )
+
+        answer = multi_hop.synthesized_answer
+        confidence = (
+            answer.confidence if answer is not None else 0.0
+        )
+        return AgenticRetrievalResult(
+            is_available=True,
+            query=query,
+            evidence=tuple(multi_hop.evidence),
+            synthesized_answer=answer,
+            hops_used=multi_hop.hops_used,
+            sub_queries_used=tuple(multi_hop.sub_queries_used),
+            search_mode="agentic",
+            error=None,
+            fallback_context=None,
+            confidence_threshold_met=(
+                answer is not None
+                and answer.is_substantive
+                and confidence >= threshold
+            ),
+            elapsed_ms=int((time.monotonic() - started) * 1000.0),
+        )
+
+    async def _run_agentic_pipeline(
+        self,
+        *,
+        pipeline: Any,
+        query: str,
+        scope_refs: List[str],
+        max_hops: Optional[int],
+    ) -> Any:
+        """Invoke the agentic pipeline with the current provider.
+
+        Both the orchestrator (6D) and a bare ``MultiHopRetriever``
+        (6C) accept the SAME ``retrieve(query, scope_refs,
+        backend=..., max_hops=...)`` shape, so no branching is
+        needed here. ``max_hops`` is a per-call argument rather than
+        an instance mutation, because the shared pipeline serves
+        concurrent requests.
+        """
+        return await pipeline.retrieve(
+            query,
+            scope_refs,
+            backend=self.provider,
+            max_hops=max_hops,
+        )
+
+    async def _agentic_fallback(
+        self,
+        *,
+        query: str,
+        chat_id: Optional[str],
+        project_id: Optional[str],
+        user_id: Optional[str],
+        run_id: Optional[str],
+        reason: str,
+        started: float,
+    ) -> "AgenticRetrievalResult":
+        """Build an ``is_available=False`` result backed by ``retrieve``."""
+        from peldrun.memory.agentic.contracts import (
+            AgenticRetrievalResult,
+        )
+
+        fallback_context = await self.retrieve(
+            query=query,
+            chat_id=chat_id,
+            project_id=project_id,
+            user_id=user_id,
+            run_id=run_id,
+        )
+        return AgenticRetrievalResult(
+            is_available=False,
+            query=query if isinstance(query, str) else "",
+            search_mode="agentic+fallback",
+            error=reason,
+            fallback_context=fallback_context,
+            elapsed_ms=int((time.monotonic() - started) * 1000.0),
+        )
 
     # ------------------------------------------------------------------
     # Settings reload
@@ -1060,6 +1620,214 @@ class MemoryService:
             logger.warning(
                 "MemoryService: embedding reload check failed "
                 "(non-fatal): %s", emb_reload_err,
+            )
+
+        # --- Phase 6: re-evaluate graph indexing ------------------
+        #
+        # Three cases drive action, mirroring the embedding block:
+        #
+        #   1. off -> on: initialize.
+        #   2. on  -> off: tear down (stopping the backfill loop and
+        #      draining in-flight tasks).
+        #   3. on  -> on WITH a model change: rebuild, because the
+        #      extractor captured the old provider/model pair at
+        #      construction and would keep calling it otherwise.
+        #
+        # The "on -> on, no change" case is a no-op: changing
+        # backfill interval or batch size is read from settings on
+        # every tick, so it needs no rebuild.
+        try:
+            ai_cfg = getattr(new_settings, "ai", None)
+            retrieval_cfg = getattr(new_settings, "retrieval", None)
+            want_search = bool(
+                getattr(
+                    retrieval_cfg, "graph_search_enabled", False
+                )
+            )
+            want_index = (
+                ai_cfg is not None
+                and getattr(ai_cfg, "enabled", False)
+                and getattr(ai_cfg, "graph_indexing_enabled", False)
+                and new_settings.mode.can_write
+                and new_settings.provider_id == "sqlite_fts"
+            )
+            want_graph = want_search or want_index
+            have_graph = (
+                self._graph_indexer is not None
+                or self._graph_search is not None
+            )
+            resolved = self._resolve_agentic_model() if want_index else None
+            new_model_key = (
+                f"{resolved[0]}::{resolved[1]}" if resolved else None
+            )
+            current_model_key = None
+            if self._graph_extractor is not None:
+                current_model_key = (
+                    f"{self._graph_extractor.provider_id}"
+                    f"::{self._graph_extractor.model_id}"
+                )
+            model_changed = (
+                self._graph_extractor is not None
+                and new_model_key is not None
+                and new_model_key != current_model_key
+            )
+
+            if want_graph and not have_graph:
+                logger.info(
+                    "MemoryService: graph enabled via settings "
+                    "reload; initializing."
+                )
+                await self._initialize_graph()
+            elif not want_graph and have_graph:
+                logger.info(
+                    "MemoryService: graph disabled via settings "
+                    "reload; stopping."
+                )
+                await self._close_graph()
+            elif model_changed:
+                logger.info(
+                    "MemoryService: agentic model changed "
+                    "(%r -> %r) via settings reload; rebuilding "
+                    "graph pipeline.",
+                    current_model_key,
+                    new_model_key,
+                )
+                await self._close_graph()
+                await self._initialize_graph()
+            elif want_search and self._graph_search is None:
+                # Search was on but the store failed to build at
+                # boot (transient). Retry now that settings were
+                # reloaded -- the operator's explicit action is a
+                # reasonable trigger.
+                await self._initialize_graph()
+        except Exception as graph_reload_err:
+            logger.warning(
+                "MemoryService: graph reload check failed "
+                "(non-fatal): %s", graph_reload_err,
+            )
+
+        # Re-apply the LLM concurrency limit: the operator may have
+        # widened it for a hosted provider (or narrowed it back to 1
+        # for a local model).
+        self._apply_llm_concurrency()
+
+        # --- Phase 6: re-evaluate agentic retrieval ---------------
+        #
+        # [FIX] This block was MISSING. ``_initialize_agentic`` ran
+        # only from ``ainitialize``, so enabling agentic in the UI
+        # (which persists through PATCH /settings -> reload_settings)
+        # left ``_agentic_orchestrator`` at ``None`` until a server
+        # RESTART. The observable symptom was exactly:
+        #
+        #   "Agentic search is enabled on the server but no model
+        #    resolved. Save a model above to activate it."
+        #
+        # ...repeatedly, after the model HAD been saved, because
+        # ``/agentic/status`` reports ``configured`` from the live
+        # pipeline object, not from the stored settings.
+        #
+        # Four cases drive action, mirroring the graph block:
+        #
+        #   1. off -> on:  build the pipeline.
+        #   2. on  -> off: tear it down.
+        #   3. on  -> on WITH a model change: rebuild, because the
+        #      rewriter/synthesizer captured the old provider/model
+        #      pair at construction.
+        #   4. on, unchanged, but the pipeline is missing: build it.
+        #      Covers a boot-time failure (no network, provider
+        #      down) recovering on the operator's next save.
+        try:
+            retrieval_now = getattr(
+                new_settings, "retrieval", None
+            )
+            ai_now = getattr(new_settings, "ai", None)
+
+            want_agentic = bool(
+                getattr(retrieval_now, "agentic_enabled", False)
+                and ai_now is not None
+                and getattr(ai_now, "enabled", False)
+            )
+            # "have" is derived from the PIPELINE, not from the
+            # stored flag -- that is the whole point of this fix.
+            have_agentic = (
+                self._agentic_orchestrator is not None
+                or self._agentic_retriever is not None
+            )
+
+            resolved_agentic = (
+                self._resolve_agentic_model()
+                if want_agentic
+                else None
+            )
+            new_agentic_key = (
+                f"{resolved_agentic[0]}::{resolved_agentic[1]}"
+                if resolved_agentic
+                else None
+            )
+            current_agentic_key = None
+            if self._agentic_synthesizer is not None:
+                # `getattr` rather than direct attribute access: this
+                # whole block is wrapped in a broad `except`, so a
+                # missing attribute would abort the ENTIRE reload
+                # (including the enable/disable transitions) and be
+                # reported as a benign warning. That is exactly how
+                # the first version of this fix failed.
+                current_agentic_key = (
+                    f"{getattr(self._agentic_synthesizer, 'provider_id', '')}"
+                    f"::{getattr(self._agentic_synthesizer, 'model_id', '')}"
+                )
+            agentic_model_changed = (
+                have_agentic
+                and new_agentic_key is not None
+                and new_agentic_key != current_agentic_key
+            )
+
+            if want_agentic and not have_agentic:
+                logger.info(
+                    "MemoryService: agentic retrieval enabled via "
+                    "settings reload; initializing."
+                )
+                await self._initialize_agentic()
+            elif not want_agentic and have_agentic:
+                logger.info(
+                    "MemoryService: agentic retrieval disabled via "
+                    "settings reload; stopping."
+                )
+                await self._close_agentic()
+            elif agentic_model_changed:
+                logger.info(
+                    "MemoryService: agentic model changed "
+                    "(%r -> %r) via settings reload; rebuilding.",
+                    current_agentic_key,
+                    new_agentic_key,
+                )
+                await self._close_agentic()
+                await self._initialize_agentic()
+            elif want_agentic and not have_agentic:
+                # Unreachable given the branch above; kept explicit
+                # so a future reordering cannot silently skip the
+                # build path.
+                await self._initialize_agentic()
+
+            # Report honestly: if the operator turned it on but no
+            # model resolved, say so at WARNING -- the UI shows this
+            # as "configured: false" and the user needs the log line
+            # to know the backend agrees.
+            if want_agentic and not (
+                self._agentic_orchestrator is not None
+                or self._agentic_retriever is not None
+            ):
+                logger.warning(
+                    "MemoryService: agentic requested but the "
+                    "pipeline could not be built (no resolvable "
+                    "model, or ai.enabled is off). /agentic/status "
+                    "will report configured=false until a model is "
+                    "selected and saved."
+                )
+        except Exception as agentic_reload_err:
+            logger.warning(
+                "MemoryService: agentic reload check failed "
+                "(non-fatal): %s", agentic_reload_err,
             )
 
         return new_settings
@@ -1798,9 +2566,17 @@ class MemoryService:
             # uses. When hybrid is built, this returns the hybrid
             # wrapper (which delegates writes to FTS transparently
             # via __getattr__); otherwise the raw FTS provider.
+            #
+            # [PHASE 6] ``graph_indexer`` is passed by VALUE at
+            # construction time. That is intentional: the provider is
+            # rebuilt per job, and a job must observe the indexer
+            # that was active when it started. A ``None`` indexer
+            # (graph disabled) leaves the write path byte-for-byte
+            # identical to Phase 5.
             return MemoryWritePipeline(
                 port=self.provider,
                 settings=self._lifecycle.settings,
+                graph_indexer=self._graph_indexer,
             )
 
         heartbeat_seconds = float(
@@ -2451,6 +3227,749 @@ class MemoryService:
             else "disabled",
         )
 
+    # ------------------------------------------------------------------
+    # Internal: knowledge graph lifecycle (Phase 6)
+    # ------------------------------------------------------------------
+
+    def _graph_ai_settings(self) -> Optional[object]:
+        """Return the current ``ai`` settings block, or ``None``."""
+        try:
+            if self._lifecycle.is_ready:
+                return getattr(self._lifecycle.settings, "ai", None)
+        except Exception:
+            pass
+        return None
+
+    def _resolve_agentic_model(self) -> Optional[tuple]:
+        """Resolve ``(provider_id, model_id)`` for the Phase 6 components.
+
+        Resolution order -- each step only uses what the operator
+        actually declared, never a guess from a model-name prefix:
+
+          1. ``ai.agentic`` provider + model pair (explicit).
+          2. ``ai.agentic.model_id`` alone -> infer the provider from
+             ``models_metadata.json`` / ``models_vault.json``.
+          3. ``ai.extraction`` pair (the operator already configured
+             a memory model; reusing it keeps the UI honest -- one
+             model pick drives both subsystems until they diverge).
+          4. The first model marked as a memory model.
+
+        Returns ``None`` when nothing resolves. ``EntityExtractor``
+        then reports ``is_configured == False`` and every indexing
+        call is a cheap no-op -- the documented degradation.
+        """
+        ai = self._graph_ai_settings()
+        if ai is None:
+            return None
+
+        agentic = getattr(ai, "agentic", None)
+        pid = getattr(agentic, "provider_id", None) if agentic else None
+        mid = getattr(agentic, "model_id", None) if agentic else None
+        if mid and not pid:
+            inferred = self._resolve_model_provider(str(mid))
+            if inferred:
+                pid = inferred
+        if pid and mid:
+            return (str(pid).strip(), str(mid).strip())
+
+        extraction = getattr(ai, "extraction", None)
+        ep = (
+            getattr(extraction, "provider_id", None)
+            if extraction
+            else None
+        )
+        em = (
+            getattr(extraction, "model_id", None)
+            if extraction
+            else None
+        )
+        if em and not ep:
+            inferred = self._resolve_model_provider(str(em))
+            if inferred:
+                ep = inferred
+        if ep and em:
+            return (str(ep).strip(), str(em).strip())
+
+        return self._resolve_first_memory_model()
+
+    def _build_agentic_gateway(self, extra_body: dict):
+        """Build a ``MemoryModelGateway`` for the Phase 6 components.
+
+        Mirrors the transport resolution that
+        ``_initialize_extraction`` performs, WITHOUT modifying it:
+        that path's three-mode logging is load-bearing for Phase 1-C
+        behaviour and its tests, so it is left untouched. The small
+        duplication is deliberate; if the transport contract ever
+        changes, both call sites are listed here so neither is
+        missed.
+        """
+        from omweb.memory.extraction.gateway import (
+            MemoryModelGateway,
+        )
+
+        transport = None
+        if self._transport_provider is not None:
+            try:
+                transport = self._transport_provider()
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: transport_provider raised while "
+                    "building the agentic gateway: %s", exc,
+                )
+                transport = None
+
+        if transport is not None:
+            return MemoryModelGateway(
+                transport=transport,
+                force_openai_compat=True,
+                extraction_extra_body=extra_body,
+            )
+        return MemoryModelGateway(
+            force_openai_compat=True,
+            extraction_extra_body=extra_body,
+        )
+
+    async def _initialize_graph(self) -> None:
+        """Bring up the knowledge-graph subsystem when applicable.
+
+        Two INDEPENDENT halves
+        ----------------------
+        The graph has a read side and a write side, and they have
+        different preconditions:
+
+          * **READ** (graph search, sub-phase 6B) needs only a store
+            over an existing v6 database. No LLM, no write
+            permission -- searching a graph that was populated
+            earlier is perfectly valid on a READ_ONLY deployment.
+
+          * **WRITE** (indexing, sub-phase 6A) needs a writable
+            mode, the AI master switch, the indexing flag, and a
+            resolvable agentic model.
+
+        Keeping them separate is what makes "search a graph that
+        was built yesterday" work without forcing indexing back on.
+        Preconditions for the READ half: ``retrieval.graph_search_enabled``
+        and ``provider_id == "sqlite_fts"``.
+
+        Boot safety
+        -----------
+        This method performs NO ``await``. Construction is pure
+        Python object building, so it cannot contribute to a
+        startup hang. The only background work it starts is the
+        backfill loop, which sleeps before its first tick.
+
+        Graceful degradation
+        --------------------
+        Any failure leaves the corresponding ``_graph_*`` fields at
+        ``None``: graph search and/or indexing is simply
+        unavailable, writes are unaffected, and retrieval stays on
+        FTS/hybrid exactly as before.
+        """
+        settings = self._lifecycle.settings
+        ai = getattr(settings, "ai", None)
+        retrieval = getattr(settings, "retrieval", None)
+
+        want_search = bool(
+            getattr(retrieval, "graph_search_enabled", False)
+        )
+        want_index = bool(
+            ai is not None
+            and getattr(ai, "enabled", False)
+            and getattr(ai, "graph_indexing_enabled", False)
+        )
+
+        if not want_search and not want_index:
+            logger.debug(
+                "MemoryService: graph disabled "
+                "(graph_search_enabled=%s, graph_indexing_enabled=%s).",
+                want_search,
+                want_index,
+            )
+            return
+
+        if settings.provider_id != "sqlite_fts":
+            logger.info(
+                "MemoryService: graph skipped -- provider %r is "
+                "not sqlite_fts (the v6 tables only exist there).",
+                settings.provider_id,
+            )
+            return
+
+        # ---- Store (shared by both halves) ----------------------
+        #
+        # Lazy imports (consistent with the rest of this file).
+        from omweb.memory.storage.graph_store import GraphStore
+        from omweb.memory.storage.repository import (
+            SqliteMemoryRepository,
+        )
+
+        # Reuse the embedding pipeline's repository when it exists:
+        # ONE connection pool per process avoids two writers
+        # competing on the same WAL file. Fall back to a dedicated
+        # repository when embedding is disabled, and remember that
+        # we own it so ``_close_graph`` can release it.
+        repository = self._memory_repository
+        owns_repository = False
+        if repository is None:
+            db_path = self._outbox_db_path or self._lifecycle.db_path
+            try:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                repository = SqliteMemoryRepository(db_path)
+            except Exception as exc:
+                logger.warning(
+                    "MemoryService: could not open a repository for "
+                    "the graph (%s: %s); graph disabled.",
+                    type(exc).__name__, exc,
+                )
+                return
+            owns_repository = True
+
+        store = GraphStore(repository)
+        self._graph_repository = repository
+        self._owns_graph_repository = owns_repository
+        self._graph_store = store
+
+        # ---- READ half: graph search target ---------------------
+        if want_search:
+            from peldrun.memory.graph.graph_search import GraphSearch
+
+            self._graph_search = GraphSearch(
+                store,
+                max_depth=int(
+                    getattr(retrieval, "graph_search_max_depth", 2)
+                    or 2
+                ),
+                memories_per_entity=int(
+                    getattr(
+                        retrieval,
+                        "graph_search_memories_per_entity",
+                        20,
+                    )
+                    or 20
+                ),
+                max_relations_per_entity=int(
+                    getattr(
+                        retrieval, "graph_search_max_relations", 20
+                    )
+                    or 20
+                ),
+                min_query_entities=int(
+                    getattr(
+                        retrieval,
+                        "graph_search_min_query_entities",
+                        1,
+                    )
+                    or 1
+                ),
+            )
+            logger.info(
+                "MemoryService: graph SEARCH enabled "
+                "(max_depth=%d, memories_per_entity=%d).",
+                self._graph_search.max_depth,
+                self._graph_search._memories_per_entity
+                if hasattr(self._graph_search, "_memories_per_entity")
+                else 20,
+            )
+
+        # ---- WRITE half: indexing ------------------------------
+        if not want_index:
+            return
+        if not settings.mode.can_write:
+            logger.info(
+                "MemoryService: graph indexing skipped -- mode %r "
+                "does not permit writes (indexing persists graph "
+                "rows).",
+                settings.mode.value,
+            )
+            return
+
+        model = self._resolve_agentic_model()
+        if model is None:
+            logger.info(
+                "MemoryService: graph indexing enabled but no "
+                "agentic model resolved (set ai.agentic.model_id "
+                "in Settings -> Memory -> AI). Indexing stays "
+                "inactive until a model is selected."
+            )
+            return
+        provider_id, model_id = model
+
+        from omweb.memory.graph.indexer import GraphIndexer
+        from peldrun.memory.graph.entity_extractor import (
+            EntityExtractor,
+        )
+
+        # ---- Gateway + extractor --------------------------------
+        agentic_cfg = getattr(ai, "agentic", None)
+        extra_body = dict(
+            getattr(agentic_cfg, "extraction_extra_body", {}) or {}
+        )
+        gateway = self._build_agentic_gateway(extra_body)
+
+        # Extraction tuning is shared with the Phase 1 extractor, so
+        # the values are re-clamped here: a 45s per-memory deadline
+        # (sensible for a whole conversation) would let a single
+        # background indexing task occupy the provider for far too
+        # long. 2..20s bounds it.
+        raw_timeout = float(
+            getattr(agentic_cfg, "timeout_seconds", 5) or 5
+        )
+        timeout_seconds = max(2.0, min(raw_timeout, 20.0))
+        raw_tokens = int(
+            getattr(agentic_cfg, "max_output_tokens", 800) or 800
+        )
+        max_output_tokens = max(128, min(raw_tokens, 4000))
+
+        extractor = EntityExtractor(
+            gateway,
+            provider_id=provider_id,
+            model_id=model_id,
+            max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+        indexer = GraphIndexer(store=store, extractor=extractor)
+
+        # ---- Commit the write half ------------------------------
+        self._graph_extractor = extractor
+        self._graph_indexer = indexer
+
+        # ---- Background backfill --------------------------------
+        interval = int(
+            getattr(ai, "graph_backfill_interval_seconds", 900)
+            or 900
+        )
+        self._graph_backfill_task = asyncio.create_task(
+            self._graph_backfill_loop(interval),
+            name="memory-graph-backfill",
+        )
+
+        logger.info(
+            "MemoryService: graph INDEXING initialized "
+            "(provider=%r, model=%r, timeout=%.1fs, "
+            "backfill_interval=%ss, owns_repository=%s).",
+            provider_id,
+            model_id,
+            timeout_seconds,
+            interval,
+            owns_repository,
+        )
+
+    async def _graph_backfill_loop(
+        self, interval_seconds: int
+    ) -> None:
+        """Background loop that indexes un-indexed memories.
+
+        This is what makes graph coverage EVENTUALLY complete for
+        writes that bypass ``MemoryWritePipeline``: the
+        ``memory_save`` tool, import batches, failed indexing tasks,
+        and every memory created before graph indexing was enabled.
+
+        The first tick is delayed (at most 60s) so startup never
+        competes with the first burst of user traffic. A failure in
+        one tick is logged and the loop continues -- a transient
+        provider outage must not stop indexing for the rest of the
+        process lifetime.
+        """
+        try:
+            await asyncio.sleep(min(60, max(1, interval_seconds)))
+            while True:
+                try:
+                    await self.run_graph_backfill_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "MemoryService: graph backfill tick failed "
+                        "(will retry): %s", exc,
+                    )
+                await asyncio.sleep(max(1, interval_seconds))
+        except asyncio.CancelledError:
+            logger.debug("MemoryService: graph backfill loop cancelled.")
+            raise
+
+    async def run_graph_backfill_once(self) -> int:
+        """Index ONE batch of un-indexed memories.
+
+        Returns the number of memories that produced at least one
+        entity. Public so an operator endpoint (or a test) can force
+        a tick without waiting for the timer.
+
+        Never raises; ``0`` when graph indexing is inactive.
+        """
+        store = self._graph_store
+        indexer = self._graph_indexer
+        if store is None or indexer is None or not indexer.is_active:
+            return 0
+
+        ai = self._graph_ai_settings()
+        batch = int(
+            getattr(ai, "graph_backfill_batch_size", 20) or 20
+        )
+        try:
+            entries = await store.list_unindexed_memories(
+                limit=batch
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "MemoryService: graph backfill could not list "
+                "un-indexed memories: %s", exc,
+            )
+            return 0
+
+        indexed = 0
+        for entry in entries:
+            try:
+                produced = await indexer.index_memory(entry)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "MemoryService: graph backfill failed for %r: %s",
+                    getattr(entry, "memory_id", None), exc,
+                )
+                continue
+            if produced:
+                indexed += 1
+
+        if indexed:
+            logger.info(
+                "MemoryService: graph backfill indexed %d "
+                "memory/memories (batch=%d).",
+                indexed, batch,
+            )
+        return indexed
+
+    # ------------------------------------------------------------------
+    # Internal: agentic RAG lifecycle (Phase 6C/6D)
+    # ------------------------------------------------------------------
+
+    async def _initialize_agentic(self) -> None:
+        """Build the agentic pipeline when the operator opted in.
+
+        Preconditions:
+
+          1. ``retrieval.agentic_enabled`` is True.
+          2. ``ai.enabled`` is True (the LLM master switch).
+          3. An agentic model resolves (``_resolve_agentic_model``).
+
+        Missing preconditions leave every ``_agentic_*`` field at
+        ``None``, which makes ``retrieve_agentic`` fall back to the
+        standard path -- the documented degradation.
+
+        Boot safety
+        -----------
+        NO ``await``: object construction only. The three components
+        are stateless, so building them costs microseconds and can
+        never hang startup.
+
+        Why the rewriter and synthesizer get different timeouts
+        ------------------------------------------------------
+        Both share one gateway and one model, but their deadlines
+        reflect their role: a rewrite blocks the entire run, while
+        the synthesis is the answer the user actually reads. The
+        run-wide ceiling (``agentic_timeout_seconds``) is applied by
+        ``retrieve_agentic`` on top of both.
+        """
+        settings = self._lifecycle.settings
+        retrieval = getattr(settings, "retrieval", None)
+        if not getattr(retrieval, "agentic_enabled", False):
+            logger.debug(
+                "MemoryService: retrieval.agentic_enabled=False; "
+                "agentic retrieval inactive."
+            )
+            return
+
+        ai = getattr(settings, "ai", None)
+        if ai is None or not getattr(ai, "enabled", False):
+            logger.info(
+                "MemoryService: agentic_enabled=True but "
+                "ai.enabled=False; agentic retrieval inactive "
+                "(agentic runs need an LLM)."
+            )
+            return
+
+        model = self._resolve_agentic_model()
+        if model is None:
+            logger.info(
+                "MemoryService: agentic_enabled=True but no agentic "
+                "model resolved (set ai.agentic.model_id in "
+                "Settings -> Memory -> AI). Agentic retrieval will "
+                "fall back to the standard path."
+            )
+            return
+        provider_id, model_id = model
+
+        from peldrun.memory.agentic.evidence_synthesizer import (
+            EvidenceSynthesizer,
+        )
+        from peldrun.memory.agentic.multi_hop_retriever import (
+            MultiHopRetriever,
+        )
+        from peldrun.memory.agentic.orchestrator import (
+            AgenticRAGOrchestrator,
+        )
+        from peldrun.memory.agentic.query_rewriter import (
+            QueryRewriter,
+        )
+
+        agentic_cfg = getattr(ai, "agentic", None)
+        extra_body = dict(
+            getattr(agentic_cfg, "extraction_extra_body", {}) or {}
+        )
+        gateway = self._build_agentic_gateway(extra_body)
+
+        base_tokens = int(
+            getattr(agentic_cfg, "max_output_tokens", 1200) or 1200
+        )
+        base_timeout = float(
+            getattr(agentic_cfg, "timeout_seconds", 20) or 20
+        )
+
+        rewriter = QueryRewriter(
+            gateway,
+            provider_id=provider_id,
+            model_id=model_id,
+            max_output_tokens=max(128, min(base_tokens, 400)),
+            # The rewrite blocks every hop; keep it tight.
+            timeout_seconds=max(2.0, min(base_timeout, 10.0)),
+        )
+        synthesizer = EvidenceSynthesizer(
+            gateway,
+            provider_id=provider_id,
+            model_id=model_id,
+            max_output_tokens=max(256, min(base_tokens, 1500)),
+            # The synthesis IS the answer; allow more room than the
+            # rewrite but stay under the run-wide ceiling.
+            timeout_seconds=max(3.0, min(base_timeout, 25.0)),
+        )
+        max_hops = int(
+            getattr(retrieval, "agentic_max_hops", 3) or 3
+        )
+        retriever = MultiHopRetriever(
+            rewriter,
+            synthesizer,
+            max_hops=max_hops,
+        )
+
+        # Phase 6D: the orchestrator adds the graph seed.
+        #
+        # ``_initialize_graph`` runs BEFORE this method, so when
+        # ``retrieval.graph_search_enabled`` is on the searcher is
+        # already built and is injected here. When it is off, the
+        # orchestrator degrades to "the retriever plus a no-op
+        # graph phase".
+        run_timeout = float(
+            getattr(retrieval, "agentic_timeout_seconds", 30.0)
+            or 30.0
+        )
+        orchestrator = AgenticRAGOrchestrator(
+            rewriter,
+            retriever,
+            synthesizer,
+            self._graph_search,
+            max_hops=max_hops,
+            timeout_seconds=run_timeout,
+        )
+
+        self._agentic_rewriter = rewriter
+        self._agentic_synthesizer = synthesizer
+        self._agentic_retriever = retriever
+        self._agentic_orchestrator = orchestrator
+
+        logger.info(
+            "MemoryService: agentic retrieval ENABLED "
+            "(provider=%r, model=%r, max_hops=%d, "
+            "run_timeout=%.0fs, graph=%s). Reachable only via "
+            "retrieve_agentic / POST /api/memory/search/agentic.",
+            provider_id,
+            model_id,
+            max_hops,
+            run_timeout,
+            "on" if orchestrator.graph_enabled else "off",
+        )
+
+    async def _close_agentic(self) -> None:
+        """Tear down the agentic components. Idempotent; never raises.
+
+        They hold no resources (no connections, no tasks) -- the
+        gateway is shared and owned by the callers that built it --
+        so dropping the references is the whole teardown. Present as
+        a method so the shutdown sequence reads uniformly and a
+        future component with a real lifecycle has an obvious home.
+        """
+        self._agentic_orchestrator = None
+        self._agentic_retriever = None
+        self._agentic_synthesizer = None
+        self._agentic_rewriter = None
+
+    @property
+    def agentic_enabled(self) -> bool:
+        """True when agentic retrieval can run.
+
+        ``False`` means ``retrieve_agentic`` returns the standard
+        ``retrieve`` context instead of a synthesized answer.
+        """
+        return (
+            self._agentic_orchestrator is not None
+            or self._agentic_retriever is not None
+        )
+
+    @property
+    def agentic_graph_enabled(self) -> bool:
+        """True when the agentic pipeline will consult the graph.
+
+        Requires BOTH agentic retrieval and graph search to be
+        enabled: the orchestrator receives ``_graph_search``, which
+        only exists when ``retrieval.graph_search_enabled`` is on.
+        """
+        orchestrator = self._agentic_orchestrator
+        if orchestrator is None:
+            return False
+        return bool(getattr(orchestrator, "graph_enabled", False))
+
+    @property
+    def agentic_retriever(self) -> Optional["MultiHopRetriever"]:
+        """The agentic multi-hop retriever, or ``None``."""
+        return self._agentic_retriever
+
+    @property
+    def agentic_orchestrator(
+        self,
+    ) -> Optional["AgenticRAGOrchestrator"]:
+        """The agentic orchestrator, or ``None`` (sub-phase 6D)."""
+        return self._agentic_orchestrator
+
+    async def _close_graph(self) -> None:
+        """Tear down graph indexing. Idempotent; never raises.
+
+        Order matters:
+
+          1. Cancel the backfill loop (it holds the longest-lived
+             reference to the store).
+          2. Drain per-write indexing tasks so no task is left
+             writing into a closing repository -- an orphan task
+             would log "Task was destroyed but it is pending" and
+             leave half-written links.
+          3. Close the repository ONLY when this service opened it
+             (the embedding pipeline owns the other case).
+        """
+        task = self._graph_backfill_task
+        self._graph_backfill_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        try:
+            from omweb.memory.manager.write_pipeline import (
+                drain_graph_tasks,
+            )
+
+            drained = await drain_graph_tasks(5.0)
+            if drained:
+                logger.debug(
+                    "MemoryService: drained %d in-flight graph "
+                    "indexing task(s) on shutdown.", drained,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "MemoryService: graph task drain failed: %s", exc,
+            )
+
+        if self._owns_graph_repository and (
+            self._graph_repository is not None
+        ):
+            try:
+                self._graph_repository.close_all()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "MemoryService: graph repository close failed: %s",
+                    exc,
+                )
+
+        self._graph_repository = None
+        self._owns_graph_repository = False
+        self._graph_store = None
+        self._graph_extractor = None
+        self._graph_indexer = None
+        self._graph_search = None
+
+    @property
+    def graph_search(self) -> Optional["GraphSearch"]:
+        """The live graph searcher, or ``None``.
+
+        ``None`` means graph search will contribute nothing: either
+        ``retrieval.graph_search_enabled`` is off, or the graph was
+        never initialized. Exposed for diagnostics and for the
+        ``/api/memory/search`` response's ``search_mode`` reporting.
+        """
+        return self._graph_search
+
+    @property
+    def graph_enabled(self) -> bool:
+        """True when knowledge-graph INDEXING is initialized."""
+        return self._graph_indexer is not None
+
+    @property
+    def graph_store(self) -> Optional["GraphStore"]:
+        """The graph store, or ``None`` when indexing is off."""
+        return self._graph_store
+
+    @property
+    def graph_indexer(self) -> Optional["GraphIndexer"]:
+        """The graph indexer, or ``None`` when indexing is off."""
+        return self._graph_indexer
+
+    # ------------------------------------------------------------------
+    # Internal: memory-LLM concurrency
+    # ------------------------------------------------------------------
+
+    def _apply_llm_concurrency(self) -> None:
+        """Push ``ai.llm_max_concurrency`` into the process-wide gate.
+
+        Called on initialize and on every settings reload. The gate
+        lives in ``peldrun.memory.llm_contracts`` because it must cover
+        entity extraction, query rewriting, gap analysis, AND evidence
+        synthesis together: all four are ``/chat/completions`` calls to
+        the same model, and a single-slot local runtime interleaves
+        overlapping requests into unparseable output.
+
+        Never raises: a malformed setting must not break startup.
+        """
+        try:
+            from peldrun.memory.llm_contracts import (
+                configure_llm_concurrency,
+            )
+
+            ai_settings = getattr(
+                self._lifecycle.settings, "ai", None
+            )
+            limit = int(
+                getattr(ai_settings, "llm_max_concurrency", 1) or 1
+            )
+            configure_llm_concurrency(limit)
+            if limit > 1:
+                logger.info(
+                    "MemoryService: memory LLM concurrency set to %d "
+                    "(safe only for a provider with real concurrency "
+                    "headroom; a local runtime serves one at a time).",
+                    limit,
+                )
+            else:
+                logger.debug(
+                    "MemoryService: memory LLM calls serialized "
+                    "(llm_max_concurrency=1)."
+                )
+        except Exception as exc:  # noqa: BLE001 -- never fatal
+            logger.warning(
+                "MemoryService: could not apply llm_max_concurrency "
+                "(defaulting to serialized calls): %s", exc,
+            )
+
     async def _close_extraction(self) -> None:
         """Tear down the extraction subsystem. Idempotent.
 
@@ -2839,6 +4358,11 @@ class MemoryService:
                 fts_provider=self._lifecycle.provider,
                 vec_provider=vec_provider,
                 reranker=reranker,
+                # Phase 6B: a LATE-BINDING proxy, not the searcher
+                # itself -- see ``_LazyGraphSearch`` for why the
+                # graph is not yet built at this point and why the
+                # flag must be re-read on every search.
+                graph_search=_LazyGraphSearch(self),
             )
 
             # ---- 4. Commit state -------------------------

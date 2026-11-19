@@ -235,6 +235,7 @@ class HybridMemoryProvider:
         vec_provider: SqliteVecProvider,
         rrf_k: int = _DEFAULT_RRF_K,
         reranker: Optional[Any] = None,
+        graph_search: Optional[Any] = None,
     ) -> None:
         """Construct the hybrid wrapper.
 
@@ -308,6 +309,23 @@ class HybridMemoryProvider:
         #: ``rerank(query, candidates, top_k)`` coroutine and a
         #: ``last_rerank_succeeded: bool`` property is compatible.
         self._reranker: Optional[Any] = reranker
+
+        #: Phase 6B: optional knowledge-graph source. When supplied,
+        #: ``search_ranked`` runs a THIRD ranked list in parallel
+        #: with FTS and vector, and fuses all three via RRF.
+        #:
+        #: Contract: an object with an async
+        #: ``find_related_for_query(query, scope_refs=..., limit=...)``
+        #: coroutine returning ``List[Tuple[MemoryEntry, float]]``.
+        #: ``peldrun.memory.graph.graph_search.GraphSearch`` is the
+        #: production implementation; tests use a tiny double.
+        #:
+        #: Stored as ``Any`` for the same reason as ``reranker``:
+        #: this module must not import the graph stack.
+        #:
+        #: ``None`` (the default) means the graph never participates
+        #: and the search path is byte-for-byte identical to Phase 5.
+        self._graph_search: Optional[Any] = graph_search
 
         #: Records the strategy used by the MOST RECENT
         #: ``search_ranked`` call. One of:
@@ -512,6 +530,12 @@ class HybridMemoryProvider:
         # ``asyncio.gather`` with the default setting would
         # abort the healthy coroutine when the broken one
         # raised -- the opposite of what we want here.
+        #
+        # [PHASE 6B] The graph source runs in the SAME gather, so
+        # enabling it adds no serial latency: the graph lookup
+        # overlaps the FTS query and the embedding HTTP call. It
+        # performs NO LLM call (see ``graph_search.py`` invariant
+        # #1), so it stays inside the dispatcher's latency budget.
         fts_coro = self._fts_provider.search_ranked(
             query, scope_refs, limit, **filters
         )
@@ -521,10 +545,22 @@ class HybridMemoryProvider:
             limit=limit,
             min_similarity=0.0,
         )
+        graph_coro = self._graph_ranked(query, scope_refs, limit)
 
-        fts_result, vec_result = await asyncio.gather(
-            fts_coro, vec_coro, return_exceptions=True
-        )
+        if graph_coro is None:
+            fts_result, vec_result = await asyncio.gather(
+                fts_coro, vec_coro, return_exceptions=True
+            )
+            graph_result: Any = []
+        else:
+            fts_result, vec_result, graph_result = (
+                await asyncio.gather(
+                    fts_coro,
+                    vec_coro,
+                    graph_coro,
+                    return_exceptions=True,
+                )
+            )
 
         # ---- Degrade gracefully on per-path failure ----------
         if isinstance(fts_result, BaseException):
@@ -543,6 +579,33 @@ class HybridMemoryProvider:
                 exc_info=vec_result,
             )
             vec_result = []
+        graph_hits: List[Tuple[MemoryEntry, float]] = []
+        if isinstance(graph_result, BaseException):
+            # The graph is an ADDITIONAL recall source; losing it
+            # must leave the lexical and vector results intact.
+            logger.warning(
+                "Hybrid: graph search failed (continuing with "
+                "FTS + vector only): %s",
+                graph_result,
+            )
+        elif graph_result:
+            graph_hits = list(graph_result)
+
+        # ---- Phase 6B: three-way fusion ---------------------
+        #
+        # Only taken when the graph actually contributed. With an
+        # empty graph (the common case right after enabling the
+        # feature) this branch is skipped entirely, so behaviour is
+        # IDENTICAL to Phase 5 -- including the single-source
+        # short-circuits below.
+        if graph_hits:
+            return await self._finish_with_graph(
+                query=query,
+                fts_result=fts_result,
+                vec_result=vec_result,
+                graph_hits=graph_hits,
+                limit=limit,
+            )
 
         # ---- Handle empty-on-one-side ------------------------
         #
@@ -595,7 +658,23 @@ class HybridMemoryProvider:
         # configured (see ``CrossEncoderReranker.is_active``) --
         # so ``rerank()`` returns its input unchanged with
         # negligible overhead.
-        if self._reranker is not None and len(fused) > 1:
+        #
+        # [PHASE 6C] ``no_rerank`` lets a caller opt out for a
+        # single search. The agentic retriever sets it on every hop:
+        # it already selects evidence across hops by fusion, so
+        # re-scoring each hop's candidates on top of that buys no
+        # accuracy, while costing ``ceil(candidates / batch_size)``
+        # extra completions PER sub-query -- roughly 36 per 3-hop run
+        # at the default configuration. Against a local model that
+        # amplification is what starved the agentic calls themselves.
+        # The flag is popped here, so it never reaches the FTS/vector
+        # backends.
+        skip_rerank = bool(filters.pop("no_rerank", False))
+        if (
+            self._reranker is not None
+            and len(fused) > 1
+            and not skip_rerank
+        ):
             reranked = await self._reranker.rerank(
                 query, fused, top_k=limit,
             )
@@ -730,6 +809,152 @@ class HybridMemoryProvider:
         ]
 
     # ------------------------------------------------------------------
+    # Graph source (Phase 6B)
+    # ------------------------------------------------------------------
+
+    def _graph_ranked(
+        self,
+        query: str,
+        scope_refs: List[str],
+        limit: int,
+    ) -> Optional[Any]:
+        """Return the graph-search coroutine, or ``None`` when off.
+
+        Returning a CORO (not awaiting here) is what lets the caller
+        hand all three sources to a single ``asyncio.gather``, so
+        the graph lookup overlaps the FTS query and the embedding
+        HTTP call instead of running after them.
+
+        ``scope_refs`` is forwarded explicitly and always: the graph
+        is the one source whose underlying table has NO scope column
+        of its own, so failing to pass the live scope set would
+        return memories from other projects (see ``graph_search.py``
+        invariant #4).
+        """
+        if self._graph_search is None:
+            return None
+        try:
+            return self._graph_search.find_related_for_query(
+                query,
+                scope_refs=list(scope_refs),
+                limit=max(int(limit), 1),
+            )
+        except AttributeError as exc:
+            # A mis-shaped graph_search object (wrong contract) must
+            # not break search. Log once per call and drop the
+            # source for this query.
+            logger.warning(
+                "Hybrid: graph_search does not expose "
+                "find_related_for_query (%s); graph source "
+                "disabled for this query.",
+                exc,
+            )
+            return None
+
+    async def _finish_with_graph(
+        self,
+        *,
+        query: str,
+        fts_result: List[Tuple[MemoryEntry, float]],
+        vec_result: List[Tuple[MemoryEntry, float]],
+        graph_hits: List[Tuple[MemoryEntry, float]],
+        limit: int,
+    ) -> List[Tuple[MemoryEntry, float]]:
+        """Fuse the non-empty sources (2 or 3 way) and optionally rerank.
+
+        Mode reporting
+        --------------
+          * ``"hybrid+graph"`` -- at least two sources contributed
+            (so the fusion genuinely blended signals),
+          * ``"graph"`` -- the graph was the ONLY source that
+            returned anything. Honest: the caller received
+            graph-only results, not a blend.
+
+        When the reranker improves the ordering the tag gains a
+        ``+rerank`` segment, mirroring the Phase 5 behaviour
+        (``"hybrid+rerank"``).
+
+        RRF is used for 3-way fusion for the same reason it is used
+        for 2-way: the three sources produce scores on incompatible
+        scales (BM25, cosine, and distance-derived), so only their
+        ORDER can be meaningfully combined.
+        """
+        ranked_lists = [
+            ranked
+            for ranked in (fts_result, vec_result, graph_hits)
+            if ranked
+        ]
+        fused = self._rrf_merge_many(ranked_lists, limit)
+        base_mode = "hybrid+graph" if len(ranked_lists) >= 2 else "graph"
+
+        if self._reranker is not None and len(fused) > 1:
+            reranked = await self._reranker.rerank(
+                query, fused, top_k=limit,
+            )
+            if getattr(
+                self._reranker, "last_rerank_succeeded", False
+            ):
+                self._last_search_mode = (
+                    base_mode + "+rerank"
+                )
+            else:
+                self._last_search_mode = base_mode
+            return reranked
+
+        self._last_search_mode = base_mode
+        return fused
+
+    def _rrf_merge_many(
+        self,
+        ranked_lists: List[List[Tuple[MemoryEntry, float]]],
+        limit: int,
+    ) -> List[Tuple[MemoryEntry, float]]:
+        """Fuse N ranked lists with RRF, normalized to ``[0, 1]``.
+
+        Generalizes :meth:`_rrf_merge` to any number of sources so
+        the 2-way (Phase 4) and 3-way (Phase 6) paths share one
+        formula. Entries present in several lists accumulate a
+        contribution from each -- the "consensus bonus" RRF relies
+        on, which is exactly what should happen when FTS, vector,
+        AND the graph all surface the same memory.
+
+        Ties break by ``memory_id`` ascending so two identical
+        searches return identical orderings (required for
+        reproducible retrieval and for golden tests).
+        """
+        scores: Dict[str, float] = {}
+        entries: Dict[str, MemoryEntry] = {}
+        k = self._rrf_k
+
+        for ranked in ranked_lists:
+            for rank, (entry, _sim) in enumerate(ranked, start=1):
+                if entry is None or not entry.memory_id:
+                    continue
+                mid = entry.memory_id
+                scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+                if mid not in entries:
+                    entries[mid] = entry
+
+        if not scores:
+            return []
+
+        ordered_ids = sorted(
+            scores.keys(),
+            key=lambda mid: (-scores[mid], mid),
+        )[:limit]
+        if not ordered_ids:
+            return []
+
+        max_score = scores[ordered_ids[0]]
+        if max_score <= 0.0:
+            return [(entries[mid], 1.0) for mid in ordered_ids]
+
+        return [
+            (entries[mid], scores[mid] / max_score)
+            for mid in ordered_ids
+        ]
+
+    # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
@@ -781,6 +1006,16 @@ class HybridMemoryProvider:
         ``POST /api/memory/search``).
         """
         return self._reranker
+
+    @property
+    def graph_search(self) -> Optional[Any]:
+        """The optional Phase 6B graph source, or ``None``.
+
+        ``None`` means the graph never participates. A non-``None``
+        value does NOT guarantee graph hits: most queries mention no
+        known entity, and the graph simply contributes nothing.
+        """
+        return self._graph_search
 
     def __repr__(self) -> str:
         reranker_desc = (

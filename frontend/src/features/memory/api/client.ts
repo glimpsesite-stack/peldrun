@@ -101,6 +101,14 @@ import type {
   MemoryProjectOverride,
   MemorySettingsPatch,
 } from '../types/settings';
+// Phase 6 agentic retrieval -- request/response envelopes live in
+// their own module because they are NOT part of the memory-entry
+// CRUD surface (see `types/agentic.ts`'s module JSDoc).
+import type {
+  AgenticSearchRequest,
+  AgenticSearchResponse,
+  AgenticStatusResponse,
+} from '../types/agentic';
 import type {
   ExportDownloadResult,
   ExportQueryParams,
@@ -508,6 +516,59 @@ export const memoryClient = {
         `/settings/projects/${encodeURIComponent(projectId)}`,
         { method: 'DELETE', signal: opts.signal },
       ),
+  },
+
+  // -------------------------------------------------------------------------
+  // Agentic retrieval (Phase 6)
+  // -------------------------------------------------------------------------
+  //
+  // A SEPARATE namespace from `entries.search`, not an option on it.
+  // The two differ in cost (one SQLite query vs several LLM calls),
+  // in latency (~ms vs seconds), and in semantics (list memories vs
+  // answer a question). Folding them into one method with a flag
+  // would hide a 3-second, paid operation behind a call site that
+  // everywhere else is cheap.
+
+  agentic: {
+    /**
+     * `POST /api/memory/search/agentic` -- answer a complex question
+     * from memory.
+     *
+     * ALWAYS resolves on a well-formed request: a disabled,
+     * unconfigured, timed-out, or failed run comes back as HTTP 200
+     * with `is_available: false`, an `error` code, and the standard
+     * retrieval result under `fallback`. Callers branch on
+     * `is_available` (or `hasAgenticAnswer()`), never on a thrown
+     * error.
+     *
+     * The request is SLOW by design (several LLM calls). Pass
+     * `opts.signal` if the caller can be cancelled -- the abort
+     * propagates to the HTTP request, and the backend's own
+     * `agentic_timeout_seconds` ceiling bounds the unbounded case.
+     */
+    search: (
+      body: AgenticSearchRequest,
+      opts: { signal?: AbortSignal } = {},
+    ) =>
+      memoryFetch<AgenticSearchResponse>('/search/agentic', {
+        method: 'POST',
+        json: body,
+        signal: opts.signal,
+      }),
+
+    /**
+     * `GET /api/memory/search/agentic/status` -- cheap availability
+     * probe.
+     *
+     * No LLM call, no search. Used by the composer toggle to decide
+     * whether the feature is offerable, and by the settings section
+     * to explain WHY it is not (disabled vs unconfigured).
+     */
+    status: (opts: { signal?: AbortSignal } = {}) =>
+      memoryFetch<AgenticStatusResponse>('/search/agentic/status', {
+        method: 'GET',
+        signal: opts.signal,
+      }),
   },
 
   // -------------------------------------------------------------------------

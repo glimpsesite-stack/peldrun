@@ -124,6 +124,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from peldrun.memory.domain import MemoryEntry
+from peldrun.memory.llm_contracts import memory_llm_gate
 
 
 logger = logging.getLogger("peldrun.memory.retrieval.reranker")
@@ -734,24 +735,48 @@ class CrossEncoderReranker:
             system_prompt, user_prompt = self._build_prompt(
                 query, batch,
             )
-            response = await self._gateway.generate_structured(  # type: ignore[union-attr]
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                provider_id=self._provider_id,  # type: ignore[arg-type]
-                model_id=self._model_id,  # type: ignore[arg-type]
-                api_key=self._api_key,
-                base_url=self._base_url,
-                max_output_tokens=self._max_output_tokens,
-                # The gateway's timeout is intentionally LOOSER
-                # than the reranker's own -- our ``asyncio.wait_for``
-                # is the authoritative deadline; the gateway's
-                # timeout is only a safety net against a runaway
-                # transport that ignores our cancellation.
-                timeout_seconds=(
-                    int(self._timeout_seconds) + 5
-                ),
-                connection_id=self._connection_id,
-            )
+            # -------------------------------------------------------
+            # Shared concurrency gate
+            # -------------------------------------------------------
+            # The reranker is the LARGEST source of memory-LLM calls:
+            # it scores ``ceil(candidates / batch_size)`` batches per
+            # SEARCH, and an agentic run performs one search per
+            # sub-query per hop. With the default 20-candidate / 5-per
+            # batch configuration that is 4 calls per search, so a
+            # 3-hop run with 3 sub-queries issues ~36 completions.
+            #
+            # None of that used to be gated, because the reranker
+            # calls the gateway directly instead of going through
+            # ``call_structured``. Against a single-slot local runtime
+            # those calls interleaved with extraction and synthesis and
+            # every one of them produced character soup -- which is
+            # exactly the "rerank timed out after 3.0s" storm in the
+            # server log.
+            #
+            # Waiting here consumes the CALLER's deadline (the
+            # ``asyncio.wait_for`` around this batch), so a queued
+            # rerank simply times out and degrades to RRF ordering.
+            # That is the intended trade: ordering quality is optional,
+            # a corrupted generation is not.
+            async with memory_llm_gate():
+                response = await self._gateway.generate_structured(  # type: ignore[union-attr]
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    provider_id=self._provider_id,  # type: ignore[arg-type]
+                    model_id=self._model_id,  # type: ignore[arg-type]
+                    api_key=self._api_key,
+                    base_url=self._base_url,
+                    max_output_tokens=self._max_output_tokens,
+                    # The gateway's timeout is intentionally LOOSER
+                    # than the reranker's own -- our ``asyncio.wait_for``
+                    # is the authoritative deadline; the gateway's
+                    # timeout is only a safety net against a runaway
+                    # transport that ignores our cancellation.
+                    timeout_seconds=(
+                        int(self._timeout_seconds) + 5
+                    ),
+                    connection_id=self._connection_id,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

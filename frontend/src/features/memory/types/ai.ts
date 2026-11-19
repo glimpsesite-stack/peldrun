@@ -138,6 +138,79 @@ export interface MemoryAISettings {
   /** LLM config for the consolidation task. */
   consolidation: MemoryTaskModel;
 
+  // ------------------------- Phase 6: agentic model -----------------------
+  //
+  // LLM config for the Phase 6 components: entity extraction
+  // (graph indexing), query rewriting, and evidence synthesis.
+  //
+  // WHY A SEPARATE TASK MODEL rather than reusing `extraction`:
+  // an agentic run issues several calls per question (one rewrite,
+  // up to `agentic_max_hops` gap analyses, one synthesis), so an
+  // operator will usually want a cheaper or faster model here than
+  // the one used for deep conversation extraction.
+  //
+  // RESOLUTION ORDER on the backend (first match wins):
+  //   1. `agentic.provider_id` + `agentic.model_id`
+  //   2. `agentic.model_id` alone -> provider inferred from the
+  //      models metadata/vault
+  //   3. `extraction.provider_id` + `extraction.model_id`
+  //   4. the first model marked as a "memory model"
+  //
+  // If NONE resolves, agentic retrieval and graph indexing are
+  // silently inactive. The settings UI MUST surface this, because
+  // a user who only flips `retrieval.agentic_enabled` would
+  // otherwise get `agentic+fallback` forever with no explanation.
+  agentic: MemoryTaskModel;
+
+  // ------------------------- Phase 6: graph indexing ----------------------
+  //
+  // Write-side of the knowledge graph. Without these, the graph is
+  // empty and `retrieval.graph_search_*` finds nothing.
+  //
+  // DISJOINT from `retrieval.graph_search_enabled`: that flag
+  // controls READING the graph, these control POPULATING it. They
+  // are independent by design (you can search a graph that was
+  // built yesterday without re-enabling indexing).
+
+  /**
+   * Index new memories into the knowledge graph. Default: `false`.
+   *
+   * When `true`, every successfully written memory schedules a
+   * BACKGROUND entity-extraction task; the write itself never
+   * waits for it. Requires `enabled` above plus a resolvable
+   * `agentic` model.
+   */
+  graph_indexing_enabled: boolean;
+
+  /**
+   * Seconds between background backfill scans [60, 86400].
+   * Default: `900` (15 min).
+   *
+   * The backfill indexes active memories that have no graph links
+   * yet -- which is the only thing that covers writes that bypass
+   * the write pipeline (the `memory_save` tool) and indexing tasks
+   * that failed.
+   */
+  graph_backfill_interval_seconds: number;
+
+  /** Memories indexed per backfill tick [1, 200]. Default: `20`. */
+  graph_backfill_batch_size: number;
+
+  /**
+   * Maximum simultaneous memory LLM calls, process-wide [1, 4]. Default: `1`.
+   *
+   * Entity extraction is a CHAT COMPLETION call, not an embedding
+   * call, and the write pipeline dispatches one background indexing
+   * task per written memory -- so a batch write of N memories opens
+   * N parallel completions.
+   *
+   * Most LOCAL runtimes (LM Studio, Ollama, llama.cpp) serve one
+   * request at a time: the extras queue, time out, or fail, leaving
+   * the graph empty. Keep this at 1 for a local model; raise it only
+   * for a hosted API with real concurrency headroom.
+   */
+  llm_max_concurrency: number;
+
   /**
    * Maximum messages sent to the LLM per extraction job.
    * A longer conversation is truncated to the LAST N messages
@@ -251,6 +324,24 @@ export interface MemoryAISettingsOverlay {
   extraction_trigger?: ExtractionTrigger;
   extraction?: Partial<MemoryTaskModel>;
   consolidation?: Partial<MemoryTaskModel>;
+  /**
+   * Phase 6 agentic model overlay. Partial so a caller can change
+   * only `model_id` without echoing the other fields back.
+   *
+   * The parent object is expanded to a FULL `MemoryAISettings`
+   * before transmission (see `computeEffectiveOverride` in
+   * `./settings.ts`), so a partial here never reaches the wire.
+   */
+  agentic?: Partial<MemoryTaskModel>;
+  /**
+   * Phase 6 graph-indexing overlay. Scalar flags -- the shallow
+   * spread in `mergeMemoryAISettings` handles them correctly.
+   */
+  graph_indexing_enabled?: boolean;
+  graph_backfill_interval_seconds?: number;
+  graph_backfill_batch_size?: number;
+  /** Phase 6: simultaneous extraction calls [1, 4]. Default: `1`. */
+  llm_max_concurrency?: number;
   max_messages_per_job?: number;
   max_input_tokens?: number;
   max_candidates_per_job?: number;
@@ -529,6 +620,23 @@ export const DEFAULT_MEMORY_AI_SETTINGS: MemoryAISettings = {
     max_output_tokens: 1200,
     timeout_seconds: 45,
   },
+  // Phase 6 agentic model. `provider_id`/`model_id` are `null`
+  // rather than a guessed provider: the form must show "not
+  // configured" honestly and let the operator pick, instead of
+  // silently inheriting a model they never chose. A null pair is
+  // the documented "not yet configured" state (see
+  // `MemoryTaskModel`), and the backend then falls back to the
+  // extraction pair / first memory model.
+  agentic: {
+    provider_id: null,
+    model_id: null,
+    max_output_tokens: 1200,
+    timeout_seconds: 20,
+  },
+  graph_indexing_enabled: false,
+  graph_backfill_interval_seconds: 900,
+  graph_backfill_batch_size: 20,
+  llm_max_concurrency: 1,
   max_messages_per_job: 40,
   max_input_tokens: 12_000,
   max_candidates_per_job: 20,
@@ -567,4 +675,10 @@ export const MemoryAIBounds = {
   max_output_tokens: { min: 128, max: 32_000 },
   timeout_seconds: { min: 5, max: 180 },
   snapshot_heartbeat_interval_seconds: { min: 1, max: 60 },
+  // Phase 6 graph-indexing bounds -- mirror the backend's
+  // `graph_backfill_interval_seconds` / `graph_backfill_batch_size`
+  // Field(ge=..., le=...) declarations.
+  graph_backfill_interval_seconds: { min: 60, max: 86_400 },
+  graph_backfill_batch_size: { min: 1, max: 200 },
+  llm_max_concurrency: { min: 1, max: 4 },
 } as const;

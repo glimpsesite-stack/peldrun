@@ -581,7 +581,7 @@ void _patchableFieldsAreExhaustive;
  * Returns a NEW object; neither `base` nor `override` is
  * mutated.
  */
-function mergeMemoryAISettings(
+export function mergeMemoryAISettings(
   base: MemoryAISettings,
   override: MemoryAISettingsOverlay,
 ): MemoryAISettings {
@@ -594,6 +594,15 @@ function mergeMemoryAISettings(
     consolidation: override.consolidation
       ? { ...base.consolidation, ...override.consolidation }
       : base.consolidation,
+    // Phase 6: same deep-merge rule as the two task models above.
+    // The overlay types `agentic` as `Partial<MemoryTaskModel>`, so
+    // a plain `...override` would make the result's `agentic`
+    // potentially-partial and fail to satisfy `MemoryAISettings`
+    // (which requires every field). Merging field-by-field both
+    // fixes the type and preserves the untouched siblings.
+    agentic: override.agentic
+      ? { ...base.agentic, ...override.agentic }
+      : base.agentic,
   };
 }
 

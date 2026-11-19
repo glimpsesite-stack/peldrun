@@ -514,6 +514,81 @@ class MemoryAISettings(BaseModel):
             "the extraction model."
         ),
     )
+    agentic: MemoryAIExtractionSettings = Field(
+        default_factory=MemoryAIExtractionSettings,
+        description=(
+            "Model selection and per-call limits for the Phase 6 "
+            "agentic components: the entity extractor (graph "
+            "indexing), the query rewriter, and the evidence "
+            "synthesizer. Kept SEPARATE from ``extraction`` on "
+            "purpose: agentic retrieval makes several LLM calls "
+            "per user question, so an operator will usually want a "
+            "cheaper or faster model here than the one used for "
+            "deep conversation extraction."
+        ),
+    )
+
+    # ------------------------- Phase 6: graph indexing ----------------------
+
+    graph_indexing_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable write-time knowledge-graph indexing (Phase 6). "
+            "When True, every successfully written memory schedules "
+            "a BACKGROUND entity-extraction task; the write itself "
+            "never waits for it. Requires ``enabled=True`` plus a "
+            "resolvable model in ``agentic``. When False (the "
+            "default), no graph work happens at all and the write "
+            "path is identical to Phase 5."
+        ),
+    )
+    graph_backfill_interval_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=86_400,
+        description=(
+            "How often the background backfill scans for active "
+            "memories that have no graph links yet and indexes "
+            "them. This is what covers writes that bypassed "
+            "``MemoryWritePipeline`` (the ``memory_save`` tool "
+            "writes straight through the provider) and any "
+            "indexing task that failed. 900s (15 min) keeps the "
+            "graph converging without competing with real writes."
+        ),
+    )
+    graph_backfill_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description=(
+            "Maximum memories the backfill indexes per tick. "
+            "Bounded so a large un-indexed backlog is worked "
+            "through gradually instead of burning the whole "
+            "day's LLM budget in one burst."
+        ),
+    )
+    llm_max_concurrency: int = Field(
+        default=1,
+        ge=1,
+        le=4,
+        description=(
+            "Maximum SIMULTANEOUS memory LLM calls, process-wide. "
+            "Covers every Phase 6 chat-completion call: entity "
+            "extraction (graph indexing), query rewriting, gap "
+            "analysis, and evidence synthesis. "
+            "Why this matters: the write pipeline dispatches one "
+            "background indexing task per written memory, and the "
+            "composer can start a new agentic run while a previous one "
+            "is still generating, so the default would otherwise be "
+            "several overlapping /chat/completions requests. "
+            "Most LOCAL runtimes (LM Studio, Ollama, llama.cpp) serve "
+            "one generation at a time: they do NOT queue overlapping "
+            "requests, they interleave the token streams and both "
+            "responses become unparseable JSON. "
+            "Keep this at 1 (default) for a local model. Raise it to "
+            "2-4 ONLY for a hosted API with real concurrency headroom."
+        ),
+    )
 
     # ------------------------- size and confidence bounds -------------------
 
@@ -948,6 +1023,169 @@ class MemoryRetrievalSettings(BaseModel):
             "single-call behavior -- the reference §6.3 "
             "suggestion. Invalid values are clamped to the "
             "reranker's own defaults at construction time."
+        ),
+    )
+
+    # ------------------------- Phase 6: graph search ------------------------
+
+    # ------------------------- Phase 6: always retrieve ---------------------
+
+    always_retrieve: bool = Field(
+        default=True,
+        description=(
+            "Search the user's memories on EVERY non-empty chat turn, "
+            "instead of only when the query happens to look like an "
+            "explicit recall request. "
+            "``classify_route`` is a heuristic gate whose patterns are "
+            "English-centric; with it active, a normal question (or any "
+            "question in another language) classifies as NO_NEED and "
+            "``build_memory_context`` returns an empty context WITHOUT "
+            "searching -- so stored facts are silently withheld from "
+            "the model even though the search itself works. "
+            "When True (default), every non-empty turn retrieves from "
+            "the user's memories in BOTH exec modes (chat and agent). "
+            "Scope is unchanged: ``user:<id>`` is always included, plus "
+            "project/chat when known -- this changes WHEN retrieval "
+            "runs, never WHAT is visible (scope isolation is a security "
+            "boundary). "
+            "Cost: one FTS query (~ms) per turn, no LLM call. "
+            "Set to False to restore the strict intent-gated behaviour."
+        ),
+    )
+
+    graph_search_enabled: bool = Field(
+        default=False,
+        description=(
+            "Add the knowledge graph as a THIRD ranked source in "
+            "``HybridMemoryProvider.search_ranked`` (Phase 6, "
+            "sub-phase 6B). When True, a query that mentions a "
+            "known entity also returns the memories linked to that "
+            "entity and its neighbours, fused with the FTS and "
+            "vector lists via three-way RRF. ``search_mode`` "
+            "reports ``hybrid+graph`` (or ``hybrid+rerank+graph``). "
+            "When False (the default) the search path is identical "
+            "to Phase 5 -- no graph lookup, no extra latency. "
+            "Requires graph indexing to have populated data; with "
+            "an empty graph the lookup returns nothing and the "
+            "result is unchanged."
+        ),
+    )
+    graph_search_max_depth: int = Field(
+        default=2,
+        ge=0,
+        le=3,
+        description=(
+            "Traversal depth for graph search, counted in HOPS from a "
+            "resolved query entity. 0 = only memories linked "
+            "DIRECTLY to that entity (score 1.0). 1 adds the "
+            "entity's direct neighbours (score 0.5). 2 (default) "
+            "adds two-hop discoveries (score 0.33), which is what "
+            "resolves 'what did my manager say about the project' "
+            "(person -> org -> memories). 3 is allowed but "
+            "expensive: reachable edges grow multiplicatively with "
+            "depth and the traversal caps start truncating "
+            "aggressively."
+        ),
+    )
+    graph_search_max_relations: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Maximum edges expanded per entity during traversal. "
+            "Hub entities (a broad TOPIC mentioned in every memory) "
+            "can have hundreds of neighbours; without this cap one "
+            "hub consumes the entire traversal budget and the "
+            "query returns hub noise only."
+        ),
+    )
+    graph_search_min_query_entities: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description=(
+            "How many known entities a query must resolve before "
+            "the graph contributes. 1 (default) means any known "
+            "entity is enough. Raise this on a sparse or noisy "
+            "graph, where a single incidental token match adds "
+            "more noise than signal."
+        ),
+    )
+    graph_search_memories_per_entity: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Memories hydrated per entity during graph search. "
+            "Bounds the work for an entity linked to thousands of "
+            "memories; the fusion only needs a handful per entity "
+            "to influence the ranking."
+        ),
+    )
+
+    # ------------------------- Phase 6: agentic RAG -------------------------
+
+    agentic_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable agentic retrieval (Phase 6, sub-phases 6C/6D): "
+            "query decomposition, multi-hop retrieval, gap analysis, "
+            "and evidence synthesis. Reachable ONLY through "
+            "``POST /api/memory/search/agentic`` and "
+            "``MemoryService.retrieve_agentic`` -- never through the "
+            "dispatcher's per-turn ``retrieve``, because an agentic "
+            "run costs several LLM calls. Requires a resolvable "
+            "model in ``ai.agentic`` (falling back to "
+            "``ai.extraction``) and ``ai.enabled=True``."
+        ),
+    )
+    agentic_max_hops: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description=(
+            "Maximum retrieval rounds in one agentic run. Hop 1 "
+            "searches the rewritten question; hops 2..N chase the "
+            "gap analysis' refinements. Each hop costs "
+            "``len(sub_queries)`` searches plus one LLM call, so "
+            "raising this multiplies both latency and cost."
+        ),
+    )
+    agentic_timeout_seconds: float = Field(
+        default=90.0,
+        ge=5.0,
+        le=300.0,
+        description=(
+            "Hard wall-clock ceiling for one agentic run, enforced "
+            "with ``asyncio.wait_for`` around the whole pipeline. "
+            "On timeout the run returns the evidence gathered so far "
+            "plus a partial answer if one was produced. "
+            "Budget guidance: a run makes one rewrite, one gap "
+            "analysis per hop, and one synthesis -- 5 chats plus a "
+            "handful of searches. Those calls are SERIALIZED by the "
+            "memory-LLM gate (ai.llm_max_concurrency, default 1), "
+            "because a local runtime interleaves overlapping "
+            "generations instead of queueing them. At ~1.5s per chat "
+            "call that is roughly 10s, but a 3-hop run that also "
+            "waits on an unreachable embedding provider or a slow "
+            "reranker needs several times that. 30s -- the original "
+            "budget, sized for UNSERIALIZED calls -- cut real runs "
+            "off mid-flight and returned 0 evidence. Raise it for a "
+            "slow local model; lower it for a hosted API."
+        ),
+    )
+    agentic_confidence_threshold: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Confidence at or above which a synthesized answer is "
+            "reported as meeting the threshold "
+            "(``confidence_threshold_met`` in the response). This "
+            "does NOT discard low-confidence answers -- it labels "
+            "them, so the caller can decide whether to surface the "
+            "raw evidence instead. Discarding would hide the partial "
+            "progress the run paid for."
         ),
     )
 

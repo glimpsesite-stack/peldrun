@@ -336,6 +336,101 @@ export interface MemoryRetrievalSettings {
   rerank_timeout_seconds: number;
   /** Reranker LLM candidates per call [1, 20]. Default: `20`. */
   rerank_batch_size: number;
+
+  // ------------------------- Phase 6: graph search ------------------------
+  //
+  // The knowledge graph is a THIRD ranked source alongside FTS and
+  // vector: a query that names a known entity also returns the
+  // memories linked to that entity and its neighbours, fused via
+  // three-way RRF. `search_mode` then reports `hybrid+graph`.
+  //
+  // INDEPENDENCE: these flags are deliberately NOT gated on
+  // `agentic_enabled`. Graph search runs inside the NORMAL
+  // `/search` path too, so a user who wants better plain retrieval
+  // enables ONLY these. Conversely `agentic_enabled` works without
+  // the graph.
+  //
+  // PREREQUISITE the UI must surface: graph search reads a graph
+  // that `ai.graph_indexing_enabled` populates. With indexing off
+  // (or the graph empty), these flags are harmless no-ops that
+  // return nothing -- never an error.
+
+  // ------------------------- always-retrieve gate -------------------------
+  //
+  // Backend-side behaviour switch, declared here so the settings object
+  // round-trips losslessly and a future settings toggle can bind to it.
+  //
+  // `true` (backend default) means EVERY non-empty chat turn searches
+  // the user's memories, in both chat and agent modes, instead of only
+  // when the query happens to look like an explicit recall request.
+  //
+  // Why it defaults to on: `classify_route`'s patterns are
+  // English-centric, so a normal question -- and ANY question in
+  // another language -- classified as NO_NEED and the model received
+  // no memory at all, even though the search itself worked.
+  //
+  // Scope is unaffected: `user:<id>` is always searched, plus
+  // project/chat when known. This changes WHEN retrieval runs, never
+  // WHAT is visible.
+  always_retrieve: boolean;
+
+  /** Knowledge-graph source in hybrid search. Default: `false`. */
+  graph_search_enabled: boolean;
+
+  /**
+   * Traversal hops from a resolved entity [0, 3]. Default: `2`.
+   *
+   * `0` = only memories linked DIRECTLY to the query entity
+   * (score 1.0). `1` adds its direct neighbours (0.5).
+   * `2` adds two-hop discoveries (0.33) -- the "manager ->
+   * company -> statements" case Phase 6 exists for.
+   *
+   * NOTE the lower bound is 0, not 1: the backend accepts 0 and
+   * the UI must not hide a legal configuration.
+   */
+  graph_search_max_depth: number;
+
+  /** Edges expanded per entity during traversal [1, 100]. Default: `20`. */
+  graph_search_max_relations: number;
+
+  /** Known entities a query must resolve to trigger graph [1, 5]. Default: `1`. */
+  graph_search_min_query_entities: number;
+
+  /** Memories hydrated per entity during graph search [1, 100]. Default: `20`. */
+  graph_search_memories_per_entity: number;
+
+  // ------------------------- Phase 6: agentic RAG -------------------------
+  //
+  // Agentic retrieval answers a QUESTION rather than listing
+  // memories: it decomposes the query, searches several hops, and
+  // synthesizes a cited answer. It costs several LLM calls, so it
+  // is reachable ONLY through `POST /api/memory/search/agentic` --
+  // never through the per-turn `retrieve` path.
+  //
+  // PREREQUISITE the UI must surface: `ai.enabled` plus a
+  // resolvable model in `ai.agentic` (falls back to
+  // `ai.extraction`, then to the first model marked as a memory
+  // model). With no model, every agentic call returns the
+  // standard retrieval result with `error: "disabled"`.
+
+  /** Opt-in agentic multi-hop retrieval. Default: `false`. */
+  agentic_enabled: boolean;
+
+  /** Retrieval rounds per agentic run [1, 5]. Default: `3`. */
+  agentic_max_hops: number;
+
+  /** Run-wide wall-clock ceiling [5.0, 120.0] seconds. Default: `30.0`. */
+  agentic_timeout_seconds: number;
+
+  /**
+   * Confidence at or above which an answer is reported as
+   * confident [0, 1]. Default: `0.6`.
+   *
+   * This does NOT discard low-confidence answers -- it LABELS
+   * them (`confidence_threshold_met`), so the caller can decide
+   * whether to surface the raw evidence instead.
+   */
+  agentic_confidence_threshold: number;
 }
 
 /**
@@ -358,6 +453,22 @@ export const DEFAULT_MEMORY_RETRIEVAL_SETTINGS: MemoryRetrievalSettings = {
   rerank_max_candidates: 20,
   rerank_timeout_seconds: 3.0,
   rerank_batch_size: 20,
+  // Phase 6 knowledge-graph + agentic defaults -- mirror the
+  // backend's Pydantic Field(...) defaults so a fresh settings
+  // form renders identically on both sides and the dirty-check
+  // reports "no changes" before the first edit.
+  graph_search_enabled: false,
+  // Backend default is True (see the interface note). Mirrored here so
+  // a fresh form renders the same value the server would produce.
+  always_retrieve: true,
+  graph_search_max_depth: 2,
+  graph_search_max_relations: 20,
+  graph_search_min_query_entities: 1,
+  graph_search_memories_per_entity: 20,
+  agentic_enabled: false,
+  agentic_max_hops: 3,
+  agentic_timeout_seconds: 30.0,
+  agentic_confidence_threshold: 0.6,
 };
 
 // ---------------------------------------------------------------------------
@@ -636,6 +747,17 @@ export const MemoryRetrievalBounds = {
   rerank_max_candidates: { min: 1, max: 100 },
   rerank_timeout_seconds: { min: 1.0, max: 30.0 },
   rerank_batch_size: { min: 1, max: 20 },
+  // Phase 6 bounds -- must match the backend's Pydantic
+  // `Field(ge=..., le=...)` declarations exactly. Note
+  // `graph_search_max_depth` starts at 0 (direct links only);
+  // clamping it to 1 would hide a legal, useful configuration.
+  graph_search_max_depth: { min: 0, max: 3 },
+  graph_search_max_relations: { min: 1, max: 100 },
+  graph_search_min_query_entities: { min: 1, max: 5 },
+  graph_search_memories_per_entity: { min: 1, max: 100 },
+  agentic_max_hops: { min: 1, max: 5 },
+  agentic_timeout_seconds: { min: 5.0, max: 120.0 },
+  agentic_confidence_threshold: { min: 0.0, max: 1.0 },
 } as const;
 
 // ---------------------------------------------------------------------------

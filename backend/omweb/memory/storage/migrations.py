@@ -95,7 +95,7 @@ logger = logging.getLogger("omweb.memory.storage.migrations")
 # ---------------------------------------------------------------------------
 
 
-CURRENT_VERSION: int = 4
+CURRENT_VERSION: int = 6
 """Highest schema version this module knows how to produce.
 
 Bump only when adding a new migration. Every bump must be paired
@@ -763,6 +763,192 @@ def _apply_v4(conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Migration v5 -- reserved number (Phase 5 required no DDL)
+# ---------------------------------------------------------------------------
+
+
+def _apply_v5(conn: sqlite3.Connection) -> None:
+    """Reserved migration number: Phase 5 shipped no schema change.
+
+    Phase 5 added the LLM reranker
+    (``peldrun.memory.retrieval.reranker``) and its tuning fields on
+    ``MemoryRetrievalSettings`` (``rerank_enabled``,
+    ``rerank_max_candidates``, ``rerank_timeout_seconds``,
+    ``rerank_batch_size``). All of it is pure configuration -- no
+    table, column, or index was ever required, so the schema stayed
+    at v4.
+
+    Why register a placeholder at all
+    ---------------------------------
+    ``apply_schema`` SKIPS every migration whose ``target_version``
+    is ``<=`` the recorded version (``if current_version >=
+    target_version: continue``). A database that jumped from v4
+    straight to a registered v6 would therefore never run a v5
+    added later -- it would be shadowed forever, with no
+    diagnostic and no error.
+
+    Recording v5 here keeps the number sequence contiguous and
+    makes the "Phase 5 added no DDL" fact explicit in the migration
+    history instead of leaving an invisible gap. If Phase 5's
+    consolidation subsystem later needs tables, it takes the NEXT
+    free number (v7), not v5.
+
+    Idempotency
+    -----------
+    The body performs no DDL and no DML. Its only effect is
+    ``_record_version(conn, 5)`` in the caller, which is itself an
+    ``INSERT OR IGNORE``. Re-running is exactly a no-op.
+    """
+    return
+
+
+# ---------------------------------------------------------------------------
+# DDL -- v6 (Phase 6: knowledge graph entities + relations + memory links)
+# ---------------------------------------------------------------------------
+#
+# v6 introduces the knowledge-graph foundation that Agentic RAG
+# (sub-phases 6B-6D) reads from. Three tables:
+#
+#   * ``graph_entities`` -- one row per canonical entity. The
+#     ``canonical_name`` column is the dedupe key: "Ahmed", "ahmed",
+#     and " Ahmed " all collapse to "ahmed", so the same person is
+#     ONE node rather than three. ``aliases_json`` holds the
+#     alternate surface forms the extractor observed for that node.
+#
+#   * ``graph_relations`` -- directed, typed edges between entities
+#     (``works_at``, ``manages``, ``related_to``, ...). A relation
+#     is idempotent on ``(source, target, type)``; the UNIQUE index
+#     below enforces that at the storage layer, so re-indexing the
+#     same memory cannot multiply edges even when a caller supplies
+#     a fresh ``relation_id`` each time.
+#
+#   * ``memory_entity_links`` -- many-to-many between a memory and
+#     the entities it mentions. ``weight`` lets a future pass rank
+#     a central mention above a passing one.
+#
+# Foreign-key policy -- why ``memory_entity_links`` has NO FK to
+# ``memories``, and ``graph_relations.source_memory_id`` has none
+# either:
+#
+#   ``memories`` rows can be PHYSICALLY deleted by the purge path
+#   (``purge`` / ``bulk_purge``). A hard FK would either block that
+#   purge or force a cascading delete that destroys graph
+#   provenance the operator may still want. ``memory_embeddings``
+#   (v4) made the same choice for the same reason: the link table
+#   is an INDEX over memories, not an owner of them. A dangling
+#   link is harmless -- the JOIN simply returns no row -- and the
+#   periodic graph backfill reconciles it.
+#
+#   Entity-to-entity FKs ARE declared, because entities are only
+#   ever created and deleted by the graph subsystem itself: a
+#   relation whose endpoint does not exist is meaningless, so the
+#   FK is the correct integrity constraint there.
+#
+# Every statement below uses ``CREATE ... IF NOT EXISTS``. There is
+# no ALTER TABLE, so no ``_column_exists`` probe is needed: a crash
+# between the DDL and ``_record_version(conn, 6)`` re-runs the whole
+# function with every object skipped.
+
+_V6_GRAPH_ENTITIES_DDL: str = """
+CREATE TABLE IF NOT EXISTS graph_entities (
+    entity_id       TEXT PRIMARY KEY,
+    entity_type     TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    canonical_name  TEXT NOT NULL,
+    aliases_json    TEXT NOT NULL DEFAULT '[]',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+"""
+
+_V6_GRAPH_ENTITIES_INDEXES_DDL: str = """
+CREATE INDEX IF NOT EXISTS idx_entities_canonical
+    ON graph_entities(canonical_name, entity_type);
+
+CREATE INDEX IF NOT EXISTS idx_entities_type_updated
+    ON graph_entities(entity_type, updated_at DESC);
+"""
+
+_V6_GRAPH_RELATIONS_DDL: str = """
+CREATE TABLE IF NOT EXISTS graph_relations (
+    relation_id         TEXT PRIMARY KEY,
+    source_entity_id    TEXT NOT NULL,
+    target_entity_id    TEXT NOT NULL,
+    relation_type       TEXT NOT NULL,
+    source_memory_id    TEXT,
+    confidence          REAL NOT NULL DEFAULT 0.8,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY(source_entity_id)
+        REFERENCES graph_entities(entity_id),
+    FOREIGN KEY(target_entity_id)
+        REFERENCES graph_entities(entity_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique
+    ON graph_relations(
+        source_entity_id, target_entity_id, relation_type
+    );
+
+CREATE INDEX IF NOT EXISTS idx_relations_source
+    ON graph_relations(source_entity_id, relation_type);
+
+CREATE INDEX IF NOT EXISTS idx_relations_target
+    ON graph_relations(target_entity_id, relation_type);
+"""
+
+_V6_MEMORY_ENTITY_LINKS_DDL: str = """
+CREATE TABLE IF NOT EXISTS memory_entity_links (
+    memory_id   TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    weight      REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (memory_id, entity_id),
+    FOREIGN KEY(entity_id)
+        REFERENCES graph_entities(entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_entity_links_entity
+    ON memory_entity_links(entity_id);
+
+CREATE INDEX IF NOT EXISTS idx_memory_entity_links_memory
+    ON memory_entity_links(memory_id);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Migration v6 -- full function body
+# ---------------------------------------------------------------------------
+
+
+def _apply_v6(conn: sqlite3.Connection) -> None:
+    """Apply the Phase 6 schema: knowledge graph.
+
+    Layout
+    ------
+      1. ``graph_entities`` + ``idx_entities_canonical`` (the
+         name lookup every ``find_entity`` call performs) and
+         ``idx_entities_type_updated`` (diagnostics: "what was
+         indexed recently, by type").
+      2. ``graph_relations`` + three indexes: the uniqueness
+         constraint on ``(source, target, type)``, the forward
+         traversal index used by ``traverse``, and the reverse
+         index used by "who points at this entity" queries.
+      3. ``memory_entity_links`` + one index per access direction
+         (entity -> memories, and memory -> entities).
+
+    Idempotency
+    -----------
+    Every statement uses ``CREATE ... IF NOT EXISTS``. No ALTER
+    TABLE, so no ``_column_exists`` guard is needed. A crash
+    between the DDL and ``_record_version(conn, 6)`` re-runs the
+    whole function with every object skipped (already exists).
+    """
+    conn.executescript(_V6_GRAPH_ENTITIES_DDL)
+    conn.executescript(_V6_GRAPH_ENTITIES_INDEXES_DDL)
+    conn.executescript(_V6_GRAPH_RELATIONS_DDL)
+    conn.executescript(_V6_MEMORY_ENTITY_LINKS_DDL)
+
+
+# ---------------------------------------------------------------------------
 # Migration registry
 # ---------------------------------------------------------------------------
 #
@@ -780,6 +966,8 @@ _MIGRATIONS: List[Tuple[int, Any]] = [
     (2, _apply_v2),
     (3, _apply_v3),
     (4, _apply_v4),
+    (5, _apply_v5),
+    (6, _apply_v6),
 ]
 
 
@@ -1084,6 +1272,16 @@ def schema_status(conn: sqlite3.Connection) -> Dict[str, Any]:
         # only the pre-v4 keys are unaffected (dict access by key).
         "vec0_available": _vec0_available(conn),
         "embedding_count": _safe_count(conn, "memory_embeddings"),
+        # Phase 6 diagnostics -- additive fields. All three are 0 on
+        # a pre-v6 database (the tables do not exist yet, and
+        # ``_safe_count`` swallows the "no such table" error), so
+        # callers written against the earlier key set are
+        # unaffected.
+        "graph_entities_count": _safe_count(conn, "graph_entities"),
+        "graph_relations_count": _safe_count(conn, "graph_relations"),
+        "memory_entity_links_count": _safe_count(
+            conn, "memory_entity_links"
+        ),
     }
 
 

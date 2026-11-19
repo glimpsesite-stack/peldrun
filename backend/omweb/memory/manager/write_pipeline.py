@@ -82,6 +82,7 @@ Cross-reference
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
@@ -102,6 +103,116 @@ from peldrun.memory.services import (
 
 
 logger = logging.getLogger("omweb.memory.manager.write_pipeline")
+
+
+# ---------------------------------------------------------------------------
+# Background graph indexing (Phase 6)
+# ---------------------------------------------------------------------------
+#
+# Knowledge-graph indexing is dispatched as a FIRE-AND-FORGET task after
+# a successful write. It must never extend the write latency: the write
+# is already durable, and a graph index is a derived artifact that can be
+# rebuilt.
+#
+# Why a MODULE-LEVEL task registry (and not an instance attribute)
+# ---------------------------------------------------------------
+# ``MemoryService`` builds a FRESH ``MemoryWritePipeline`` per job (see
+# ``_write_pipeline_provider``), so an instance attribute would be
+# discarded moments after the write -- and a task with no strong
+# reference can be garbage-collected mid-flight by CPython's cyclic GC,
+# silently losing the index. ``asyncio`` only keeps WEAK references to
+# running tasks, so the registry below is what actually keeps them alive.
+#
+# The set is also the shutdown hook: ``drain_graph_tasks`` waits for
+# in-flight indexing so a clean ``aclose`` does not leave "Task was
+# destroyed but it is pending" warnings or half-written links.
+
+_GRAPH_TASKS: "set[asyncio.Task]" = set()
+
+
+def pending_graph_task_count() -> int:
+    """Return the number of in-flight background graph-index tasks.
+
+    Diagnostics and test hook. Returns to 0 once the tasks settle.
+    """
+    return len(_GRAPH_TASKS)
+
+
+async def drain_graph_tasks(timeout_seconds: float = 10.0) -> int:
+    """Wait for in-flight graph-index tasks to finish.
+
+    Called by ``MemoryService.aclose`` and by tests that need a
+    deterministic end state. A task that exceeds ``timeout_seconds``
+    is CANCELLED (not left running against a closing database).
+
+    Returns
+    -------
+    int
+        Number of tasks that were still pending when the drain
+        started (0 when there was nothing to wait for).
+    """
+    tasks = [task for task in _GRAPH_TASKS if not task.done()]
+    if not tasks:
+        return 0
+    done, pending = await asyncio.wait(
+        tasks, timeout=max(0.0, float(timeout_seconds))
+    )
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        logger.warning(
+            "drain_graph_tasks: cancelled %d task(s) that exceeded "
+            "the %.1fs drain budget.",
+            len(pending),
+            timeout_seconds,
+        )
+    return len(tasks)
+
+
+def _schedule_graph_indexing(
+    indexer: Any,
+    entry: Optional[MemoryEntry],
+) -> Optional["asyncio.Task"]:
+    """Dispatch ``indexer.index_memory(entry)`` in the background.
+
+    Returns the created task, or ``None`` when nothing was scheduled
+    (no indexer, no entry, or no running event loop).
+
+    Never raises. A scheduling failure must not fail a write that
+    already succeeded -- the graph would simply miss one memory, and
+    the periodic backfill repairs that.
+    """
+    if indexer is None or entry is None:
+        return None
+    memory_id = getattr(entry, "memory_id", None)
+    if not memory_id:
+        return None
+    try:
+        task = asyncio.create_task(
+            indexer.index_memory(entry),
+            name=f"memory-graph-index:{memory_id}",
+        )
+    except RuntimeError as exc:
+        # No running loop (a synchronous caller invoked the async
+        # pipeline through asyncio.run from another thread, or the
+        # loop is already closed during shutdown).
+        logger.warning(
+            "WritePipeline: could not schedule graph indexing for "
+            "%s (no running event loop: %s).", memory_id, exc,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 -- never fail the write
+        logger.warning(
+            "WritePipeline: could not schedule graph indexing for "
+            "%s (%s: %s).", memory_id, type(exc).__name__, exc,
+        )
+        return None
+
+    _GRAPH_TASKS.add(task)
+    task.add_done_callback(_GRAPH_TASKS.discard)
+    return task
+
 
 
 _DEFAULT_SCAN_LIMIT: int = 500
@@ -204,7 +315,36 @@ class MemoryWritePipeline:
         self,
         port: MemoryPort,
         settings: MemorySettings,
+        *,
+        graph_indexer: Optional[Any] = None,
     ) -> None:
+        """Construct the pipeline.
+
+        Parameters
+        ----------
+        port
+            The live ``MemoryPort`` (the provider).
+        settings
+            The current settings snapshot.
+        graph_indexer
+            Optional Phase 6 ``GraphIndexer``. When supplied, every
+            SUCCESSFUL write schedules a background
+            ``index_memory(entry)`` task -- never awaited, so write
+            latency is unchanged. ``None`` (the default, and the
+            behavior of every pre-Phase-6 caller) means graph
+            indexing is off and the write path is byte-for-byte
+            identical to Phase 5.
+
+            Typed as ``Any`` to keep this module decoupled from
+            ``omweb.memory.graph.indexer``; anything exposing an
+            async ``index_memory(entry)`` coroutine works.
+
+        Raises
+        ------
+        TypeError
+            When ``port`` is ``None`` or ``settings`` is not a
+            ``MemorySettings``.
+        """
         if port is None:
             raise TypeError("port must be a MemoryPort instance, got None")
         if not isinstance(settings, MemorySettings):
@@ -214,6 +354,9 @@ class MemoryWritePipeline:
             )
         self._port: MemoryPort = port
         self._settings: MemorySettings = settings
+        #: Phase 6: optional background graph indexer. ``None``
+        #: disables graph indexing for this pipeline instance.
+        self._graph_indexer: Optional[Any] = graph_indexer
 
     # ------------------------------------------------------------------
     # Single save
@@ -276,11 +419,15 @@ class MemoryWritePipeline:
                 error=f"decision_failed: {exc}",
             )
 
-        return await self._execute_decision(
+        outcome = await self._execute_decision(
             decision=decision,
             candidate=candidate,
             scope_ref=scope_ref,
         )
+        # Phase 6: derived graph artifact, scheduled in the
+        # background. ``save`` does not wait for it.
+        self._schedule_graph_indexing_for([outcome])
+        return outcome
 
     # ------------------------------------------------------------------
     # Batch save
@@ -364,6 +511,13 @@ class MemoryWritePipeline:
                         except ValueError:
                             pool.append(outcome.memory)
 
+        # Phase 6: schedule graph indexing for every write that
+        # actually changed the stored content. Dispatched AFTER the
+        # whole batch so a slow LLM cannot interleave with the
+        # write loop, and never awaited -- the writes are already
+        # durable.
+        self._schedule_graph_indexing_for(outcomes)
+
         logger.info(
             "WritePipeline.save_many: %d candidate(s) in scope %s "
             "-> create=%d, skip=%d, supersede=%d, reactivate=%d, "
@@ -377,6 +531,45 @@ class MemoryWritePipeline:
             sum(1 for o in outcomes if not o.succeeded),
         )
         return outcomes
+
+    # ------------------------------------------------------------------
+    # Internal: Phase 6 background graph indexing
+    # ------------------------------------------------------------------
+
+    def _schedule_graph_indexing_for(
+        self, outcomes: List["WriteOutcome"]
+    ) -> None:
+        """Schedule background indexing for successful writes.
+
+        Scheduling rules:
+
+          * ``SKIP`` is excluded -- the entry already existed with
+            identical content, so the graph already holds exactly
+            these entities. Re-indexing would burn an LLM call for a
+            no-op.
+          * ``SUPERSEDE`` and ``REACTIVATE`` ARE indexed -- their
+            ``memory`` is the NEW row, whose content may differ from
+            the row it replaced.
+          * ``CREATE`` is indexed.
+
+        Never raises: a scheduling problem is logged inside
+        ``_schedule_graph_indexing`` and the write still succeeds.
+        """
+        if self._graph_indexer is None:
+            return
+        for outcome in outcomes:
+            if not outcome.succeeded or outcome.memory is None:
+                continue
+            if outcome.action == WriteAction.SKIP:
+                continue
+            _schedule_graph_indexing(
+                self._graph_indexer, outcome.memory
+            )
+
+    @property
+    def graph_indexer(self) -> Optional[Any]:
+        """The configured background graph indexer, or ``None``."""
+        return self._graph_indexer
 
     # ------------------------------------------------------------------
     # Internal: enforcement

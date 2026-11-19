@@ -1,4 +1,4 @@
-﻿// Path: frontend/src/components/chat/composer.tsx
+// Path: frontend/src/components/chat/composer.tsx
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
@@ -22,7 +22,9 @@ import {
   GitFork,
   Globe,
   Sparkles,
+  Target,
 } from "lucide-react";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/ToastNotification";
 import { AgentSelector } from "./agent-selector";
@@ -43,6 +45,29 @@ import {
 import { SimilarMemoriesPanel } from "@/features/memory/components/SimilarMemoriesPanel";
 import { useMemoryMode } from "@/features/memory/hooks/useMemoryMode";
 import { SEARCH_MIN_QUERY_LENGTH } from "@/features/memory/lib/constants";
+// Phase 6: agentic retrieval, extracted into a reusable component.
+//
+// WHY IT MOVED OUT
+// ----------------
+// This was ~300 lines of state machine plus two local components. It
+// now lives in `AgenticMemorySearch.tsx` because the same control is
+// wanted on the memory browse page, in the entry editor, and in the
+// command palette -- and because keeping it here made every Phase 6
+// tweak a change to the busiest file in the app.
+//
+// The composer composes the pieces rather than the wrapper, because
+// its BUTTON belongs in the toolbar while its CARD sits above the
+// editor: two different DOM parents, so they cannot be one element.
+// Every other consumer uses the default export, which stacks them.
+//
+// Also note what is NOT imported any more: `useAgenticSearch`,
+// `useAgenticStatus`, and the answer-formatting helpers. The hook owns
+// the request lifecycle, so the composer cannot fire one by accident.
+import {
+  AgenticMemorySearchButton,
+  AgenticMemorySearchCard,
+  useAgenticMemorySearch,
+} from "@/features/memory/components/AgenticMemorySearch";
 
 export interface SubmissionAccepted {
   accepted: boolean;
@@ -246,6 +271,16 @@ async function uploadFileToWorkspace(
   return { name: uploaded.name || file.name, path: uploaded.path };
 }
 
+/**
+ * `localStorage` key that USED to persist the agentic-preview mode.
+ *
+ * Kept as a literal (not read, not written) so the cleanup below is
+ * explicit and greppable: an older build stored `"true"` here, and a
+ * user upgrading mid-session would otherwise keep a value that no
+ * code reads while still looking authoritative in devtools.
+ */
+const LEGACY_AGENTIC_MODE_KEY = "peldrun_agentic_mode";
+
 interface ComposerProps {
   onSend: (
     text: string,
@@ -313,6 +348,103 @@ export function Composer({
 
   // Web Search: temporary per-message toggle, chat mode only.
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+
+  // ── Agentic mode (Phase 6) ────────────────────────────────────
+  //
+  // WHAT THIS TOGGLE DOES
+  // ---------------------
+  // It changes the MEMORY PREVIEW above the editor, not the message
+  // send. Sending still goes to the agent engine, and the backend's
+  // per-turn retrieval stays on the fast `retrieve()` path -- an
+  // agentic run costs several LLM calls and seconds of latency, so
+  // it must never sit in front of every turn.
+  //
+  // So: with the toggle ON, the panel above the editor answers
+  // "what do my memories say about this?" instead of listing similar
+  // entries. The user's message is unaffected.
+  //
+  // PERSISTENCE
+  // -----------
+  // `localStorage`, hydrated in an effect (never during render) so
+  // server and client markup match on first paint. `useAppStorage`
+  // is not used because its key set is a closed union maintained in
+  // another module; adding a key there would spread this feature
+  // across files.
+  //
+  // AVAILABILITY
+  // ------------
+  // ------------------------------------------------------------------
+  // Agentic memory: an ON-DEMAND answer, not a mode
+  // ------------------------------------------------------------------
+  //
+  // History, because the two previous designs were both wrong:
+  //
+  //   1. FIRST: a persisted "mode" that replaced the similar-memories
+  //      panel while ON, plus a debounce that fired while typing. It
+  //      ran full multi-hop searches on half-typed sentences and cost
+  //      ~24 completions per message.
+  //   2. SECOND: the same mode, made explicit, but LATCHED. One press
+  //      turned it on forever, and the only way back was a dismiss
+  //      button drawn on the answer card -- which does not exist when
+  //      the card is not on screen. The result was that the live
+  //      similar-memories (semantic) search silently stopped working
+  //      for the rest of the session. That is the regression: the
+  //      user lost a feature they never asked to turn off.
+  //
+  // THE CORRECT MODEL
+  // -----------------
+  // There is no mode. Two independent things coexist:
+  //
+  //   * The similar-memories panel is ALWAYS on, while typing. It is
+  //     the semantic search: cheap, live, no LLM.
+  //
+  //   * The agentic button requests one synthesized answer for the
+  //     current draft. The answer appears ABOVE the panel; it never
+  //     replaces it. Pressing again searches again.
+  //
+  // Nothing is persisted and nothing latches, so a user who never
+  // presses the button gets exactly the behaviour that existed before
+  // Phase 6. That is the property that was lost and is restored here.
+  // Bumped on every send so the agentic answer cannot outlive the
+  // message it was about. Combined into `resetKey` below rather than
+  // handled with an extra effect: one declarative signal, one reset.
+  const [previewEpoch, setPreviewEpoch] = useState(0);
+
+  // One-time cleanup of the retired preference.
+  //
+  // The previous build persisted the agentic mode here. Nothing reads
+  // it now, but leaving a stale `"true"` behind means a future reader
+  // (or a debugging session) would believe a mode still exists.
+  useEffect(() => {
+    try {
+      window.localStorage.removeItem(LEGACY_AGENTIC_MODE_KEY);
+    } catch {
+      // Storage disabled: nothing to clean.
+    }
+  }, []);
+
+  const agentic = useAgenticMemorySearch({
+    query: text,
+    scope: { chatId: activeSessionId, userId: "default" },
+    // A different chat -- or a sent message -- means a different
+    // evidence scope, so a stale answer must not survive it.
+    resetKey: `${activeSessionId ?? "no-session"}:${previewEpoch}`,
+    // Probe only when memory is readable; an unauthenticated or
+    // read-disabled session must not hit the endpoint.
+    enabled: memoryCanRead,
+  });
+
+  // Whether an agentic answer is on screen. Drives the button's
+  // highlight only -- it never gates the panel.
+  const agenticShowing = agentic.running || agentic.result !== undefined;
+
+  // The backend turns agentic off at the operator level. In that case
+  // the control is HIDDEN, not merely disabled: there is nothing to
+  // discover, and a permanently dead button is noise. The distinction
+  // from Web Search's `disabled-not-hidden` is deliberate -- there the
+  // feature exists but lacks a model (a fixable, discoverable state);
+  // here an operator decision removed it.
+  const agenticHidden = agentic.status?.enabled === false;
 
   // Multi-Agent Delegation Toggle State
   const [delegationAllowed, setDelegationAllowed] = useAppStorage(
@@ -1056,6 +1188,11 @@ export function Composer({
       return;
     }
 
+    // The message is going out, so the agentic answer is no longer
+    // "about" anything on screen. Bumping the epoch resets the hook
+    // (result + in-flight record) without an extra effect.
+    setPreviewEpoch((epoch) => epoch + 1);
+
     // Partition attachments by kind:
     //   * Non-images are ALREADY on the workspace (uploaded at attach
     //     time by ``ingestFiles``). They travel as ``context_refs``
@@ -1406,25 +1543,71 @@ export function Composer({
           </div>
         )}
 
-        {/* ============ Similar memories (F8.2) ============
-            Fires a debounced `POST /api/memory/search` with the
-            composer's chat id AND the user id, so the backend
-            searches the union of user:default + chat:<id>
-            (contextual mode). Renders nothing when memory is
-            disabled (the `memoryCanRead` gate) or when the
-            draft is shorter than SEARCH_MIN_QUERY_LENGTH --
-            so the composer stays exactly the same size when
-            memory is off or when the draft is trivial. */}
+        {/* ============ Memory preview (F8.2 + Phase 6) ============
+            MUTUALLY EXCLUSIVE BY DESIGN, and the exclusivity is
+            DELIBERATE -- confirmed against the product requirement:
+
+              * default state     -> `SimilarMemoriesPanel` (F8.2: the
+                debounced `/search` that fuses FTS, vector, rerank and
+                graph).
+              * agentic answer    -> replaces the panel while it is on
+                screen, and the panel comes back the moment that
+                answer is dismissed.
+
+            WHY REPLACEMENT, NOT STACKING
+            -----------------------------
+            Stacking was tried and rejected: two lists of overlapping
+            memories above the editor push the editor down, and the
+            user has to read both to find out which one wins. Showing
+            exactly one at a time makes "which search am I looking at"
+            unambiguous.
+
+            WHY IT CANNOT GET STUCK (the earlier regression)
+            ------------------------------------------------
+            An earlier build LATCHED this on: one press turned it on
+            for the whole session, and the only off-switch was a
+            dismiss button drawn on the answer card -- which does not
+            exist when the card is not rendered. The semantic search
+            then stayed hidden with no way back.
+
+            The state is now DERIVED, not stored: "agentic is showing"
+            means "there is a live run or a result in hand". There is
+            no separate flag to latch and nothing is persisted, so:
+
+              dismiss (x)   -> hook.reset()  -> panel returns
+              send          -> previewEpoch  -> panel returns
+              switch chat   -> resetKey      -> panel returns
+
+            Every exit path clears the same state, so no sequence of
+            clicks can leave the panel hidden.
+
+            The card is a FROZEN result: it keeps showing the answer it
+            produced, prints the question it answered, and adds a
+            "draft changed" line when the text has moved on. It is not
+            re-run by typing -- the toolbar button is the only trigger.
+
+            The outer gate keeps the strip absent -- not merely empty
+            -- when memory is unreadable, when there is no session, or
+            when the draft is too short, so the composer height does
+            not jump between states. */}
         {memoryCanRead &&
           activeSessionId &&
           text.trim().length >= SEARCH_MIN_QUERY_LENGTH && (
             <div className="px-2.5 pt-2">
-              <SimilarMemoriesPanel
-                query={text}
-                chat_id={activeSessionId}
-                user_id="default"
-                limit={3}
-              />
+              {agenticShowing && !agenticHidden ? (
+                <AgenticMemorySearchCard
+                  {...agentic}
+                  query={text}
+                  onDismiss={agentic.reset}
+                />
+              ) : (
+                <SimilarMemoriesPanel
+                  query={text}
+                  chat_id={activeSessionId}
+                  user_id="default"
+                  limit={3}
+                />
+              )}
             </div>
           )}
 
@@ -1529,6 +1712,42 @@ export function Composer({
               </button>
             )}
 
+            {/* ============ Agentic memory search (Phase 6) ============
+                Sits beside Web Search because it is the same KIND of
+                control: a per-user affordance on the current message,
+                not a setting.
+
+                Rendered in BOTH exec modes -- memory preview runs in
+                Agent and Chat alike, unlike Web Search.
+
+                SEMANTICS: this is a REQUEST, not a mode.
+
+                  * It starts OFF and nothing is persisted.
+                  * Press once -> one synthesized answer appears above
+                    the editor. The similar-memories panel keeps
+                    running underneath, unaffected.
+                  * Press again -> searches again.
+                  * The card's dismiss control clears the answer.
+
+                It therefore never changes what the composer does with
+                a message, and never disables the live semantic search
+                for users who do not press it.
+
+                It is disabled -- not hidden -- while a run is live or
+                when no model is resolved: a missing control leaves the
+                feature undiscoverable and makes the toolbar width jump.
+                It IS hidden when the operator disabled agentic in
+                settings: an operator decision removed the feature, so
+                a permanently dead button is only noise. */}
+            {memoryCanRead && !agenticHidden && (
+              <AgenticMemorySearchButton
+                {...agentic}
+                mode="toggle"
+                pressed={agenticShowing}
+                hostDisabled={disabled || isRunning || isSubmitting}
+              />
+            )}
+
 
 
             {execMode === "agent" && (
@@ -1609,5 +1828,4 @@ export function Composer({
     </div>
   );
 }
-
 export default Composer;

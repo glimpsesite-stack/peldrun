@@ -1,4 +1,4 @@
-﻿# backend/omweb/main.py
+# backend/omweb/main.py
 """
 PELDRUN Web FastAPI Application Entrypoint.
 
@@ -86,6 +86,7 @@ from omweb.routers import (
 # Memory Platform -- CRUD router (mounted at /api/memory AFTER
 # memory_rtr.router; see the include comment below for ordering).
 from omweb.memory.api.memory_crud import router as memory_crud
+from omweb.memory.api import memory_agentic
 
 # Phase 4: periodic auto-batch scheduler.
 #
@@ -1031,6 +1032,17 @@ app.include_router(
     memory_rtr.router,
     prefix="/api/memory",
     tags=["memory"],
+)
+# Phase 6 agentic search. Registered BEFORE ``memory_crud`` so the
+# two-segment ``/search/agentic`` route is matched without ever
+# reaching the CRUD router's ``/{memory_id}`` catch-all. Separate
+# module and separate endpoint because an agentic run costs several
+# LLM calls -- it must not share a URL with the UI's cheap preview
+# search (see ``memory_agentic.py``'s module docstring).
+app.include_router(
+    memory_agentic.router,
+    prefix="/api/memory",
+    tags=["memory", "agentic"],
 )
 # NOTE: ``memory_crud`` (imported as ``from omweb.memory.api.memory_crud
 # import router as memory_crud``) IS the APIRouter instance -- the
