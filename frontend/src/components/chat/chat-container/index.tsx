@@ -28,6 +28,22 @@ const SourceControlWorkspacePanel = dynamic(
   { ssr: false }
 );
 
+// Lazy-load the Project workspace panel for the same reasons as the
+// Source Control panel: legacy chat routes (no `projectId`) never need
+// it, and it reads from browser storage via `useWorkspaceResolver`, so
+// it must not run during SSR (would cause a hydration mismatch).
+//
+// Only mounted when `projectId` is provided, in the exact same slot
+// the legacy `WorkspacePanel` occupies — zero UI difference beyond
+// the scoping.
+const ProjectWorkspacePanel = dynamic(
+  () =>
+    import("@/components/workspace/project-workspace-panel").then(
+      (m) => m.ProjectWorkspacePanel
+    ),
+  { ssr: false }
+);
+
 import { Composer } from "@/components/chat/composer";
 import { ChatSubHeader } from "@/components/chat/chat-sub-header";
 import { ChatLanding } from "@/components/chat/chat-landing";
@@ -43,6 +59,17 @@ import { useSessionStore } from "@/stores/session-store";
 import { useSourceControlStore } from "@/features/source-control/state/source-control-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities } from "@/lib/modelMetadata";
+// Used to resolve `initialChatId` → `job_id` on mount when the user
+// lands on `/projects/[projectId]/chat/[chatId]` directly (via sidebar,
+// bookmark, or browser refresh). The lookup is project-scoped when
+// `projectId` is present so we never scan the global chat list on
+// large deployments.
+//
+// `ChatSession` is imported alongside `fetchChats` so the resolution
+// callback can be typed explicitly, guaranteeing that future signature
+// changes to `fetchChats` surface as compile-time errors at this call
+// site rather than as silent `any` narrowing.
+import { fetchChats, type ChatSession } from "@/lib/chatsApi";
 
 import { getGenerativeUIPayload } from "@/components/generative-ui/store";
 
@@ -66,7 +93,11 @@ import { showToast } from "@/components/ui/ToastNotification";
 
 export type { ChatContainerProps };
 
-export function ChatContainer({ initialJobId }: ChatContainerProps) {
+export function ChatContainer({
+  initialJobId,
+  initialChatId,
+  projectId,
+}: ChatContainerProps) {
   const router = useRouter();
 
   // Three independent subscriptions. Only `selectedAgentId` can trigger a
@@ -482,12 +513,71 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     };
   }, [setShowRightPanel]);
 
+  // Hydration entry point for the chat container.
+  //
+  // Precedence:
+  //   1. `initialJobId` — legacy `/chat/[jobId]` route. Used as-is.
+  //   2. `initialChatId` — new `/projects/[projectId]/chat/[chatId]`
+  //      route. Resolved to its `job_id` via `GET /api/chats`, then
+  //      fed to `fetchJobDetails` for full hydration (history, steps,
+  //      tokens, artifacts).
+  //
+  // The `initialChatId` lookup is scoped to `projectId` when present
+  // so we never scan the global chat list on large deployments.
+  //
+  // If the chat is not found in the list, this is one of two cases:
+  //   a. The chat was just created client-side and has not yet been
+  //      persisted by the backend (user clicked "+ New Chat" in the
+  //      sidebar, then landed on this URL).
+  //   b. The chat was deleted concurrently from another tab.
+  //
+  // In both cases we set `activeChatId` to the requested id so that
+  // the next POST /api/run targets the correct chat session. The user
+  // sees a fresh session in case (a), and will be re-synced from the
+  // backend the next time they send a message in case (b).
   useEffect(() => {
     if (initialJobId) {
       setActiveJobId(initialJobId);
       fetchJobDetails(initialJobId);
+      return;
     }
-  }, [initialJobId, fetchJobDetails]);
+
+    if (!initialChatId) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const chats = await fetchChats(
+          projectId ? { projectId } : undefined
+        );
+        if (cancelled) return;
+
+        const match = chats.find(
+          (c: ChatSession) => c.id === initialChatId
+        );
+        if (match?.job_id) {
+          setActiveChatId(match.id);
+          setActiveJobId(match.job_id);
+          fetchJobDetails(match.job_id);
+        } else {
+          setActiveChatId(initialChatId);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        console.error(
+          "[ChatContainer] Failed to resolve initialChatId:",
+          err
+        );
+        // Preserve the chat id so subsequent dispatches target the
+        // correct session even when the lookup fails transiently.
+        setActiveChatId(initialChatId);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [initialJobId, initialChatId, projectId, fetchJobDetails]);
 
   // Listen for file-mention clicks dispatched from the composer. Opens the
   // referenced file in the workspace panel by selecting it and forcing the
@@ -570,10 +660,41 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
     setPendingApprovals({});
     setChatReasoningText("");
     setMcpAuthRequiredPayload(null);
-    router.push("/chat");
+    // Project-scoped "New Session" navigates to the dedicated new-chat
+    // route `/projects/{id}/chat/new` — NOT to the project root
+    // `/projects/{id}`.
+    //
+    // Why the new-chat route (rather than the project root):
+    //
+    //   * Project root renders the chat LIST page, requiring the user
+    //     to click "New Chat" again — one extra hop for a flow they
+    //     already initiated.
+    //
+    //   * `/projects/{id}/chat/new` renders `<ChatContainer
+    //     projectId={id} />` with no `initialChatId`. All state is
+    //     already reset by the setters above, so `isFreshSession` is
+    //     true and `ChatLanding` renders immediately with
+    //     `projectId` still attached. The first message the user
+    //     sends carries `project_id` in the `POST /api/run` body,
+    //     creating the new session under the correct project.
+    //
+    //   * No remount is triggered: `/projects/{id}/chat/[chatId]`
+    //     and `/projects/{id}/chat/new` both render the same
+    //     `ChatContainer` component, so React reconciles the props
+    //     (`initialChatId` goes from a string to `undefined`) without
+    //     tearing down and rebuilding the component tree. This means
+    //     `closeStream()` above is sufficient to stop the previous
+    //     SSE connection; the new session starts clean.
+    //
+    // Legacy chats (no project) keep the flat `/chat` target — they
+    // have no project segment to preserve.
+    router.push(
+      projectId ? `/projects/${projectId}/chat/new` : "/chat"
+    );
   }, [
     closeStream,
     router,
+    projectId,
     setProducedFiles,
     setElapsedSeconds,
     setShowRightPanel,
@@ -845,8 +966,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
           filesToUpload.forEach((f) => formData.append("files", f));
           formData.append("chat_id", targetChatId);
           if (activeJobId) formData.append("job_id", activeJobId);
+          if (projectId) formData.append("project_id", projectId);
 
-          const uploadRes = await fetch("/api/files/upload", {
+          // Project-scoped uploads land in the persistent project
+          // workspace; legacy chats keep using the global endpoint.
+          const uploadEndpoint = projectId
+            ? `/api/projects/${projectId}/workspace/upload`
+            : "/api/files/upload";
+
+          const uploadRes = await fetch(uploadEndpoint, {
             method: "POST",
             body: formData,
           });
@@ -1104,6 +1232,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                 ? getAgentMaxSteps(selectedAgentId)
                 : 1,
             chat_id: targetChatId,
+            project_id: projectId || undefined,
             agent_id: selectedAgentId || "peldrun",
             mode: effectiveMode,
             reasoning_effort: effectiveReasoningEffort,
@@ -1124,7 +1253,15 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
         const returnedChatId = data.chat_id || targetChatId;
         setActiveChatId(returnedChatId);
         if (typeof window !== "undefined") {
-          window.history.replaceState(null, "", `/chat/${returnedChatId}`);
+          // Keep the address bar in sync with the active session.
+          // Project-scoped routes preserve the project segment so a
+          // refresh lands back on the same two-column layout with
+          // the project workspace panel on the right; legacy chats
+          // keep the flat `/chat/{id}` shape they have always had.
+          const nextPath = projectId
+            ? `/projects/${projectId}/chat/${returnedChatId}`
+            : `/chat/${returnedChatId}`;
+          window.history.replaceState(null, "", nextPath);
         }
         setActiveJobId(jobId);
 
@@ -1187,6 +1324,10 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       connectStream,
       setProducedFiles,
       setElapsedSeconds,
+      // Required so file uploads are routed to the correct workspace
+      // (project-scoped vs. legacy chat-scoped) and so the run body
+      // carries the right `project_id`.
+      projectId,
       // Required so handleStartTask reads the LATEST reasoning text
       // when archiving the previous turn. Without it, the closure
       // captures "" from the initial state and every archived turn
@@ -1300,6 +1441,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                   ? getAgentMaxSteps(selectedAgentId)
                   : 1,
               chat_id: targetChatId,
+              project_id: projectId || undefined,
               agent_id: selectedAgentId || "peldrun",
               mode: effectiveMode,
               regenerate_turn_id: "latest",
@@ -1388,6 +1530,7 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
                   ? getAgentMaxSteps(selectedAgentId)
                   : 1,
               chat_id: targetChatId,
+              project_id: projectId || undefined,
               agent_id: selectedAgentId || "peldrun",
               mode: effectiveMode,
               regenerate_turn_id: targetTurnId,
@@ -1434,6 +1577,9 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
       // `runStartModelRef` at the start of each regeneration.
       activeProvider,
       activeModelName,
+      // Required so regeneration dispatches to the correct project
+      // workspace (memory scope, file routes, artifact targets).
+      projectId,
     ]
   );
 
@@ -1697,6 +1843,19 @@ export function ChatContainer({ initialJobId }: ChatContainerProps) {
               activeChatId={activeChatId || activeJobId}
               defaultMode={sourceControlDefaultMode}
               onClose={() => setShowRightPanel(false)}
+            />
+          ) : projectId ? (
+            // Project-scoped workspace panel. Same slot, same header
+            // controls, same override/overrideDraft semantics as the
+            // legacy WorkspacePanel — the only difference is the
+            // backing storage (persistent project workspace instead
+            // of the per-chat session directory).
+            <ProjectWorkspacePanel
+              projectId={projectId}
+              activeChatId={activeChatId || activeJobId}
+              activeJobId={activeJobId}
+              overrideFile={selectedFileForEditor}
+              overrideDraft={sandboxDraft}
             />
           ) : (
             <WorkspacePanel

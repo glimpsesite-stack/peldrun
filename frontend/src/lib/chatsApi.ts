@@ -54,7 +54,10 @@ export interface Project {
   id: string;
   name: string;
   description?: string;
+  workspace_path?: string;
+  workspace_type?: "internal" | "external";
   created_at: string;
+  updated_at?: string;
 }
 
 export interface ChatSession {

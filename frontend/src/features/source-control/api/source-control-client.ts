@@ -347,6 +347,25 @@ export const sourceControlClient = {
     );
   },
 
+    /**
+   * Resolves the source-control workspace bound to a specific project.
+   * Used by the Project Source Control panel to fetch repository metadata
+   * without relying on a specific chat session context.
+   */
+  async getWorkspaceByProject(projectId: string): Promise<WorkspaceResponse | null> {
+    try {
+      const res = await fetch(
+        `/api/source-control/workspace?project_id=${encodeURIComponent(projectId)}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (err) {
+      console.warn("[sourceControlClient] getWorkspaceByProject failed:", err);
+      return null;
+    }
+  },
+
   async ensureEditableBranch(workspaceId: string): Promise<{ branch_name: string }> {
     return request<{ branch_name: string }>(
       `/workspaces/${encodeURIComponent(workspaceId)}/ensure-editable-branch`,

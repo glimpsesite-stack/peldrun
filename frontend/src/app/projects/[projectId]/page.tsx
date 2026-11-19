@@ -1,395 +1,513 @@
-﻿// Path: frontend/src/app/projects/[projectId]/page.tsx
-"use client";
+﻿// frontend/src/app/projects/[projectId]/page.tsx
 
 /**
- * Project Workspace page.
+ * Project Dashboard Page
  *
- * Reads project metadata from `project-store` and sessions from
- * `session-store.projectSessionsCache`. No local fetch on mount —
- * the bootstrap provider loads projects, and
- * `loadProjectSessions(projectId)` fetches this project's sessions
- * exactly once (cached on subsequent visits).
+ * Main entry point for a specific project. Displays:
+ * - Project metadata (name, description, workspace info)
+ * - Quick statistics (sessions count, tasks count, last activity)
+ * - Project workspace panel (right side)
+ * - Navigation to sub-pages (chat, tasks, notebook, etc.)
  *
- * ## Design decisions
+ * Design:
+ * - Two-column layout: main content (left) + workspace panel (right)
+ * - Responsive: workspace panel collapses on mobile
+ * - Uses useProjectStore for project data
+ * - Integrates with ProjectWorkspacePanel for file operations
  *
- *   * **No N+1 file fetch.** The old version issued one
- *     `/api/run/jobs/{id}/files` call per session to build the
- *     "Deliverables" count — 31 requests for a 30-session project.
- *     Files are now loaded only when the user opens a session, by
- *     `ChatContainer` → `WorkspacePanel`. The project page shows
- *     session metadata only.
- *
- *   * **409 handling.** Both delete endpoints (`/api/chats/{id}` and
- *     `/api/chats/projects/{id}`) return 409 when an active run
- *     exists in the target. The handlers surface a clear toast
- *     instead of silently failing.
- *
- *   * **No custom events.** The old version relied on
- *     `omweb:chats-updated` to nudge the sidebar. After Phase F.4
- *     that event is no longer listened to. Store mutations replace
- *     it entirely.
- *
- *   * **Cache invalidation on create.** After `POST /api/run` creates
- *     a chat under this project, the project's session cache is
- *     invalidated so the next visit reflects the new chat.
+ * This page is wrapped by the projects layout.tsx which provides
+ * the sidebar navigation.
  */
 
-import React, { useState, useEffect } from "react";
-import Link from "next/link";
+"use client";
+
+import React, { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
-  Folder,
-  MessageSquare,
-  Send,
-  Trash2,
   Calendar,
-  Download,
+  MessageSquare,
+  CheckSquare,
+  Folder,
+  Settings,
+  GitBranch,
+  FileText,
+  Loader2,
   ArrowLeft,
-  Clock,
-  CheckCircle2,
-  AlertCircle,
-  FileCode,
-  Sparkles,
-  ExternalLink,
+  Edit,
+  Trash2,
+  PanelRightClose,
+  PanelRightOpen,
+  FolderTree,
 } from "lucide-react";
+import { ProjectSourceControlPanel } from "@/features/source-control/components/project-source-control-panel";
+
 import { Button } from "@/components/ui/button";
 import { useProjectStore } from "@/stores/project-store";
-import { useSessionStore } from "@/stores/session-store";
-import { showToast } from "@/components/ui/ToastNotification";
+import { ProjectWorkspacePanel } from "@/components/workspace/project-workspace-panel";
+import { Project, WorkspaceType } from "@/features/workspace/types";
 
-export default function ProjectWorkspacePage() {
+export default function ProjectDashboardPage() {
   const params = useParams();
   const router = useRouter();
-  const projectId = params?.projectId as string;
+  const projectId = params.projectId as string;
 
-  // Store subscriptions.
-  const project = useProjectStore((s) =>
-    projectId ? s.projectsById[projectId] : undefined,
-  );
-  const projectSessions = useSessionStore((s) =>
-    projectId ? s.projectSessionsCache[projectId] : undefined,
-  );
-  const isLoading = useSessionStore(
-    (s) => projectId ? s.projectSessionsLoading[projectId] === true : false,
-  );
-  const loadProjectSessions = useSessionStore((s) => s.loadProjectSessions);
+  const { getProject, loadProjects } = useProjectStore();
 
-  // Local UI state.
-  const [promptInput, setPromptInput] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  // Helper to safely map store project to full Project type.
+  //
+  // Moved ABOVE the state initialiser so it can be used synchronously
+  // during the first render. Arrow-function constants are NOT hoisted,
+  // so a definition placed below `useState` would be `undefined` at
+  // the moment the initialiser runs.
+  const mapToFullProject = (storedProject: any): Project => ({
+    ...storedProject,
+    workspace_path: storedProject.workspace_path || "",
+    workspace_type: (storedProject.workspace_type as WorkspaceType) || "internal",
+    updated_at: storedProject.updated_at || storedProject.created_at,
+  });
 
-  const chats = projectSessions ?? [];
+  // ── F5 / hard-reload fix ──────────────────────────────────────
+  //
+  // Initialise `project` SYNCHRONOUSLY from the store on the very
+  // first render. This is critical for the hard-reload case:
+  //
+  //   * Client-side navigation: the store is already populated by
+  //     the sidebar's initial load, so the first render can
+  //     immediately show the project data.
+  //
+  //   * Hard reload (F5): the store starts empty, BUT the wrapping
+  //     `ProjectLayoutClient` fetches the project BEFORE it renders
+  //     its children — so by the time this component mounts, the
+  //     project is already in the store. Reading it here avoids a
+  //     one-frame flash of "Project Not Found".
+  //
+  // `hasResolved` distinguishes "we haven't checked yet" from "we
+  // checked, and the project genuinely does not exist". Without it,
+  // the previous check `!isLoading && !project` would spuriously
+  // render "Not Found" during the brief window between mount and
+  // the fetch effect resolving.
+  const [project, setProject] = useState<Project | null>(() => {
+    if (typeof window === "undefined") return null;
+    const stored = useProjectStore.getState().getProject(projectId);
+    return stored ? mapToFullProject(stored) : null;
+  });
+  const [hasResolved, setHasResolved] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return useProjectStore.getState().getProject(projectId) != null;
+  });
+  const [isEditing, setIsEditing] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [rightPanel, setRightPanel] = useState<"workspace" | "source-control" | null>("workspace");
 
-  // Load project sessions on mount / project switch. The store method
-  // is idempotent — cached data is returned without a network call on
-  // re-visits.
+  // Load project data only when we don't already have it.
+  //
+  // Because `ProjectLayoutClient` fetches the project before rendering
+  // its children, `hasResolved` is usually `true` on mount (F5 case)
+  // or immediately on first paint (client-nav case). This effect then
+  // becomes a no-op, which:
+  //
+  //   * Avoids a redundant network round-trip.
+  //   * Eliminates the double-fetch race that previously caused the
+  //     "Project Not Found" UI to stick on hard reloads.
+  //
+  // The `cancelled` flag guards against setting state after the
+  // component unmounts (e.g., user navigates away mid-fetch).
   useEffect(() => {
-    if (projectId) {
-      void loadProjectSessions(projectId);
-    }
-  }, [projectId, loadProjectSessions]);
+    if (!projectId || hasResolved) return;
 
-  const handleStartProjectChat = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const text = promptInput.trim();
-    if (!text || isSubmitting) return;
-    setIsSubmitting(true);
-    try {
-      const res = await fetch("/api/run", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: text,
-          project_id: projectId,
-          max_steps: 30,
-        }),
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || `HTTP ${res.status}`);
+    let cancelled = false;
+    (async () => {
+      try {
+        await loadProjects(true);
+      } catch (error) {
+        console.error(
+          "[ProjectDashboard] Failed to load projects:",
+          error
+        );
       }
-      const data = await res.json();
-      setPromptInput("");
+      if (cancelled) return;
 
-      // Invalidate this project's cached session list so the next
-      // visit shows the newly created chat.
-      useSessionStore.getState().invalidateProjectSessions(projectId);
-
-      if (data.job_id) {
-        router.push(`/chat/${data.job_id}`);
-      } else if (data.chat_id) {
-        router.push(`/chat/${data.chat_id}`);
-      }
-    } catch (err: any) {
-      showToast.error(
-        "Dispatch Failed",
-        err?.message || "Could not create project task.",
+      const currentProject = getProject(projectId);
+      setProject(
+        currentProject ? mapToFullProject(currentProject) : null
       );
-    } finally {
-      setIsSubmitting(false);
-    }
+      setHasResolved(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, getProject, loadProjects, hasResolved]);
+
+  // Wait for initial resolution before deciding between "Not Found"
+  // and "Loaded". This is the core F5 fix: without `hasResolved`, the
+  // component rendered "Not Found" during the brief window between
+  // mount and the fetch effect resolving.
+  //
+  // Two distinct states are handled here:
+  //   1. `!hasResolved && !project` — we haven't checked yet (show
+  //      loading, not "Not Found").
+  //   2. `!project` (with `hasResolved === true` implied) — resolution
+  //      completed and the project genuinely does not exist.
+  if (!hasResolved && !project) {
+    return (
+      <div className="flex h-screen">
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 size={32} className="animate-spin text-primary" />
+        </div>
+      </div>
+    );
+  }
+
+  // Resolution complete, project not found.
+  if (!project) {
+    return (
+      <div className="container mx-auto px-4 py-16 max-w-2xl">
+        <div className="bg-card border border-border rounded-lg p-8 text-center">
+          <Folder size={48} className="mx-auto text-muted-foreground mb-4" />
+          <h2 className="text-xl font-semibold mb-2">Project Not Found</h2>
+          <p className="text-muted-foreground mb-6">
+            The project you're looking for doesn't exist or has been deleted.
+          </p>
+          <Button onClick={() => router.push("/projects")}>
+            <ArrowLeft size={16} className="mr-2" />
+            Back to Projects
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const handleEdit = () => {
+    setEditName(project.name);
+    setEditDescription(project.description || "");
+    setIsEditing(true);
   };
 
-  const handleDeleteChat = async (
-    e: React.MouseEvent,
-    chatId: string,
-    jobId: string,
-  ) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!confirm("Delete this session from this project?")) return;
-
-    try {
-      const res = await fetch(
-        `/api/chats/${encodeURIComponent(chatId)}`,
-        { method: "DELETE" },
-      );
-
-      if (!res.ok) {
-        if (res.status === 409) {
-          const body = await res.json().catch(() => ({}));
-          showToast.error(
-            "Cannot Delete",
-            body.detail || "A run is still active in this session.",
-          );
-          return;
-        }
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      // removeSession clears both the sidebar entry and any project
-      // cache entry for this chat.
-      useSessionStore.getState().removeSession(chatId);
-      showToast.success("Session Deleted", `Session removed from project.`);
-    } catch (err: any) {
-      showToast.error(
-        "Delete Failed",
-        err?.message || "Could not delete session.",
-      );
-    }
+  const handleSave = async () => {
+    // TODO: Implement project update API
+    console.log("Save project:", { name: editName, description: editDescription });
+    setIsEditing(false);
   };
 
-  const handleDeleteProject = async () => {
-    if (!confirm("Are you sure you want to delete this entire project workspace?"))
+  const handleDelete = async () => {
+    if (!confirm(`Are you sure you want to delete "${project.name}"? This action cannot be undone.`)) {
       return;
+    }
 
     try {
-      const res = await fetch(
-        `/api/chats/projects/${encodeURIComponent(projectId)}`,
-        { method: "DELETE" },
-      );
-
-      if (!res.ok) {
-        if (res.status === 409) {
-          const body = await res.json().catch(() => ({}));
-          showToast.error(
-            "Cannot Delete",
-            body.detail || "A run is still active in this project.",
-          );
-          return;
-        }
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      // Remove all sessions in this project from the store first,
-      // then the project itself.
-      const sessionStore = useSessionStore.getState();
-      for (const chat of chats) {
-        sessionStore.removeSession(chat.id);
-      }
-      useProjectStore.getState().removeProject(projectId);
-
-      showToast.success("Project Deleted", "Workspace removed.");
+      // TODO: Implement project delete API
+      console.log("Delete project:", projectId);
       router.push("/projects");
-    } catch (err: any) {
-      showToast.error(
-        "Delete Failed",
-        err?.message || "Could not delete project.",
-      );
+    } catch (error) {
+      console.error("Failed to delete project:", error);
+      alert("Failed to delete project. Please try again.");
     }
+  };
+
+  const formatDate = (dateString: string) => {
+    const date = new Date(dateString);
+    return date.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
   };
 
   return (
-    <div className="flex flex-col flex-1 h-full w-full bg-background text-foreground overflow-hidden font-sans">
-      <div className="h-14 flex items-center justify-between px-8 border-b border-border bg-card/40 backdrop-blur-sm shrink-0">
-        <div className="flex items-center gap-3">
-          <Link
-            href="/projects"
-            className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition cursor-pointer"
-            title="Back to all projects"
-          >
-            <ArrowLeft size={16} />
-          </Link>
-          <Folder className="h-4 w-4 text-peldrun-accent" />
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="font-heading font-semibold text-sm text-foreground">
-                {project?.name || "Project Workspace"}
-              </h1>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-primary/15 text-primary border border-primary/30">
-                {projectId}
-              </span>
-            </div>
-          </div>
-        </div>
-        <div className="flex items-center gap-3">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleDeleteProject}
-            className="flex items-center gap-1.5 h-8 px-3 rounded-md border-peldrun-error/30 text-peldrun-error hover:bg-peldrun-error/10 text-xs transition cursor-pointer shadow-peldrun-xs"
-          >
-            <Trash2 size={13} />
-            <span>Delete Workspace</span>
-          </Button>
-        </div>
-      </div>
-
-      <div className="flex-1 p-8 overflow-y-auto space-y-6 bg-background">
-        <div className="p-5 rounded-2xl border border-border bg-card space-y-3 shadow-peldrun-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] font-semibold text-peldrun-success uppercase tracking-wider flex items-center gap-1.5">
-              <Sparkles size={12} />
-              Project Objective &amp; Context
-            </span>
-            <div className="flex items-center gap-3 text-xs font-mono">
-              <span className="px-2.5 py-1 rounded-md bg-background border border-border text-foreground flex items-center gap-1.5 shadow-peldrun-xs">
-                <MessageSquare size={12} className="text-peldrun-success" />
-                <span>{chats.length} Sessions</span>
-              </span>
-            </div>
-          </div>
-          <p className="text-xs text-muted-foreground leading-relaxed max-w-3xl font-sans">
-            {project?.description ||
-              "All chats, files, and deliverables generated in this workspace are strictly scoped and stored under this project."}
-          </p>
-          <div className="flex items-center gap-4 pt-1 text-[11px] text-muted-foreground font-mono">
-            <span className="flex items-center gap-1">
-              <Calendar size={11} /> Created: {project?.created_at || "Recent"}
-            </span>
-          </div>
-        </div>
-
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-              <MessageSquare size={13} className="text-peldrun-success" />
-              <span>Project Sessions ({chats.length})</span>
-            </h2>
-          </div>
-
-          {isLoading && chats.length === 0 ? (
-            <div className="flex items-center justify-center h-48 text-muted-foreground text-xs animate-pulse font-mono">
-              Loading project workspace sessions...
-            </div>
-          ) : chats.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-52 text-center text-muted-foreground space-y-2 border border-dashed border-border rounded-2xl bg-card/40">
-              <FileCode size={34} className="text-muted-foreground" />
-              <p className="text-xs font-medium text-foreground">
-                No chat sessions recorded inside this project yet.
-              </p>
-              <p className="text-[11px] text-muted-foreground">
-                Use the input composer below to dispatch your first task
-                under this workspace.
-              </p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {chats.map((chat) => {
-                const targetJob = chat.job_id || chat.id;
-                return (
-                  <div
-                    key={chat.id}
-                    className="flex flex-col justify-between p-4 rounded-sm border border-border bg-card hover:border-primary/40 transition-all group shadow-peldrun-xs"
-                  >
-                    <div>
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-[10px] text-muted-foreground font-mono font-semibold">
-                          {targetJob}
-                        </span>
-                        <span
-                          className={`px-2 py-0.5 rounded-md text-[10px] font-mono font-medium flex items-center gap-1 ${
-                            chat.status === "completed"
-                              ? "bg-peldrun-success/15 text-peldrun-success border border-peldrun-success/30"
-                              : chat.status === "running"
-                              ? "bg-peldrun-warning/15 text-peldrun-warning border border-peldrun-warning/30 animate-pulse"
-                              : chat.status === "cancelled"
-                              ? "bg-slate-500/15 text-slate-500 border border-slate-500/30"
-                              : chat.status === "interrupted"
-                              ? "bg-orange-500/15 text-orange-500 border border-orange-500/30"
-                              : "bg-peldrun-error/15 text-peldrun-error border border-peldrun-error/30"
-                          }`}
-                        >
-                          {chat.status === "completed" && <CheckCircle2 size={10} />}
-                          {chat.status === "running" && <Clock size={10} />}
-                          {chat.status === "failed" && <AlertCircle size={10} />}
-                          <span>{chat.status}</span>
-                        </span>
-                      </div>
-
-                      <h3 className="text-xs font-semibold text-foreground line-clamp-2 mb-2 leading-relaxed font-sans group-hover:text-primary transition">
-                        {chat.title || chat.prompt || "New Session"}
-                      </h3>
-                    </div>
-
-                    <div className="flex items-center justify-between pt-3 border-t border-border/60 mt-auto text-xs">
-                      <Link
-                        href={`/chat/${targetJob}`}
-                        className="text-primary hover:underline font-medium flex items-center gap-1"
-                      >
-                        <span>Open Session</span>
-                        <ExternalLink size={11} />
-                      </Link>
-
-                      <div className="flex items-center gap-1.5">
-                        <a
-                          href={`/api/run/jobs/${targetJob}/download-zip`}
-                          title="Download ZIP"
-                          className="p-1.5 rounded-md bg-muted hover:bg-muted/80 text-foreground border border-border text-[11px] transition shadow-peldrun-xs"
-                        >
-                          <Download size={12} />
-                        </a>
-                        <button
-                          type="button"
-                          onClick={(e) => handleDeleteChat(e, chat.id, chat.job_id)}
-                          title="Delete session"
-                          className="p-1.5 rounded-md bg-white-foreground hover:bg-peldrun-error/20 text-muted-foreground hover:text-peldrun-error border border-border transition cursor-pointer"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      </div>
-                    </div>
+    <div className="flex h-screen">
+      {/* Main Content Area */}
+      <div className="flex-1 flex flex-col overflow-auto">
+        {/* Header */}
+        <div className="border-b border-border bg-card p-6">
+          <div className="flex items-start justify-between mb-4">
+            <div className="flex-1">
+              {isEditing ? (
+                <div className="space-y-3">
+                  <input
+                    type="text"
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    className="w-full text-2xl font-bold bg-background border border-border rounded-md px-3 py-2"
+                    autoFocus
+                  />
+                  <textarea
+                    value={editDescription}
+                    onChange={(e) => setEditDescription(e.target.value)}
+                    placeholder="Project description..."
+                    className="w-full bg-background border border-border rounded-md px-3 py-2 text-sm"
+                    rows={3}
+                  />
+                  <div className="flex gap-2">
+                    <Button onClick={handleSave} size="sm">
+                      Save
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setIsEditing(false)}
+                    >
+                      Cancel
+                    </Button>
                   </div>
-                );
-              })}
+                </div>
+              ) : (
+                <>
+                  <h1 className="text-2xl font-bold mb-2">{project.name}</h1>
+                  <p className="text-muted-foreground">
+                    {project.description || "No description"}
+                  </p>
+                </>
+              )}
             </div>
-          )}
+
+            {!isEditing && (
+              <div className="flex items-center gap-2">
+                <Button variant="ghost" size="sm" onClick={handleEdit}>
+                  <Edit size={16} className="mr-1" />
+                  Edit
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-destructive hover:text-destructive"
+                  onClick={handleDelete}
+                >
+                  <Trash2 size={16} className="mr-1" />
+                  Delete
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => router.push(`/projects/${projectId}/settings`)}
+                >
+                  <Settings size={16} className="mr-1" />
+                  Settings
+                </Button>
+
+                {/* Open Panel Button (visible only when panel is closed) */}
+                {rightPanel === null && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setRightPanel("workspace")}
+                    className="gap-1.5 ml-2"
+                    title="Open Workspace / Source Control Panel"
+                  >
+                    <PanelRightOpen size={16} />
+                    <span className="hidden md:inline">Open Panel</span>
+                  </Button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Project Stats */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="bg-muted/50 border border-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <MessageSquare size={16} className="text-primary" />
+                <span className="text-sm font-medium">Sessions</span>
+              </div>
+              <div className="text-2xl font-bold">0</div>
+              <div className="text-xs text-muted-foreground mt-1">
+                Active conversations
+              </div>
+            </div>
+
+            <div className="bg-muted/50 border border-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <CheckSquare size={16} className="text-primary" />
+                <span className="text-sm font-medium">Tasks</span>
+              </div>
+              <div className="text-2xl font-bold">0</div>
+              <div className="text-xs text-muted-foreground mt-1">
+                Pending tasks
+              </div>
+            </div>
+
+            <div className="bg-muted/50 border border-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <Folder size={16} className="text-primary" />
+                <span className="text-sm font-medium">Files</span>
+              </div>
+              <div className="text-2xl font-bold">0</div>
+              <div className="text-xs text-muted-foreground mt-1">
+                Workspace files
+              </div>
+            </div>
+
+            <div className="bg-muted/50 border border-border rounded-lg p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <Calendar size={16} className="text-primary" />
+                <span className="text-sm font-medium">Created</span>
+              </div>
+              <div className="text-sm font-semibold">
+                {formatDate(project.created_at)}
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                Project creation date
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Quick Actions */}
+        <div className="p-6 border-b border-border">
+          <h2 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wider">
+            Quick Actions
+          </h2>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <Button
+              variant="outline"
+              className="h-auto py-4 flex flex-col items-start gap-2"
+              onClick={() => router.push(`/projects/${projectId}/chat`)}
+            >
+              <MessageSquare size={20} className="text-primary" />
+              <div className="text-left">
+                <div className="font-semibold">Start Chat</div>
+                <div className="text-xs text-muted-foreground">
+                  Begin a new conversation
+                </div>
+              </div>
+            </Button>
+
+            <Button
+              variant="outline"
+              className="h-auto py-4 flex flex-col items-start gap-2"
+              onClick={() => router.push(`/projects/${projectId}/tasks`)}
+            >
+              <CheckSquare size={20} className="text-primary" />
+              <div className="text-left">
+                <div className="font-semibold">Manage Tasks</div>
+                <div className="text-xs text-muted-foreground">
+                  View and organize tasks
+                </div>
+              </div>
+            </Button>
+
+            <Button
+              variant="outline"
+              className="h-auto py-4 flex flex-col items-start gap-2"
+              onClick={() => router.push(`/projects/${projectId}/notebook`)}
+            >
+              <FileText size={20} className="text-primary" />
+              <div className="text-left">
+                <div className="font-semibold">Notebook</div>
+                <div className="text-xs text-muted-foreground">
+                  Project notes and docs
+                </div>
+              </div>
+            </Button>
+
+            <Button
+              variant="outline"
+              className="h-auto py-4 flex flex-col items-start gap-2"
+              onClick={() => router.push(`/projects/${projectId}/source-control`)}
+            >
+              <GitBranch size={20} className="text-primary" />
+              <div className="text-left">
+                <div className="font-semibold">Source Control</div>
+                <div className="text-xs text-muted-foreground">
+                  Git repositories
+                </div>
+              </div>
+            </Button>
+          </div>
+        </div>
+
+        {/* Project Info */}
+        <div className="p-6">
+          <h2 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wider">
+            Project Information
+          </h2>
+          <div className="bg-muted/30 border border-border rounded-lg p-4 space-y-3">
+            <div className="flex items-start gap-3">
+              <Folder size={16} className="text-muted-foreground mt-0.5" />
+              <div className="flex-1">
+                <div className="text-sm font-medium">Workspace Path</div>
+                <div className="text-xs text-muted-foreground font-mono mt-1 break-all">
+                  {project.workspace_path || "Not configured"}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-3">
+              <Settings size={16} className="text-muted-foreground mt-0.5" />
+              <div className="flex-1">
+                <div className="text-sm font-medium">Workspace Type</div>
+                <div className="text-xs text-muted-foreground mt-1 capitalize">
+                  {project.workspace_type || "internal"}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-start gap-3">
+              <Calendar size={16} className="text-muted-foreground mt-0.5" />
+              <div className="flex-1">
+                <div className="text-sm font-medium">Last Updated</div>
+                <div className="text-xs text-muted-foreground mt-1">
+                  {project.updated_at ? formatDate(project.updated_at) : "Never"}
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div className="p-4 border-t border-border bg-card/60 backdrop-blur-sm shrink-0">
-        <form
-          onSubmit={handleStartProjectChat}
-          className="flex items-center gap-2 p-1.5 pl-3.5 rounded-sm border border-border bg-background shadow-peldrun-sm focus-within:ring-1 focus-within:ring-primary focus-within:border-primary/50 transition-all"
-        >
-          <input
-            type="text"
-            value={promptInput}
-            onChange={(e) => setPromptInput(e.target.value)}
-            placeholder={`Assign a new autonomous task to ${project?.name || "this project"}...`}
-            disabled={isSubmitting}
-            className="flex-1 bg-transparent border-0 outline-none text-xs text-foreground placeholder:text-muted-foreground disabled:opacity-50 font-sans"
-          />
-          <Button
-            type="submit"
-            size="sm"
-            disabled={isSubmitting || !promptInput.trim()}
-            className="h-7 w-7 p-0 rounded-md shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed shadow-peldrun-xs"
-          >
-            <Send size={12} />
-          </Button>
-        </form>
-      </div>
+      {/* Right Panel (Workspace / Source Control) */}
+      {rightPanel !== null && (
+        <div className="w-[33.333333%] border-l border-border hidden lg:flex flex-col shrink-0 bg-background">
+          {/* Toggle Header */}
+          <div className="h-12 border-b border-border bg-card px-3 flex items-center justify-between shrink-0">
+            <div className="flex items-center bg-muted/40 rounded-md border border-border p-0.5">
+              <button
+                type="button"
+                onClick={() => setRightPanel("workspace")}
+                className={`px-2.5 py-1.5 rounded-sm transition-all cursor-pointer flex items-center gap-1.5 text-xs ${
+                  rightPanel === "workspace"
+                    ? "bg-background text-foreground shadow-sm font-medium"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted/80"
+                }`}
+              >
+                <FolderTree size={14} />
+                <span>Workspace</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setRightPanel("source-control")}
+                className={`px-2.5 py-1.5 rounded-sm transition-all cursor-pointer flex items-center gap-1.5 text-xs ${
+                  rightPanel === "source-control"
+                    ? "bg-background text-foreground shadow-sm font-medium"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted/80"
+                }`}
+              >
+                <GitBranch size={14} />
+                <span>Source Control</span>
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setRightPanel(null)}
+              className="p-1.5 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground transition-all cursor-pointer"
+              title="Close Right Panel"
+            >
+              <PanelRightClose size={16} />
+            </button>
+          </div>
+
+          {/* Panel Content */}
+          <div className="flex-1 min-h-0 overflow-hidden">
+            {rightPanel === "workspace" && (
+              <ProjectWorkspacePanel projectId={projectId} />
+            )}
+            {rightPanel === "source-control" && (
+              <ProjectSourceControlPanel projectId={projectId} />
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

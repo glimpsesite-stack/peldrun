@@ -181,6 +181,8 @@ class ProjectManager:
                             "id": pid,
                             "name": pid.replace("proj_", "Project ").title(),
                             "description": "Recovered workspace",
+                            "workspace_path": "",  # Added for backward compatibility
+                            "workspace_type": "internal",  # Added for backward compatibility
                             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         }
                         if meta_file.exists():
@@ -691,6 +693,8 @@ class ProjectManager:
             "id": project_id,
             "name": name,
             "description": description,
+            "workspace_path": "",  # Added: Path to the project workspace
+            "workspace_type": "internal",  # Added: "internal" or "external"
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         _atomic_write_json(pdir / "project.json", meta)

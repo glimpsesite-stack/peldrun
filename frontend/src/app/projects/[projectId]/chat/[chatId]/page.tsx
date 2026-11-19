@@ -1,26 +1,89 @@
-﻿//frontend\src\app\projects\[projectId]\chat\[chatId]\page.tsx
+// frontend/src/app/projects/[projectId]/chat/[chatId]/page.tsx
+
+/**
+ * Project Active Chat Page
+ *
+ * Route: /projects/[projectId]/chat/[chatId]
+ *
+ * Responsibilities (intentionally minimal):
+ *   - Extract `projectId` and `chatId` from the URL.
+ *   - Render `<ChatContainer>` with those values forwarded as props.
+ *   - Nothing else.
+ *
+ * Design Decision — why no wrapper / no right-side panel here:
+ *
+ *   `ChatContainer` is the single source of truth for the entire chat
+ *   UI, including the right-hand workspace panel. It:
+ *
+ *     * owns the two-column layout (chat column + right panel),
+ *     * renders `ProjectWorkspacePanel` automatically when
+ *       `projectId` is present (same slot, same header controls as
+ *       the legacy `WorkspacePanel`),
+ *     * hydrates the chat session from `initialChatId` via
+ *       `GET /api/chats` and feeds the resolved `job_id` into
+ *       `fetchJobDetails`, so refreshing the page restores the full
+ *       history, steps, tokens, and artifacts,
+ *     * persists the user's right-panel visibility preference under
+ *       `peldrun:right_panel_open` in localStorage,
+ *     * toggles the panel through `ChatSubHeader`'s built-in button.
+ *
+ *   Adding a second wrapper panel here (as an earlier draft did)
+ *   produced two visible bugs:
+ *
+ *     1. Two right-hand panels stacked side-by-side, each with its
+ *        own independent show/hide state — the wrapper's close
+ *        button did not close `ChatContainer`'s panel and vice
+ *        versa.
+ *     2. An infinite custom-event loop: the wrapper listened for
+ *        `peldrun:artifact-created` and re-dispatched the same
+ *        event under the same name, which `ChatContainer` also
+ *        listened for. Every artifact triggered a chain of
+ *        re-dispatches until React bailed out.
+ *
+ *   Both bugs disappear once the wrapper is removed. Keeping the
+ *   page as a thin props-passing shell guarantees the layout is
+ *   defined in exactly one place.
+ *
+ * Data flow (for reference):
+ *
+ *   URL: /projects/P/chat/C
+ *        ↓
+ *   <ChatContainer projectId="P" initialChatId="C" />
+ *        ↓
+ *   GET /api/chats?project_id=P  →  find chat with id === "C"
+ *        ↓
+ *   found:    fetchJobDetails(chat.job_id)  → hydrate full state
+ *   not found: activeChatId = "C"           → fresh session, first
+ *                                             run targets chat_id=C
+ *                                             with project_id=P
+ */
+
+"use client";
+
 import React from "react";
+import { useParams } from "next/navigation";
+import { ChatContainer } from "@/components/chat/chat-container";
 
-interface ProjectChatPageProps {
-  params: Promise<{ projectId: string; chatId: string }>;
-}
+export default function ProjectActiveChatPage() {
+  const params = useParams();
 
-export default async function ProjectChatPage({ params }: ProjectChatPageProps) {
-  const resolvedParams = await params;
-  const { projectId, chatId } = resolvedParams;
+  // `useParams()` returns a readonly record whose values are typed as
+  // `string | string[]`. Both segments are defined by the route
+  // pattern (`[projectId]/chat/[chatId]`), so a direct cast is safe.
+  // The defensive `?? ""` keeps the component renderable during the
+  // brief window before Next.js populates params on the client.
+  const projectId = (params?.projectId as string) ?? "";
+  const chatId = (params?.chatId as string) ?? "";
 
+  // ChatContainer handles everything: layout, hydration, right panel,
+  // run dispatch, file uploads, regeneration. This page exists purely
+  // to bridge the URL segments into typed props.
   return (
-    <div className="flex flex-col items-center justify-center h-screen bg-slate-950 text-slate-100 font-mono p-6">
-      <div className="max-w-md w-full p-6 rounded-sm border border-slate-800 bg-slate-900 shadow-xl space-y-4">
-        <h1 className="text-sm font-bold text-emerald-400 uppercase tracking-wider">Independent Project Workspace</h1>
-        <div className="text-xs space-y-1 text-slate-300">
-          <p><span className="text-slate-500">Project ID:</span> {projectId}</p>
-          <p><span className="text-slate-500">Chat Session ID:</span> {chatId}</p>
-        </div>
-        <p className="text-[11px] text-slate-500 leading-relaxed">
-          This isolated project context ensures clean URL routing and dedicated session repositories.
-        </p>
-      </div>
+    <div className="h-screen w-full overflow-hidden bg-background">
+      <ChatContainer
+        projectId={projectId}
+        initialChatId={chatId}
+      />
     </div>
   );
 }

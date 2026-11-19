@@ -42,6 +42,54 @@ export interface DelegationApprovalRequest {
 /** Props accepted by the top-level ChatContainer component. */
 export interface ChatContainerProps {
   initialJobId?: string | null;
+
+  /**
+   * Optional chat session identifier.
+   *
+   * When provided (typically from the URL route
+   * `/projects/[projectId]/chat/[chatId]`), ChatContainer fetches the
+   * chat list, resolves the matching session, and hydrates the full
+   * state (history, steps, tokens, artifacts) from its `job_id`.
+   *
+   * Resolution precedence:
+   *   1. `initialJobId` — if set, used directly (legacy behaviour).
+   *   2. `initialChatId` — if set and no `initialJobId`, resolved
+   *      via `GET /api/chats` (project-scoped when `projectId` is
+   *      present) and its `job_id` fed to `fetchJobDetails`.
+   *
+   * Passing both is allowed; `initialJobId` wins. This lets legacy
+   * routes (which carry a job id in the URL) keep working while the
+   * new project routes use the chat id.
+   */
+  initialChatId?: string;
+
+  /**
+   * Optional project identifier.
+   *
+   * When provided, every chat operation — file uploads, artifact
+   * generation, memory retrieval, and run dispatch — is scoped to
+   * that project's persistent workspace instead of the legacy
+   * per-chat session directory.
+   *
+   * Scope of the change (backward-compatible):
+   *   - File uploads:    POST /api/projects/{projectId}/workspace/upload
+   *                      instead of POST /api/files/upload.
+   *   - Run dispatch:    `project_id` is included in the POST /api/run
+   *                      body so the backend scopes memory + tools.
+   *   - Regeneration:    Same `project_id` is forwarded on both the
+   *                      "latest" and "historical turn" code paths.
+   *   - Right panel:     ProjectWorkspacePanel replaces WorkspacePanel
+   *                      inside the same slot (same layout, same
+   *                      header controls, zero UI difference beyond
+   *                      the scoping).
+   *   - URL updates:     New turns write `/projects/{projectId}/chat/{chatId}`
+   *                      instead of `/chat/{chatId}`.
+   *
+   * When omitted (legacy chat route), all endpoints, payloads, and
+   * UI rendering remain byte-for-byte identical to the pre-project
+   * behaviour.
+   */
+  projectId?: string;
 }
 
 /**

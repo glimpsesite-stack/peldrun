@@ -69,6 +69,7 @@ from omweb.routers import (
     mcp,
     mcp_auth,
     memory_rtr,
+    projects,
     resource_monitor,
     run,
     runtime_settings_rtr,
@@ -1085,6 +1086,14 @@ app.include_router(system_rtr.router, prefix="/api/system", tags=["system"])
 # `/api/source-control` (see `routers/source_control.py`). Do NOT pass
 # a `prefix=` argument here, or the path would be double-prefixed.
 app.include_router(source_control.router)
+
+# Projects API router.
+#
+# NOTE: The router defines its internal prefix as `/api/projects`
+# (see `routers/projects.py`). Do NOT pass a `prefix=` argument here,
+# or the path would be double-prefixed. This matches the source_control
+# and resource_monitor router convention.
+app.include_router(projects.router)
 
 # Resource Monitor & Hardware Telemetry router.
 #

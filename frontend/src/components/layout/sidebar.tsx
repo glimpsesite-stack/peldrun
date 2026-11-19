@@ -797,9 +797,52 @@ function SidebarChatRow({
   onToggleArchive,
   onDeleteChat,
 }: SidebarChatRowProps) {
-  const effectiveTarget = chat.job_id || chat.id;
-  const isActive =
-    pathname === `/chat/${effectiveTarget}` || pathname === `/chat/${chat.id}`;
+  // ── Route resolution ────────────────────────────────────────────
+  //
+  // Each session must be opened via the route that matches its
+  // `project_id`:
+  //
+  //   * Project-scoped sessions (project_id set, not the reserved
+  //     default) go to `/projects/{pid}/chat/{chat.id}`. That route
+  //     forwards `chat.id` as `initialChatId` — NOT `job_id` — so
+  //     `ChatContainer` can match it against `GET /api/chats` and
+  //     re-hydrate the session. It also receives `projectId` as a
+  //     PROP, so every downstream operation (uploads, POST /api/run,
+  //     regeneration, workspace panel) is scoped to the project.
+  //
+  //   * Legacy sessions (no project_id / empty / DEFAULT_PROJECT_ID)
+  //     keep the flat `/chat/{jobId}` route. That route passes the
+  //     segment as `initialJobId` (the legacy hydration path), so
+  //     we must pass the session's `job_id` when available, falling
+  //     back to the chat id for never-run sessions.
+  //
+  // The previous implementation unconditionally built `/chat/{id}`,
+  // which caused project sessions to open in the GLOBAL chat route
+  // with no `projectId` PROP. The user would see the session
+  // hydrate correctly (the legacy route still works), but any
+  // subsequent message would dispatch to `POST /api/run` WITHOUT
+  // `project_id`, silently creating the next turn under the global
+  // chat list instead of the project.
+  const isProjectScoped =
+    !!chat.project_id &&
+    chat.project_id !== DEFAULT_PROJECT_ID &&
+    chat.project_id !== "";
+
+  const effectiveLegacyTarget = chat.job_id || chat.id;
+
+  const href = isProjectScoped
+    ? `/projects/${chat.project_id}/chat/${chat.id}`
+    : `/chat/${effectiveLegacyTarget}`;
+
+  // Active-state detection must mirror the href computation exactly;
+  // otherwise a session opened via the project route would not be
+  // highlighted in the sidebar because we would be comparing against
+  // the legacy `/chat/{id}` shape only.
+  const isActive = isProjectScoped
+    ? pathname === `/projects/${chat.project_id}/chat/${chat.id}`
+    : pathname === `/chat/${effectiveLegacyTarget}` ||
+      pathname === `/chat/${chat.id}`;
+
   const isPinned = chat.is_pinned || chat.pinned;
 
   return (
@@ -811,7 +854,7 @@ function SidebarChatRow({
       }`}
     >
       <Link
-        href={`/chat/${effectiveTarget}`}
+        href={href}
         className="flex items-center gap-2 truncate flex-1 mr-1"
       >
         <span
