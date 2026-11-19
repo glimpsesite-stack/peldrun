@@ -256,7 +256,7 @@ export default function TasksPage() {
           <p className="text-muted-foreground mb-6 max-w-md mx-auto">
             Create your first task to start tracking work within this project.
           </p>
-          <Button onClick={() => setShowCreateModal(true)} className="gap-2">
+          <Button onClick={() => setShowCreateModal(true)} className="gap-2 hover:text-[#fff]">
             <Plus size={16} />
             Create First Task
           </Button>

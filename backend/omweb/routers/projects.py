@@ -26,7 +26,8 @@ Endpoints:
 """
 
 from fastapi import APIRouter, HTTPException, status, Query
-from typing import Optional, List
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
 import os
 from pathlib import Path
 
@@ -85,6 +86,239 @@ def _get_task_manager() -> TaskManager:
     """Creates a TaskManager instance using the canonical storage path."""
     db_path = STORAGE_ROOT / "projects_tasks.db"
     return TaskManager(str(db_path))
+
+
+# ==============================================================================
+# Directory Browser (for External workspace folder picker)
+# ==============================================================================
+
+def _list_common_roots() -> List[Dict[str, Any]]:
+    """Return platform-appropriate workspace shortcuts.
+
+    Windows: every existing drive letter (C:\\, D:\\, ...).
+    macOS/Linux: home directory plus common mount roots.
+
+    Non-existent paths are silently filtered so the caller always
+    receives a usable list.
+    """
+    roots: List[Dict[str, Any]] = []
+
+    if os.name == "nt":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            try:
+                if os.path.exists(drive):
+                    roots.append({
+                        "name": f"{letter}:",
+                        "path": drive,
+                        "is_dir": True,
+                    })
+            except OSError:
+                continue
+        return roots
+
+    # Unix-like: try a curated list, keep only what actually exists.
+    candidates = [
+        str(Path.home()),
+        "/",
+        "/home",
+        "/Users",      # macOS
+        "/Volumes",    # macOS external mounts
+        "/mnt",
+        "/media",
+        "/opt",
+    ]
+    seen: set[str] = set()
+    for c in candidates:
+        try:
+            p = Path(c).expanduser()
+            if not p.exists() or not p.is_dir():
+                continue
+            p = p.resolve()
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append({
+                "name": key,
+                "path": key,
+                "is_dir": True,
+            })
+        except (OSError, RuntimeError):
+            continue
+    return roots
+
+
+@router.get("/browse-directories")
+async def browse_directories(
+    path: Optional[str] = Query(
+        default=None,
+        description=(
+            "Absolute directory path to list. Omit to get the list "
+            "of platform shortcuts (drives on Windows, home/roots "
+            "on Unix)."
+        ),
+    ),
+):
+    """List immediate subdirectories of ``path`` for the folder picker.
+
+    Cross-platform: uses ``pathlib`` only, no shell commands.
+
+    Response shape::
+
+        {
+            "current":  str,           # resolved absolute path, or ""
+            "parent":   str | None,    # absolute parent, None if at root
+            "entries":  [{"name": str, "path": str, "is_dir": true}, ...],
+            "roots":    [{"name": str, "path": str, "is_dir": true}, ...]
+        }
+
+    ``roots`` is always present so the picker can render a persistent
+    sidebar of shortcuts regardless of the current browsing depth.
+
+    Errors:
+        400 - the path is syntactically invalid
+        404 - the path does not exist or is not a directory
+        403 - the directory exists but cannot be read
+    """
+    roots = _list_common_roots()
+
+    # ── No path → return shortcuts only ──
+    if not path:
+        return {
+            "current": "",
+            "parent": None,
+            "entries": [],
+            "roots": roots,
+        }
+
+    # ── Resolve and validate the target ──
+    try:
+        target = Path(path).expanduser()
+        if not target.exists():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Directory not found: {path}",
+            )
+        if not target.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Not a directory: {path}",
+            )
+        target = target.resolve()
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid path: {path} ({exc})",
+        )
+
+    # ── Enumerate immediate subdirectories ──
+    # Windows-only system directories are silently skipped: they
+    # cannot be opened without admin privileges and would only
+    # surface "Permission denied" errors during normal browsing.
+    windows_blocklist = {
+        "System Volume Information",
+        "$Recycle.Bin",
+        "Recovery",
+        "Config.Msi",
+    }
+
+    entries: List[Dict[str, Any]] = []
+    try:
+        for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+            try:
+                if not child.is_dir():
+                    continue
+                if os.name == "nt" and child.name in windows_blocklist:
+                    continue
+                entries.append({
+                    "name": child.name,
+                    "path": str(child),
+                    "is_dir": True,
+                })
+            except (PermissionError, OSError):
+                # Individual entries can be inaccessible (bad symlinks,
+                # junctions, ACL-restricted dirs). Skip rather than
+                # abort the whole listing.
+                continue
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission denied: {target}",
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read directory: {exc}",
+        )
+
+    # ── Parent path (None at filesystem root) ──
+    parent: Optional[str] = None
+    try:
+        if target.parent != target:
+            parent = str(target.parent)
+    except (OSError, RuntimeError):
+        parent = None
+
+    return {
+        "current": str(target),
+        "parent": parent,
+        "entries": entries,
+        "roots": roots,
+    }
+
+
+# ==============================================================================
+# Project Metadata (update)
+# ==============================================================================
+
+class ProjectUpdateRequest(BaseModel):
+    """Payload for PATCH /api/projects/{project_id}.
+
+    All fields are optional; only fields actually present in the
+    request body are applied to the persisted record. ``description``
+    intentionally allows empty strings (the frontend clears the
+    description this way). ``name`` requires at least one character
+    because an empty name would break sidebar rendering.
+    """
+    name: Optional[str] = Field(default=None, min_length=1)
+    description: Optional[str] = None
+    workspace_path: Optional[str] = None
+    workspace_type: Optional[str] = None
+
+
+@router.patch("/{project_id}")
+async def update_project(project_id: str, req: ProjectUpdateRequest):
+    """Apply a partial update to a project's metadata.
+
+    Returns the freshly-persisted project dict (not wrapped) so that
+    the frontend can merge it into its Zustand store with a single
+    object-spread — the frontend already expects this shape.
+    """
+    if not project_manager.get_project(project_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        )
+
+    updates = req.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No fields provided to update",
+        )
+
+    updated = project_manager.update_project(project_id, **updates)
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist project update",
+        )
+
+    return updated
 
 
 # ==============================================================================

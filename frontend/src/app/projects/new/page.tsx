@@ -29,11 +29,15 @@ import {
   Loader2,
   AlertCircle,
   CheckCircle2,
+  HardDrive,
+  ExternalLink,
+  FolderOpen,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { createProject } from "@/lib/chatsApi";
 import { useProjectStore } from "@/stores/project-store";
 import { showToast, ToastContainer } from "@/components/ui/ToastNotification";
+import { DirectoryPicker } from "@/components/ui/directory-picker";
 
 export default function NewProjectPage() {
   const router = useRouter();
@@ -41,6 +45,10 @@ export default function NewProjectPage() {
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [workspaceType, setWorkspaceType] =
+    useState<"internal" | "external">("internal");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
 
@@ -71,6 +79,15 @@ export default function NewProjectPage() {
       return false;
     }
 
+    // External workspace requires a non-empty path. The backend
+    // will additionally verify the path exists (or can be created).
+    if (workspaceType === "external" && !workspacePath.trim()) {
+      setValidationError(
+        "Select a workspace folder, or switch back to Internal."
+      );
+      return false;
+    }
+
     setValidationError(null);
     return true;
   };
@@ -84,7 +101,12 @@ export default function NewProjectPage() {
     setIsCreating(true);
 
     try {
-      const newProject = await createProject(name.trim(), description.trim());
+      const newProject = await createProject(
+        name.trim(),
+        description.trim(),
+        workspaceType === "external" ? workspacePath.trim() : "",
+        workspaceType,
+      );
 
       if (!newProject) {
         throw new Error("Server did not return the created project.");
@@ -101,6 +123,9 @@ export default function NewProjectPage() {
       // Navigate to the new project's dashboard
       router.push(`/projects/${newProject.id}`);
     } catch (err: any) {
+      // Backend path-validation errors (e.g. "Cannot create or access
+      // external workspace …") arrive here verbatim — surface them in
+      // the toast so the user knows exactly what failed.
       console.error("[NewProjectPage] Creation failed:", err);
       showToast.error(
         "Creation Failed",
@@ -208,6 +233,109 @@ export default function NewProjectPage() {
           </p>
         </div>
 
+        {/* Workspace Configuration */}
+        <div className="mb-6">
+          <label className="block text-sm font-medium mb-2">
+            Workspace Location
+          </label>
+
+          {/* Type selector */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+            {(
+              [
+                {
+                  value: "internal" as const,
+                  label: "Internal",
+                  desc: "Stored under the app's project directory. Recommended.",
+                  Icon: HardDrive,
+                },
+                {
+                  value: "external" as const,
+                  label: "External",
+                  desc: "Point to any folder on your machine.",
+                  Icon: ExternalLink,
+                },
+              ]
+            ).map(({ value, label, desc, Icon }) => {
+              const isActive = workspaceType === value;
+              return (
+                <label
+                  key={value}
+                  className={`relative flex flex-col p-3 border rounded-md cursor-pointer transition-colors ${
+                    isActive
+                      ? "border-primary bg-primary/5"
+                      : "border-border hover:border-primary/40"
+                  } ${isCreating ? "opacity-60 pointer-events-none" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    name="workspaceType"
+                    value={value}
+                    checked={isActive}
+                    onChange={() => setWorkspaceType(value)}
+                    className="sr-only"
+                    disabled={isCreating}
+                  />
+                  <div className="flex items-center gap-2 mb-1">
+                    <Icon
+                      size={14}
+                      className={
+                        isActive ? "text-primary" : "text-muted-foreground"
+                      }
+                    />
+                    <span className="font-medium text-sm">{label}</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    {desc}
+                  </p>
+                </label>
+              );
+            })}
+          </div>
+
+          {/* External path input */}
+          {workspaceType === "external" && (
+            <div>
+              <label className="block text-xs font-medium mb-1.5 text-muted-foreground">
+                Folder Path
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={workspacePath}
+                  onChange={(e) => setWorkspacePath(e.target.value)}
+                  className="min-w-0 flex-1 px-3 py-2 bg-background border border-border rounded-md font-mono text-xs
+                             focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary
+                             transition-shadow placeholder:text-muted-foreground/60"
+                  placeholder="/path/to/your/folder  (or use Browse…)"
+                  disabled={isCreating}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setPickerOpen(true)}
+                  disabled={isCreating}
+                  className="gap-1.5 shrink-0 h-[38px] px-3"
+                >
+                  <FolderOpen size={13} />
+                  Browse…
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1.5">
+                The folder will be used as the project's workspace. If it
+                does not exist yet, it will be created.
+              </p>
+            </div>
+          )}
+
+          {workspaceType === "internal" && (
+            <p className="text-xs text-muted-foreground">
+              Your workspace will live inside the PELDRUN data directory,
+              managed automatically.
+            </p>
+          )}
+        </div>
+
         {/* Validation Error */}
         {validationError && (
           <div className="mb-6 p-3 bg-destructive/10 border border-destructive/30 rounded-md flex items-start gap-2">
@@ -251,7 +379,11 @@ export default function NewProjectPage() {
           </Button>
           <Button
             type="submit"
-            disabled={isCreating || !name.trim()}
+            disabled={
+              isCreating ||
+              !name.trim() ||
+              (workspaceType === "external" && !workspacePath.trim())
+            }
             className="gap-2"
           >
             {isCreating ? (
@@ -282,6 +414,16 @@ export default function NewProjectPage() {
       </div>
 
       <ToastContainer />
+
+      {/* Cross-platform folder picker for the External workspace path.
+          Uses createPortal internally, so DOM position is irrelevant. */}
+      <DirectoryPicker
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        initialPath={workspacePath || undefined}
+        onSelect={(p) => setWorkspacePath(p)}
+        title="Select Workspace Folder"
+      />
     </div>
   );
 }

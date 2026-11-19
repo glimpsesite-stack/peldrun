@@ -265,17 +265,57 @@ export async function fetchProjects(): Promise<Project[]> {
   }
 }
 
-export async function createProject(name: string, description?: string): Promise<Project | null> {
+/**
+ * Create a new project with an explicit workspace configuration.
+ *
+ * @param name           Human-readable project name (required, ≥1 char).
+ * @param description    Optional short description.
+ * @param workspacePath  Absolute filesystem path. Required when
+ *                       `workspaceType === "external"`. Ignored when
+ *                       `workspaceType === "internal"` (the backend
+ *                       derives a canonical path from the project ID).
+ * @param workspaceType  Either "internal" (default) or "external".
+ *
+ * Returns the created project on success, or null on failure. On a
+ * validation error from the backend (invalid path, un-creatable
+ * directory, unknown workspace_type) the message is logged to the
+ * console — the caller is expected to display a generic toast.
+ */
+export async function createProject(
+  name: string,
+  description?: string,
+  workspacePath?: string,
+  workspaceType?: "internal" | "external",
+): Promise<Project | null> {
   try {
     const res = await fetch("/api/chats/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, description: description || "" })
+      body: JSON.stringify({
+        name,
+        description: description || "",
+        workspace_path: workspacePath || "",
+        workspace_type: workspaceType || "internal",
+      }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const detail =
+        typeof body?.detail === "string"
+          ? body.detail
+          : `HTTP ${res.status}`;
+      console.error("createProject failed:", detail);
+      // Re-throw so new/page.tsx can surface the specific backend
+      // message (e.g. "Cannot create or access external workspace …")
+      // instead of a generic "creation failed".
+      throw new Error(detail);
+    }
     const data = await res.json();
     return data.project || null;
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Cannot")) {
+      throw err;  // propagate backend-validation message verbatim
+    }
     console.error("createProject error:", err);
     return null;
   }

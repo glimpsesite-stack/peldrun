@@ -62,7 +62,7 @@ export default function NewProjectChatPage() {
   const projectId = (params?.projectId as string) ?? "";
 
   return (
-    <div className="h-screen w-full overflow-hidden bg-background">
+    <div className="h-full w-full overflow-hidden bg-background">
       <ChatContainer projectId={projectId} />
     </div>
   );

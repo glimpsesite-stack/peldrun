@@ -79,7 +79,7 @@ export default function ProjectActiveChatPage() {
   // run dispatch, file uploads, regeneration. This page exists purely
   // to bridge the URL segments into typed props.
   return (
-    <div className="h-screen w-full overflow-hidden bg-background">
+    <div className="h-full w-full overflow-hidden bg-background">
       <ChatContainer
         projectId={projectId}
         initialChatId={chatId}

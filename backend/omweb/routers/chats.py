@@ -43,6 +43,20 @@ class ChatRenameRequest(BaseModel):
 class ProjectCreateRequest(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = ""
+    workspace_path: Optional[str] = ""
+    workspace_type: Optional[str] = "internal"
+
+
+class ProjectUpdateRequest(BaseModel):
+    """Partial-update payload for PATCH /projects/{project_id}.
+
+    All fields optional. Only fields present in the request body are
+    applied; ``name`` still requires at least one character when provided.
+    """
+    name: Optional[str] = Field(default=None, min_length=1)
+    description: Optional[str] = None
+    workspace_path: Optional[str] = None
+    workspace_type: Optional[str] = None
 
 
 # ============================================================================
@@ -144,7 +158,22 @@ async def list_projects():
 
 @router.post("/projects")
 async def create_project(req: ProjectCreateRequest):
-    proj = project_manager.create_project(name=req.name, description=req.description)
+    """Create a new project with an explicit workspace configuration.
+
+    Returns ``{status, project}``. A validation error from the manager
+    (invalid workspace type, un-creatable external path) is surfaced as
+    HTTP 400 with a readable detail so the frontend can display it in a
+    toast without needing to inspect the raw exception.
+    """
+    try:
+        proj = project_manager.create_project(
+            name=req.name,
+            description=req.description or "",
+            workspace_path=req.workspace_path or "",
+            workspace_type=req.workspace_type or "internal",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "ok", "project": proj}
 
 
@@ -155,6 +184,30 @@ async def get_project_detail(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
     chats = project_manager.list_chats(project_id=project_id)
     return {"status": "ok", "project": proj, "chats": chats}
+
+
+@router.patch("/projects/{project_id}")
+async def update_project(project_id: str, req: ProjectUpdateRequest):
+    """Apply a partial update to a project's metadata.
+
+    Returns ``{status, project}`` so callers can merge the authoritative
+    record into their local store in one step.
+    """
+    if not project_manager.get_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    updates = {
+        k: v for k, v in req.model_dump().items() if v is not None
+    }
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    updated = project_manager.update_project(project_id, **updates)
+    if updated is None:
+        raise HTTPException(
+            status_code=500, detail="Failed to persist project update"
+        )
+    return {"status": "ok", "project": updated}
 
 
 @router.delete("/projects/{project_id}")

@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import { useRouter } from "next/navigation";
 import dynamic from "next/dynamic";
+import { Loader2 } from "lucide-react";
 import {
   WorkspacePanel,
   getFileCategory,
@@ -121,6 +122,27 @@ export function ChatContainer({
   );
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [historyTurns, setHistoryTurns] = useState<ChatTurn[]>([]);
+
+  // True while the initial-chat resolution effect is running. Prevents
+  // ChatLanding from flashing on F5 for an existing chat, and gates the
+  // composer so the user cannot fire a send before activeChatId is set.
+  //
+  // Starts as `true` only when we actually have a chat to resolve
+  // (initialChatId present AND no initialJobId). When both are absent
+  // (the `/chat/new` route), this stays `false` so ChatLanding renders
+  // immediately.
+  const [isResolvingChat, setIsResolvingChat] = useState<boolean>(
+    Boolean(initialChatId && !initialJobId)
+  );
+
+  // Tracks which chat id has already been resolved in this mount cycle.
+  // Prevents the effect from re-fetching the same chat every time an
+  // unrelated dependency (activeChatId, activeJobId) changes.
+  //
+  // Reset to null whenever activeChatId returns to null (user clicked
+  // "New Session"), so re-navigating to the same chat later re-resolves
+  // it fresh.
+  const resolvedChatIdRef = useRef<string | null>(null);
   // After widening ChatStatus in chat-container/types.ts (Phase G.4.d),
   // the union already includes "paused" and every other canonical
   // status, so the extra `| "paused"` annotation and all the
@@ -535,49 +557,149 @@ export function ChatContainer({
   // the next POST /api/run targets the correct chat session. The user
   // sees a fresh session in case (a), and will be re-synced from the
   // backend the next time they send a message in case (b).
+  // Reset the resolved-chat marker whenever activeChatId goes back to
+  // null (via handleNewSession). Otherwise re-navigating to the same
+  // chat id would be silently skipped by the effect below.
   useEffect(() => {
+    if (activeChatId === null) {
+      resolvedChatIdRef.current = null;
+    }
+  }, [activeChatId]);
+
+  useEffect(() => {
+    // ── Legacy path: explicit jobId ──
     if (initialJobId) {
       setActiveJobId(initialJobId);
       fetchJobDetails(initialJobId);
       return;
     }
 
-    if (!initialChatId) return;
+    // ── Fresh session (no chatId at all) ──
+    if (!initialChatId) {
+      setIsResolvingChat(false);
+      return;
+    }
 
+    // ── Just created this chat ourselves (post-send URL rewrite) ──
+    // handleStartTask sets activeChatId + activeJobId BEFORE
+    // window.history.replaceState rewrites the URL. When the prop
+    // change reaches this effect, re-fetching would clobber the
+    // live SSE state with a backend snapshot that may be behind
+    // the stream. Detect this exact case and skip.
+    if (activeChatId === initialChatId && activeJobId) {
+      resolvedChatIdRef.current = initialChatId;
+      setIsResolvingChat(false);
+      return;
+    }
+
+    // ── Already resolved this chat in this mount cycle ──
+    if (resolvedChatIdRef.current === initialChatId) {
+      return;
+    }
+
+    // ── Full resolution: F5, direct nav, or switching chats ──
+    // Close any stream from a previous chat before loading the new one.
+    try {
+      closeStream();
+    } catch {
+      /* non-fatal */
+    }
+    setIsResolvingChat(true);
     let cancelled = false;
+
     (async () => {
+      let match: ChatSession | null = null;
+
+      // Attempt 1: default page size (fast path).
       try {
         const chats = await fetchChats(
           projectId ? { projectId } : undefined
         );
         if (cancelled) return;
-
-        const match = chats.find(
-          (c: ChatSession) => c.id === initialChatId
-        );
-        if (match?.job_id) {
-          setActiveChatId(match.id);
-          setActiveJobId(match.job_id);
-          fetchJobDetails(match.job_id);
-        } else {
-          setActiveChatId(initialChatId);
-        }
-      } catch (err) {
+        match = chats.find((c: ChatSession) => c.id === initialChatId) ?? null;
+      } catch (e) {
         if (cancelled) return;
-        console.error(
-          "[ChatContainer] Failed to resolve initialChatId:",
-          err
+        console.warn(
+          "[ChatContainer] fetchChats (default) failed:",
+          e
         );
-        // Preserve the chat id so subsequent dispatches target the
-        // correct session even when the lookup fails transiently.
+      }
+
+      // Attempt 2: larger page (chat may be on page 2+).
+      if (!match) {
+        try {
+          const chats = await fetchChats(
+            projectId ? { projectId, limit: 200 } : { limit: 200 }
+          );
+          if (cancelled) return;
+          match =
+            chats.find((c: ChatSession) => c.id === initialChatId) ?? null;
+        } catch (e) {
+          if (cancelled) return;
+          console.warn(
+            "[ChatContainer] fetchChats (limit=200) failed:",
+            e
+          );
+        }
+      }
+
+      // Attempt 3: direct GET /api/chats/{id} (bypasses pagination).
+      if (!match) {
+        try {
+          const res = await fetch(
+            `/api/chats/${encodeURIComponent(initialChatId)}`
+          );
+          if (res.ok) {
+            const detail = await res.json();
+            if (detail?.chat?.job_id) {
+              match = detail.chat as ChatSession;
+            }
+          }
+        } catch (e) {
+          if (cancelled) return;
+          console.warn(
+            "[ChatContainer] direct chat fetch failed:",
+            e
+          );
+        }
+      }
+
+      if (cancelled) return;
+
+      if (match?.job_id) {
+        setActiveChatId(match.id);
+        setActiveJobId(match.job_id);
+        fetchJobDetails(match.job_id);
+      } else {
+        // Chat id exists in URL but the backend has no record of it.
+        // Preserve the id so the next POST /api/run attaches to it.
         setActiveChatId(initialChatId);
       }
-    })();
+      resolvedChatIdRef.current = initialChatId;
+      setIsResolvingChat(false);
+    })().catch((err) => {
+      if (cancelled) return;
+      console.error(
+        "[ChatContainer] Failed to resolve initialChatId:",
+        err
+      );
+      setActiveChatId(initialChatId);
+      resolvedChatIdRef.current = initialChatId;
+      setIsResolvingChat(false);
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [initialJobId, initialChatId, projectId, fetchJobDetails]);
+  }, [
+    initialJobId,
+    initialChatId,
+    activeChatId,
+    activeJobId,
+    projectId,
+    fetchJobDetails,
+    closeStream,
+  ]);
 
   // Listen for file-mention clicks dispatched from the composer. Opens the
   // referenced file in the workspace panel by selecting it and forcing the
@@ -1585,6 +1707,7 @@ export function ChatContainer({
 
   // --- Derived values -------------------------------------------------------
   const isFreshSession =
+    !isResolvingChat &&
     historyTurns.length === 0 &&
     steps.length === 0 &&
     !submittedPrompt &&
@@ -1722,7 +1845,16 @@ export function ChatContainer({
           activeModel={activeModelName}
         />
 
-        {isFreshSession ? (
+        {isResolvingChat ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="flex flex-col items-center gap-3">
+              <Loader2 size={28} className="animate-spin text-accent" />
+              <p className="text-sm text-muted-foreground">
+                Loading chat…
+              </p>
+            </div>
+          </div>
+        ) : isFreshSession ? (
           <ChatLanding
             inputValue={inputValue}
             setInputValue={setInputValue}
@@ -1809,7 +1941,7 @@ export function ChatContainer({
           />
         )}
 
-        {!isFreshSession && (
+        {!isFreshSession && !isResolvingChat && (
           <div className="p-3 sm:p-4 bg-background shrink-0">
             <Composer
               chatId={activeChatId || undefined}

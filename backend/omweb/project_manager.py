@@ -681,20 +681,98 @@ class ProjectManager:
                 })
         return projects
 
-    def create_project(self, name: str, description: str = "") -> Dict[str, Any]:
+    def create_project(
+        self,
+        name: str,
+        description: str = "",
+        workspace_path: str = "",
+        workspace_type: str = "internal",
+    ) -> Dict[str, Any]:
+        """Create a new project and prepare its workspace directory.
+
+        ``workspace_type`` decides the on-disk location:
+
+        * ``"internal"`` — the workspace is created under
+          ``storage/projects/{project_id}/workspace``. Any caller-supplied
+          ``workspace_path`` is ignored (the path is derived from the
+          project ID and must remain canonical so backup/restore keeps
+          working).
+
+        * ``"external"`` — the caller-supplied ``workspace_path`` is
+          used verbatim. The directory is created if it does not yet
+          exist, so the first workspace operation (file read, list,
+          write) never fails with ENOENT right after creation. Parent
+          directories are created too. A path that cannot be created
+          raises ValueError so the API layer can surface a 400.
+
+        The function is atomic: index.json and project.json are written
+        via the shared atomic writer. If directory creation fails
+        AFTER the project has been registered, the partial project
+        entry is cleaned up so no ghost record survives.
+        """
         import uuid
+
+        normalized_type = (workspace_type or "internal").strip().lower()
+        if normalized_type not in ("internal", "external"):
+            raise ValueError(
+                f"workspace_type must be 'internal' or 'external', "
+                f"got {workspace_type!r}"
+            )
+
         project_id = f"proj_{uuid.uuid4().hex[:8]}"
         pdir = self.projects_dir / project_id
         pdir.mkdir(parents=True, exist_ok=True)
         (pdir / "chats").mkdir(parents=True, exist_ok=True)
         (pdir / "assets").mkdir(parents=True, exist_ok=True)
 
+        # ── Resolve the workspace path before persisting anything ──
+        if normalized_type == "internal":
+            resolved_workspace = pdir / "workspace"
+            try:
+                resolved_workspace.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                # Rollback the project directory before raising so the
+                # caller can retry without an orphan on disk.
+                shutil.rmtree(pdir, ignore_errors=True)
+                raise ValueError(
+                    f"Failed to create internal workspace: {exc}"
+                ) from exc
+            persisted_path = ""  # Empty string signals "use the default"
+        else:
+            if not workspace_path or not workspace_path.strip():
+                shutil.rmtree(pdir, ignore_errors=True)
+                raise ValueError(
+                    "workspace_path is required when workspace_type is 'external'"
+                )
+
+            resolved_workspace = Path(workspace_path).expanduser()
+            try:
+                # Create the external directory if missing. exist_ok=True
+                # means an existing folder is reused without touching it.
+                resolved_workspace.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                shutil.rmtree(pdir, ignore_errors=True)
+                raise ValueError(
+                    f"Cannot create or access external workspace "
+                    f"'{workspace_path}': {exc}"
+                ) from exc
+
+            if not resolved_workspace.is_dir():
+                shutil.rmtree(pdir, ignore_errors=True)
+                raise ValueError(
+                    f"External workspace path is not a directory: {workspace_path}"
+                )
+
+            # Persist the absolute path so later reads never need to
+            # re-resolve a relative or tilde-prefixed value.
+            persisted_path = str(resolved_workspace.resolve())
+
         meta = {
             "id": project_id,
             "name": name,
             "description": description,
-            "workspace_path": "",  # Added: Path to the project workspace
-            "workspace_type": "internal",  # Added: "internal" or "external"
+            "workspace_path": persisted_path,
+            "workspace_type": normalized_type,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         _atomic_write_json(pdir / "project.json", meta)
@@ -709,6 +787,53 @@ class ProjectManager:
             if isinstance(p, dict) and p.get("id") == project_id:
                 return p
         return None
+
+    def update_project(
+        self, project_id: str, **updates: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Persist a partial update to a project's metadata.
+
+        Only fields present in ``updates`` with a non-None value are
+        written. ``id`` and ``created_at`` are immutable — they are
+        silently ignored if present in the payload. ``updated_at`` is
+        bumped on every successful update.
+
+        Writes are atomic: the index.json is replaced via the standard
+        atomic-write helper, and project.json is refreshed in lockstep
+        so disk and index never diverge.
+
+        Returns the updated project dict, or None when the project
+        does not exist.
+        """
+        index = self._read_index()
+        target: Optional[Dict[str, Any]] = None
+        for p in index.get("projects", []):
+            if isinstance(p, dict) and p.get("id") == project_id:
+                target = p
+                break
+
+        if target is None:
+            return None
+
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if key in ("id", "created_at"):
+                continue
+            target[key] = value
+
+        target["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        self._write_index(index)
+
+        pdir = self.projects_dir / project_id
+        if pdir.exists():
+            try:
+                _atomic_write_json(pdir / "project.json", target)
+            except Exception:
+                pass
+
+        return target
 
     def delete_project(self, project_id: str) -> bool:
         if project_id == "default_project":

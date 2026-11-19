@@ -93,12 +93,25 @@ export default function ProjectsPage() {
     }
 
     try {
-      // TODO: Implement API call to delete project
-      // await deleteProject(projectId);
+      // Deletion lives on chats.router at /api/chats/projects/{id}.
+      // projects.py has no DELETE handler for the root project path,
+      // so calling /api/projects/{id} would return 405.
+      const res = await fetch(`/api/chats/projects/${projectId}`, {
+        method: "DELETE",
+      });
+      if (res.status === 409) {
+        const body = await res.json().catch(() => ({}));
+        alert(
+          body.detail ||
+            "Cannot delete: a run is still active. Stop it first."
+        );
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       removeProject(projectId);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to delete project:", error);
-      alert("Failed to delete project. Please try again.");
+      alert(error?.message || "Failed to delete project. Please try again.");
     }
   };
 
