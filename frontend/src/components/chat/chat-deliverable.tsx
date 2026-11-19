@@ -15,6 +15,13 @@ import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 interface ChatDeliverableProps {
   finalResult: string;
   chatId?: string;
+  /**
+   * When provided, media preview URLs (img/video thumbnails) resolve
+   * against the project workspace instead of the chat session folder.
+   * The agent writes deliverables into the project workspace, so the
+   * chat-scoped /api/chats/{id}/raw route cannot see them.
+   */
+  projectId?: string | null;
   status?: "completed" | "failed" | "stopped" | "paused";
   turnIndex?: number;
   isTurnRawTrace?: boolean;
@@ -70,6 +77,7 @@ interface ChatDeliverableProps {
 export function ChatDeliverable({
   finalResult,
   chatId,
+  projectId,
   status = "completed",
   turnIndex,
   isTurnRawTrace = false,
@@ -262,12 +270,22 @@ export function ChatDeliverable({
 
               // Determine preview capability
               const info = resolveFileCategory(targetPath);
-              const fileUrl = chatId
-                ? `/api/chats/${chatId}/raw/${targetPath
-                    .split("/")
-                    .map(encodeURIComponent)
-                    .join("/")}`
-                : null;
+          // Project mode: serve media from the project workspace via the
+          // path-scoped raw route (works for internal AND external
+          // workspaces). Chat mode keeps the legacy per-chat raw route.
+          // Per-segment encoding is preserved so spaces and special
+          // characters in folder names resolve correctly.
+          const fileUrl = projectId
+            ? `/api/files/raw-project/${encodeURIComponent(projectId)}/${targetPath
+                .split("/")
+                .map(encodeURIComponent)
+                .join("/")}`
+            : chatId
+              ? `/api/chats/${chatId}/raw/${targetPath
+                  .split("/")
+                  .map(encodeURIComponent)
+                  .join("/")}`
+              : null;
 
               // 1. Image Preview
               if (info.isImage && fileUrl) {

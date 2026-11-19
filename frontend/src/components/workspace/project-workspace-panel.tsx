@@ -158,57 +158,21 @@ export function ProjectWorkspacePanel({
       setProjectFiles([]);
       return;
     }
-
     try {
       setFilesLoading(true);
+      // loadFiles() resolves to void and commits the new list into resolver
+      // state AFTER this call returns. Reading workspaceState.files here
+      // would use a stale closure snapshot (empty on first load), which is
+      // why the panel auto-selected nothing on a cold page load. Mapping
+      // and auto-selection now react to workspaceState.files in a dedicated
+      // effect below, so they always see the committed list.
       await workspaceActions.loadFiles();
-
-      const files: ProjectWorkspaceFileItem[] = workspaceState.files.map((path) => ({
-        name: path.split("/").pop() || path,
-        path: path,
-      }));
-
-      setProjectFiles(files);
-
-      if (!hasAutoSelectedRef.current && !selectedFilePathRef.current && files.length > 0) {
-        const webAppFile =
-          files.find((f) => f.name.toLowerCase() === "index.html" && (f.size ?? 1) > 0) ||
-          files.find((f) => {
-            const l = f.name.toLowerCase();
-            return (l.endsWith(".html") || l.endsWith(".htm")) && (f.size ?? 1) > 0;
-          }) ||
-          files.find((f) => getProjectFileCategory(f.path) === "preview" && (f.size ?? 1) > 0) ||
-          files.find((f) => f.name.toLowerCase() === "index.html") ||
-          files.find((f) => {
-            const l = f.name.toLowerCase();
-            return l.endsWith(".html") || l.endsWith(".htm");
-          }) ||
-          files.find((f) => getProjectFileCategory(f.path) === "preview");
-
-        if (webAppFile) {
-          hasAutoSelectedRef.current = true;
-          lastPreviewFileRef.current = webAppFile.path;
-          setSelectedFilePath(webAppFile.path);
-          setActiveTab("preview");
-          return;
-        }
-
-        const mediaFile = files.find((f) => getProjectFileCategory(f.path) === "artifacts");
-        if (mediaFile) {
-          hasAutoSelectedRef.current = true;
-          setSelectedFilePath(mediaFile.path);
-          setActiveTab("artifacts");
-          return;
-        }
-
-        hasAutoSelectedRef.current = true;
-      }
     } catch (err) {
       console.error("[ProjectWorkspacePanel] Failed to fetch project files:", err);
     } finally {
       setFilesLoading(false);
     }
-  }, [projectId, workspaceState.files, workspaceActions]);
+  }, [projectId, workspaceActions]);
 
   // CRITICAL FIX: Use a ref to hold the latest fetchProjectFiles to prevent infinite loops
   const fetchProjectFilesRef = useRef(fetchProjectFiles);
@@ -216,12 +180,61 @@ export function ProjectWorkspacePanel({
     fetchProjectFilesRef.current = fetchProjectFiles;
   }, [fetchProjectFiles]);
 
+  // React to the resolver's committed file list instead of reading it
+  // inside fetchProjectFiles (stale closure). Runs on mount, after every
+  // successful loadFiles(), and after artifact-triggered refreshes, so
+  // auto-selection works on a cold page load of an existing project.
+  useEffect(() => {
+    const files: ProjectWorkspaceFileItem[] = (workspaceState.files || []).map((path) => ({
+      name: path.split("/").pop() || path,
+      path: path,
+    }));
+    setProjectFiles(files);
+
+    if (hasAutoSelectedRef.current || selectedFilePathRef.current || files.length === 0) {
+      return;
+    }
+
+    const webAppFile =
+      files.find((f) => f.name.toLowerCase() === "index.html" && (f.size ?? 1) > 0) ||
+      files.find((f) => {
+        const l = f.name.toLowerCase();
+        return (l.endsWith(".html") || l.endsWith(".htm")) && (f.size ?? 1) > 0;
+      }) ||
+      files.find((f) => getProjectFileCategory(f.path) === "preview" && (f.size ?? 1) > 0) ||
+      files.find((f) => f.name.toLowerCase() === "index.html") ||
+      files.find((f) => {
+        const l = f.name.toLowerCase();
+        return l.endsWith(".html") || l.endsWith(".htm");
+      }) ||
+      files.find((f) => getProjectFileCategory(f.path) === "preview");
+
+    if (webAppFile) {
+      hasAutoSelectedRef.current = true;
+      lastPreviewFileRef.current = webAppFile.path;
+      setSelectedFilePath(webAppFile.path);
+      setActiveTab("preview");
+      return;
+    }
+
+    const mediaFile = files.find((f) => getProjectFileCategory(f.path) === "artifacts");
+    if (mediaFile) {
+      hasAutoSelectedRef.current = true;
+      setSelectedFilePath(mediaFile.path);
+      setActiveTab("artifacts");
+      return;
+    }
+
+    hasAutoSelectedRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceState.files]);
+
   // CRITICAL FIX: Dependency array contains ONLY [projectId]
   useEffect(() => {
     hasAutoSelectedRef.current = false;
     setSelectedFilePath(null);
     lastPreviewFileRef.current = null;
-
+    setProjectFiles([]);
     if (projectId) {
       fetchProjectFilesRef.current();
     }
@@ -397,10 +410,14 @@ export function ProjectWorkspacePanel({
 
       <div className="flex-1 min-h-0 overflow-hidden bg-background">
         {activeTab === "preview" && (
-          <PreviewTab currentHtmlPath={previewablePath} activeJobId={effectiveScopeId} />
+          <PreviewTab
+            currentHtmlPath={previewablePath}
+            activeJobId={effectiveScopeId}
+            projectId={projectId}
+          />
         )}
         {activeTab === "files" && (
-          <FilesTab onSelectFile={handleUserSelectFile} activeJobId={effectiveScopeId} />
+          <FilesTab onSelectFile={handleUserSelectFile} activeJobId={effectiveScopeId} projectId={projectId} />
         )}
         {activeTab === "artifacts" && (
           <ArtifactsTab
@@ -420,6 +437,7 @@ export function ProjectWorkspacePanel({
             filePath={selectedFilePath}
             initialContent={draftContent}
             activeJobId={effectiveScopeId}
+            projectId={projectId}
             onSave={handleEditorSaved}
           />
         )}

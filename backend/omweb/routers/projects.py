@@ -25,7 +25,7 @@ Endpoints:
     - GET    /api/projects/{project_id}/audit-log
 """
 
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, UploadFile, File
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import os
@@ -324,6 +324,62 @@ async def update_project(project_id: str, req: ProjectUpdateRequest):
 # ==============================================================================
 # Workspace File Operations
 # ==============================================================================
+
+@router.post("/{project_id}/workspace/upload")
+async def upload_workspace_files(
+    project_id: str,
+    files: List[UploadFile] = File(...),
+):
+    """Persist user uploads directly into the project workspace.
+
+    The frontend composer routes uploads here when a projectId is
+    present. Files are written to the workspace root (the same
+    directory the agent writes to), so uploaded and generated files
+    live side by side and both are visible in the workspace panel.
+
+    The target directory comes from ``_get_project_workspace_path``,
+    which honours ``workspace_type`` and ``workspace_path``. An
+    external workspace therefore receives uploads at its configured
+    absolute path, exactly like the agent does.
+    """
+    from fastapi import UploadFile, File as FastAPIFile  # local alias
+
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No files provided for upload",
+        )
+
+    workspace_path = _get_project_workspace_path(project_id)
+    workspace_path.mkdir(parents=True, exist_ok=True)
+
+    uploaded: List[Dict[str, Any]] = []
+    for f in files:
+        raw_name = f.filename or "uploaded_attachment"
+        clean_name = Path(raw_name).name
+        if not clean_name:
+            continue
+        try:
+            content = await f.read()
+            target = workspace_path / clean_name
+            target.write_bytes(content)
+            uploaded.append({
+                "name": clean_name,
+                "path": str(target),
+                "size": len(content),
+            })
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to save '{clean_name}': {exc}",
+            )
+
+    return {
+        "status": "success",
+        "files": uploaded,
+        "total_count": len(uploaded),
+    }
+
 
 @router.get("/{project_id}/workspace/file", response_model=WorkspaceFileReadResponse)
 async def read_workspace_file(

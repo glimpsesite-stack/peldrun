@@ -584,6 +584,66 @@ class PeldrunEngine(ExecutionEngine):
         project_dir = context.project_dir
         chat_id = context.chat_id or f"chat_{job_id}"
 
+        # ── Resolve the effective workspace path from project metadata ──
+        #
+        # The engine MUST honour ``project.workspace_path``. The caller
+        # (dispatcher) sets ``context.project_dir`` before this method
+        # runs, but that value is derived from a chat-scoped or default
+        # internal path and does NOT reflect the project's configured
+        # workspace. Without this override, agent-generated files
+        # always land in the internal project directory regardless of
+        # ``workspace_type``, which defeats the entire external-workspace
+        # feature.
+        #
+        # Resolution rules:
+        #   * ``workspace_type == "external"`` and ``workspace_path`` set
+        #     → use that absolute path. The directory is created if it
+        #     does not exist so the first tool call never fails.
+        #   * Otherwise → fall back to the canonical internal path
+        #     ``storage/projects/{project_id}/workspace``. This matches
+        #     ``projects.py::_get_project_workspace_path`` exactly, so
+        #     the API and the engine agree on ONE location.
+        #
+        # The override is applied unconditionally: ``context.project_dir``
+        # is still used as a last-resort fallback if the project metadata
+        # lookup fails, preserving prior behaviour for legacy setups that
+        # have no project entry at all (default_project).
+        _engine_project_id = str(
+            (context.manifest or {}).get("project_id") or "default_project"
+        )
+        try:
+            from omweb.project_manager import project_manager as _pm
+            _project_meta = _pm.get_project(_engine_project_id) or {}
+        except Exception:
+            _project_meta = {}
+
+        _ws_type = (_project_meta.get("workspace_type") or "internal").lower()
+        _ws_configured = (_project_meta.get("workspace_path") or "").strip()
+
+        if _ws_type == "external" and _ws_configured:
+            _resolved_ws = Path(_ws_configured).expanduser()
+        elif _engine_project_id and _engine_project_id != "default_project":
+            _resolved_ws = (
+                Path(_pm.storage_dir) / "projects" / _engine_project_id / "workspace"
+            )
+        else:
+            # No project context — keep whatever the caller provided.
+            _resolved_ws = Path(project_dir)
+
+        try:
+            _resolved_ws.mkdir(parents=True, exist_ok=True)
+        except OSError as _ws_err:
+            logger.warning(
+                "[ENGINE PELDRUN] Could not create workspace %s for "
+                "project %s (falling back to project_dir): %s",
+                _resolved_ws,
+                _engine_project_id,
+                _ws_err,
+            )
+            _resolved_ws = Path(project_dir)
+
+        project_dir = _resolved_ws
+
         # Tool Output Streaming: read once at run start (see the helper's
         # docstring for why we do not read this per-event). When disabled,
         # TOOL_OUTPUT / TOOL_PROGRESS events are dropped at this layer even

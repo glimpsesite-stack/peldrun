@@ -12,6 +12,7 @@ Hardened under Phase M2 & Release Bug Fixes:
 """
 
 import base64
+import mimetypes
 import os
 import shutil
 import time
@@ -379,8 +380,17 @@ def resolve_temp_artifact_to_data_uri(file_id: str) -> Optional[str]:
 
 
 class FileContentPayload(BaseModel):
+    """Payload for POST /api/files/content.
+
+    ``project_id`` is optional. When provided, the target path is
+    resolved against the project workspace (external or internal),
+    which is required when the caller only knows the workspace-relative
+    path and the workspace lives outside ``storage/``. When absent,
+    the legacy resolution against ``PROJECT_ROOT`` is used.
+    """
     path: str
     content: str
+    project_id: Optional[str] = None
 
 
 def safe_resolve(target_path: str) -> Path:
@@ -392,11 +402,49 @@ def safe_resolve(target_path: str) -> Path:
     return target
 
 
-def find_file_in_storage(filename_or_rel: str) -> Optional[Path]:
-    """Search for deliverable file in workspace or storage hierarchy if not found in root."""
+def find_file_in_storage(
+    filename_or_rel: str,
+    project_id: Optional[str] = None,
+) -> Optional[Path]:
+    """Search for a deliverable file across the storage hierarchy.
+
+    When ``project_id`` is provided, the project's workspace directory
+    (which may be an external path) is searched FIRST. This is
+    required for external workspaces whose files live outside
+    ``storage/`` and therefore cannot be found by the generic walk
+    below. The lookup degrades gracefully when project metadata is
+    unavailable: it falls through to the legacy paths.
+
+    The root ``WORKSPACE_DIR`` check is retained as a last-resort
+    fallback for legacy chats that predate the project-scoped layout.
+    """
     clean = filename_or_rel.lstrip("/\\").replace("\\", "/")
 
-    # 1. Direct workspace check
+    # 0. Project-scoped workspace (external or internal) — checked
+    #    FIRST when project_id is known. External workspace files
+    #    live OUTSIDE storage/ and cannot be found by any of the
+    #    scans below, so this branch is the only way to serve them.
+    if project_id:
+        try:
+            ws_root = _resolve_project_workspace_root(project_id)
+            if ws_root is not None:
+                candidate = (ws_root / clean).resolve()
+                # Containment guard: a crafted relative path (e.g. "../x")
+                # or a symlink must never resolve outside the workspace.
+                # Without this, save_file_content step 1a could overwrite
+                # files one level up (e.g. the project's metadata JSON),
+                # because that step calls this helper directly and does
+                # NOT pass through safe_resolve's 403 gate.
+                try:
+                    candidate.relative_to(ws_root)
+                except ValueError:
+                    candidate = None
+                if candidate is not None and candidate.is_file():
+                    return candidate
+        except Exception:
+            pass
+
+    # 1. Direct workspace check (root, legacy)
     candidate = (WORKSPACE_DIR / clean).resolve()
     if candidate.is_file():
         return candidate
@@ -841,13 +889,26 @@ async def download_file(path: str = Query(...)):
 
 @router.get("/content/{filepath:path}")
 @router.get("/content")
-async def get_file_content(filepath: Optional[str] = None, path: Optional[str] = Query(None)):
+async def get_file_content(
+    filepath: Optional[str] = None,
+    path: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None, description="Project id for external workspace resolution"),
+):
     target_rel = filepath or path
     if not target_rel:
         raise HTTPException(status_code=400, detail="Missing file path")
+    # safe_resolve still runs first so traversal attempts are rejected
+    # with 403 before any lookup happens.
     target = safe_resolve(target_rel)
+    # Project workspace wins over PROJECT_ROOT: a stale legacy copy at
+    # PROJECT_ROOT/<path> (written by the pre-project save bug) must not
+    # shadow the real workspace file when project_id is known.
+    if project_id:
+        scoped = find_file_in_storage(target_rel, project_id=project_id)
+        if scoped and scoped.is_file():
+            target = scoped
     if not target.exists() or not target.is_file():
-        fallback = find_file_in_storage(target_rel)
+        fallback = find_file_in_storage(target_rel, project_id=project_id)
         if fallback and fallback.is_file():
             target = fallback
         else:
@@ -861,17 +922,83 @@ async def get_file_content(filepath: Optional[str] = None, path: Optional[str] =
 
 @router.post("/content")
 async def save_file_content(payload: FileContentPayload):
-    """Save or update file content in the project workspace."""
-    target = safe_resolve(payload.path)
-    if not target.parent.exists():
-        fallback = find_file_in_storage(payload.path)
-        if fallback:
-            target = fallback
+    """Save or update file content in a workspace.
+
+    Resolution order:
+
+    1. **Existing file in the project workspace** (when ``project_id``
+       is provided) — the file is written where it already lives,
+       which works for both internal and external workspaces.
+    2. **New file in the project workspace** — the file is created
+       inside ``<project_workspace>/<path>``. Internal workspaces
+       resolve to ``storage/projects/{id}/workspace/...``; external
+       workspaces resolve to ``<configured_path>/...``.
+    3. **Legacy fallback** — no ``project_id`` supplied, or project
+       resolution failed. Falls back to ``PROJECT_ROOT/<path>``,
+       matching the pre-project behavior.
+    """
+    target: Optional[Path] = None
+
+    # ── 1 & 2: Project-scoped resolution (preferred when project_id given) ──
+    if payload.project_id:
+        # 1a. Try to find an EXISTING file anywhere in the project's
+        #     workspace so we rewrite the same physical file.
+        existing = find_file_in_storage(payload.path, project_id=payload.project_id)
+        if existing is not None:
+            target = existing
         else:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            # 1b. New file — resolve the project workspace root.
+            try:
+                from omweb.project_manager import project_manager as _pm
+                _meta = _pm.get_project(payload.project_id) or {}
+                _ws_type = (_meta.get("workspace_type") or "internal").lower()
+                _ws_cfg = (_meta.get("workspace_path") or "").strip()
+
+                if _ws_type == "external" and _ws_cfg:
+                    _ws_root = Path(_ws_cfg).expanduser().resolve()
+                else:
+                    _ws_root = (
+                        Path(_pm.storage_dir) / "projects" / payload.project_id / "workspace"
+                    ).resolve()
+
+                # Defend against path traversal for the new-file path.
+                _candidate = (_ws_root / payload.path).resolve()
+                try:
+                    _candidate.relative_to(_ws_root)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Path traversal detected in payload.path",
+                    )
+                target = _candidate
+            except HTTPException:
+                raise
+            except Exception:
+                target = None
+
+    # ── 3: Legacy fallback ──
+    if target is None:
+        target = safe_resolve(payload.path)
+        if not target.parent.exists():
+            fallback = find_file_in_storage(payload.path)
+            if fallback:
+                target = fallback
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(payload.content, encoding="utf-8")
-        rel_path = str(target.relative_to(PROJECT_ROOT)).replace("\\", "/")
+
+        # Best-effort relative path for the response payload.
+        try:
+            rel_path = str(target.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        except ValueError:
+            # External workspace files live outside PROJECT_ROOT — return
+            # the absolute path as-is; the frontend only uses this for
+            # display and doesn't need it to be relative.
+            rel_path = str(target)
+
         _invalidate_artifacts_cache()
         return {
             "status": "success",
@@ -879,19 +1006,27 @@ async def save_file_content(payload: FileContentPayload):
             "path": rel_path,
             "size": target.stat().st_size,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save file: {str(e)}"
+        )
 
 
 @router.get("/raw/{filepath:path}")
 @router.get("/raw")
-async def get_raw_file(filepath: Optional[str] = None, path: Optional[str] = Query(None)):
+async def get_raw_file(
+    filepath: Optional[str] = None,
+    path: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None, description="Project id for external workspace resolution"),
+):
     target_rel = filepath or path
     if not target_rel:
         raise HTTPException(status_code=400, detail="Missing file path")
     target = safe_resolve(target_rel)
     if not target.exists() or not target.is_file():
-        fallback = find_file_in_storage(target_rel)
+        fallback = find_file_in_storage(target_rel, project_id=project_id)
         if fallback and fallback.is_file():
             target = fallback
         else:
@@ -921,6 +1056,139 @@ async def get_raw_file(filepath: Optional[str] = None, path: Optional[str] = Que
         media_type = "application/pdf"
 
     return FileResponse(path=str(target), media_type=media_type)
+
+
+def _resolve_project_workspace_root(project_id: str) -> Optional[Path]:
+    """Resolve the workspace root for a project (external or internal).
+
+    Returns ``None`` when project metadata cannot be read, so callers
+    can respond with a clean 404 instead of a 500.
+    """
+    try:
+        from omweb.project_manager import project_manager as _pm
+        meta = _pm.get_project(project_id) or {}
+        ws_type = (meta.get("workspace_type") or "internal").lower()
+        ws_cfg = (meta.get("workspace_path") or "").strip()
+        if ws_type == "external" and ws_cfg:
+            return Path(ws_cfg).expanduser().resolve()
+        return (
+            Path(_pm.storage_dir) / "projects" / project_id / "workspace"
+        ).resolve()
+    except Exception:
+        return None
+
+
+@router.get("/raw-project/{project_id}/{filepath:path}")
+async def get_project_raw_file(project_id: str, filepath: str):
+    """Serve a project workspace file with the project id IN THE PATH.
+
+    Why not ``/raw?project_id=...``? The HTML preview injects a
+    ``<base href>`` pointing at the deliverable's directory so relative
+    assets (CSS, JS, images, ``url(...)`` inside CSS, ``fetch()`` inside
+    scripts) resolve against the workspace. Browsers DROP the base
+    URL's query string when resolving relative references, so a
+    query-based project scope would be lost on every nested asset.
+    Keeping the project id in the path preserves both the scope and
+    correct directory semantics for every subresource — including
+    multi-page navigation (``<a href="page2.html">``) inside the iframe.
+    """
+    # Reject path-like project ids (separator / traversal injection).
+    if not project_id or "/" in project_id or "\\" in project_id or ".." in project_id:
+        raise HTTPException(status_code=400, detail="Invalid project id")
+
+    ws_root = _resolve_project_workspace_root(project_id)
+    if ws_root is None:
+        raise HTTPException(status_code=404, detail="Project workspace not found")
+
+    # Normalize the incoming path to a workspace-relative form.
+    #
+    # Callers reach this route with three different path shapes:
+    #   1. "my site/index.html"                          (Workspace API,
+    #      artifact events, Files tab clicks)
+    #   2. "storage/projects/<id>/workspace/my site/..."  (the /api/files
+    #      artifact walk, job listings, and session artifacts hydrated
+    #      after a page reload)
+    #   3. an absolute path that already lives inside the workspace
+    #
+    # Shape 2 is what broke the preview after F5: the HTML itself still
+    # loads through /api/files/content's legacy safe_resolve fallback,
+    # but every relative CSS/JS asset resolves against a <base href>
+    # carrying the storage prefix, so a strict join 404s on all of them.
+    clean = (filepath or "").replace("\\", "/").lstrip("/")
+
+    # Absolute path pointing inside this workspace -> make it relative.
+    try:
+        _abs = Path(clean)
+        if _abs.is_absolute():
+            clean = str(_abs.resolve().relative_to(ws_root)).replace("\\", "/")
+    except (ValueError, OSError):
+        pass
+
+    # Strip the storage-relative prefixes emitted by the artifact walk.
+    for _prefix in (
+        f"storage/projects/{project_id}/workspace/",
+        f"projects/{project_id}/workspace/",
+    ):
+        if clean.lower().startswith(_prefix.lower()):
+            clean = clean[len(_prefix):]
+            break
+
+    def _contained(candidate: Path) -> Optional[Path]:
+        """Resolve a candidate and reject anything outside the workspace."""
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(ws_root)
+        except ValueError:
+            return None
+        return resolved
+
+    target = _contained(ws_root / clean)
+    if target is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path outside project workspace",
+        )
+
+    # Longest-suffix fallback. When the exact join misses (unknown
+    # prefix, doubled segment, legacy chat-relative path), find the
+    # longest tail of the requested path that exists inside the
+    # workspace. Every candidate is containment-checked, so this can
+    # never escape the workspace and never follows a symlink out of it.
+    if not target.is_file():
+        segments = [s for s in clean.split("/") if s]
+        for index in range(1, len(segments)):
+            candidate = _contained(ws_root / "/".join(segments[index:]))
+            if candidate is not None and candidate.is_file():
+                target = candidate
+                break
+
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    ext = target.suffix.lower()
+    media_type, _ = mimetypes.guess_type(target.name)
+    # Pin the web-critical types so previews behave identically across
+    # platforms (mimetypes reads the OS registry on Windows).
+    if ext in (".html", ".htm"):
+        media_type = "text/html"
+    elif ext == ".css":
+        media_type = "text/css"
+    elif ext == ".js":
+        media_type = "application/javascript"
+    elif ext == ".svg":
+        media_type = "image/svg+xml"
+    elif ext == ".webp":
+        media_type = "image/webp"
+    elif ext == ".mjs":
+        media_type = "application/javascript"
+    elif ext == ".json":
+        media_type = "application/json"
+    elif ext == ".wasm":
+        media_type = "application/wasm"
+    return FileResponse(
+        path=str(target),
+        media_type=media_type or "application/octet-stream",
+    )
 
 
 @router.delete("")

@@ -1,6 +1,7 @@
-﻿"use client";
+﻿// frontend/src/components/workspace/preview-tab.tsx
+"use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Code, RefreshCw, ExternalLink, Code2, Sparkles, FileText, Image as ImageIcon, AlignLeft } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { Icon } from '@/components/Icon/Icon';
@@ -11,6 +12,14 @@ export interface PreviewTabProps {
   currentHtmlPath?: string | null;
   filePath?: string | null;
   overrideFile?: string | null;
+  /**
+   * When provided, content reads and raw asset URLs target the
+   * project's workspace (external or internal) instead of the chat
+   * session's directory. Required for correct previews inside
+   * `ProjectWorkspacePanel` — the agent writes deliverables to the
+   * project workspace, and the preview must read from the same place.
+   */
+  projectId?: string | null;
 }
 
 export function PreviewTab({
@@ -19,11 +28,46 @@ export function PreviewTab({
   currentHtmlPath,
   filePath,
   overrideFile,
+  projectId,
 }: PreviewTabProps) {
   const effectiveJobId = jobId || activeJobId || null;
+  // Monotonic request counter. Polling + refresh events can overlap
+  // fetches; only the newest response is allowed to touch state.
+  const fetchSeqRef = useRef(0);
   const [autoFile, setAutoFile] = useState<string | null>(null);
   const explicitFile = overrideFile || currentHtmlPath || filePath || null;
   const effectiveFile = explicitFile || autoFile;
+
+  // Normalize the selected path to a workspace-relative form.
+  //
+  // Two different shapes reach this component:
+  //   * "my site/index.html" — artifact events and Files tab clicks,
+  //     which come from the Workspace API listing.
+  //   * "storage/projects/<id>/workspace/my site/index.html" — the
+  //     selection hydrated after a page reload, which comes from the
+  //     /api/files artifact walk and the job listings.
+  //
+  // Deriving <base href> from the second shape produced asset URLs the
+  // workspace root could not resolve, so CSS/JS silently dropped out of
+  // the preview after F5 while a Files tab click restored them. Every
+  // project-scoped read and URL below uses this normalized value, so
+  // both entry points are byte-identical.
+  const workspaceFile = useMemo(() => {
+    if (!effectiveFile) return null;
+    const clean = effectiveFile.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!projectId) return clean;
+    const prefixes = [
+      `storage/projects/${projectId}/workspace/`,
+      `projects/${projectId}/workspace/`,
+    ];
+    const lower = clean.toLowerCase();
+    for (const prefix of prefixes) {
+      if (lower.startsWith(prefix.toLowerCase())) {
+        return clean.slice(prefix.length);
+      }
+    }
+    return clean;
+  }, [effectiveFile, projectId]);
 
   const [rawContent, setRawContent] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(false);
@@ -70,7 +114,7 @@ useEffect(() => {
   }, [effectiveFile, isHtml]);
 
   const scanForPreviewableDeliverables = useCallback(() => {
-    if (effectiveJobId && !explicitFile) {
+    if (!projectId && effectiveJobId && !explicitFile) {
       fetch(`/api/run/jobs/${effectiveJobId}/files?t=${Date.now()}`, { cache: "no-store" })
         .then((res) => (res.ok ? res.json() : null))
         .then((data) => {
@@ -101,7 +145,7 @@ useEffect(() => {
         })
         .catch(() => {});
     }
-  }, [effectiveJobId, explicitFile, autoFile]);
+  }, [projectId, effectiveJobId, explicitFile, autoFile]);
 
   useEffect(() => {
     scanForPreviewableDeliverables();
@@ -111,55 +155,106 @@ useEffect(() => {
 
   const fetchContent = useCallback(async () => {
     // Strictly prevent binary image files from being fetched as text
-    if (!effectiveFile || !isPreviewable) {
+    if (!workspaceFile || !isPreviewable) {
+      // Invalidate any in-flight fetch so it cannot repopulate content
+      // after we switched to a non-previewable file.
+      fetchSeqRef.current++;
       setRawContent("");
       return;
     }
-
+    const seq = ++fetchSeqRef.current;
     setLoading(true);
     try {
       let res: Response | null = null;
+
+      // ── 1. Project-scoped read (preferred when projectId is set) ──
+      // Same endpoint the EditorTab reads from, so preview and editor
+      // always show the exact same bytes the agent wrote. The path is
+      // workspace-relative, so this now succeeds on a cold reload too
+      // instead of falling through to the generic endpoint.
+      if (projectId) {
+        try {
+          const projectRes = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/workspace/file?path=${encodeURIComponent(workspaceFile)}&t=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (projectRes.ok) {
+            const data = await projectRes.json();
+            if (seq === fetchSeqRef.current) {
+              setRawContent(data.content || "");
+            }
+            return;
+          }
+        } catch {
+          /* fall through to chat-scoped / generic */
+        }
+      }
+
+      // ── 2. Chat-scoped read (legacy chats) ──
       if (effectiveJobId) {
-        res = await fetch(`/api/run/jobs/${effectiveJobId}/content?path=${encodeURIComponent(effectiveFile)}&t=${Date.now()}`, {
-          cache: "no-store",
-        });
+        try {
+          const chatRes = await fetch(
+            `/api/run/jobs/${effectiveJobId}/content?path=${encodeURIComponent(workspaceFile)}&t=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (chatRes.ok) res = chatRes;
+        } catch {
+          /* fall through */
+        }
       }
 
+      // ── 3. Generic files endpoint (project_id keeps resolution correct) ──
       if (!res || !res.ok) {
-        res = await fetch(`/api/files/content?path=${encodeURIComponent(effectiveFile)}&t=${Date.now()}`, {
-          cache: "no-store",
-        });
+        const query = projectId
+          ? `&project_id=${encodeURIComponent(projectId)}`
+          : "";
+        res = await fetch(
+          `/api/files/content?path=${encodeURIComponent(workspaceFile)}${query}&t=${Date.now()}`,
+          { cache: "no-store" }
+        );
       }
 
+      if (seq !== fetchSeqRef.current) return; // superseded by a newer fetch
       if (res && res.ok) {
         const data = await res.json();
-        setRawContent(data.content || "");
+        if (seq === fetchSeqRef.current) {
+          setRawContent(data.content || "");
+        }
       } else {
         setRawContent("");
       }
     } catch (e) {
-      console.error("Failed to load preview content", e);
-      setRawContent("");
+      if (seq === fetchSeqRef.current) {
+        console.error("Failed to load preview content", e);
+        setRawContent("");
+      }
     } finally {
-      setLoading(false);
+      if (seq === fetchSeqRef.current) setLoading(false);
     }
-  }, [effectiveFile, effectiveJobId, isPreviewable, refreshKey]);
+  }, [workspaceFile, effectiveJobId, projectId, isPreviewable, refreshKey]);
 
   useEffect(() => {
     fetchContent();
   }, [fetchContent]);
 
   const sandboxedHtml = useMemo(() => {
-    if (!rawContent || !isHtml || !effectiveFile) return "";
-
-    // Dynamically scope base href to the deliverable's parent folder (e.g., "my site/")
-    const fileDir = effectiveFile.includes("/")
-      ? effectiveFile.substring(0, effectiveFile.lastIndexOf("/") + 1)
+    if (!rawContent || !isHtml || !workspaceFile) return "";
+    // Scope base href to the deliverable's parent folder inside the
+    // workspace (e.g. "my site/"). workspaceFile is already normalized,
+    // so a storage-prefixed selection hydrated after a page reload
+    // yields exactly the same base as a Files tab click.
+    const fileDir = workspaceFile.includes("/")
+      ? workspaceFile.substring(0, workspaceFile.lastIndexOf("/") + 1)
       : "";
     const encodedDir = fileDir ? encodeURI(fileDir) : "";
-    const baseHref = effectiveJobId
-      ? `/api/run/jobs/${effectiveJobId}/raw/${encodedDir}`
-      : `/api/files/raw/${encodedDir}`;
+    // Project scope MUST live in the path (not a query param): browsers
+    // drop the base URL's query string when resolving relative
+    // subresources, which would break every CSS/JS/image reference.
+    const baseHref = projectId
+      ? `/api/files/raw-project/${encodeURIComponent(projectId)}/${encodedDir}`
+      : effectiveJobId
+        ? `/api/run/jobs/${effectiveJobId}/raw/${encodedDir}`
+        : `/api/files/raw/${encodedDir}`;
     const baseTag = `<base href="${baseHref}">`;
 
     // Cache-bust relative CSS and JS assets so modifications reload live in the iframe
@@ -183,7 +278,7 @@ useEffect(() => {
       return processed.replace("<head>", `<head>${baseTag}`);
     }
     return `${baseTag}${processed}`;
-  }, [rawContent, isHtml, effectiveFile, effectiveJobId, refreshKey]);
+  }, [rawContent, isHtml, workspaceFile, effectiveJobId, projectId, refreshKey]);
 
   if (!effectiveFile || !isPreviewable || !rawContent) {
     return (
@@ -210,9 +305,11 @@ useEffect(() => {
     );
   }
 
-  const rawUrl = effectiveJobId
-    ? `/api/run/jobs/${effectiveJobId}/raw/${encodeURI(effectiveFile)}`
-    : `/api/files/raw/${encodeURI(effectiveFile)}`;
+  const rawUrl = projectId
+    ? `/api/files/raw-project/${encodeURIComponent(projectId)}/${encodeURI(workspaceFile || "")}`
+    : effectiveJobId
+      ? `/api/run/jobs/${effectiveJobId}/raw/${encodeURI(effectiveFile || "")}`
+      : `/api/files/raw/${encodeURI(effectiveFile || "")}`;
 
   const renderBadge = () => {
     if (isHtml) return <span className="iconname-html">
@@ -305,7 +402,7 @@ useEffect(() => {
         {isHtml && (
           <div className="w-full h-full bg-white relative overflow-hidden">
             <iframe
-              key={`${effectiveJobId}-${effectiveFile}-${refreshKey}`}
+              key={`${projectId || effectiveJobId}-${workspaceFile}-${refreshKey}`}
               title="Sandbox Preview"
               srcDoc={sandboxedHtml}
               sandbox="allow-scripts allow-modals allow-forms allow-same-origin"

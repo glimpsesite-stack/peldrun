@@ -81,6 +81,7 @@ import type {
   UsageMetrics,
   ChildRunState,
   DelegationApprovalRequest,
+  ProducedFile,
 } from "./types";
 import { formatFileSize, groupStepEvents } from "./utils";
 import { useMetadataVault } from "./hooks/use-metadata-vault";
@@ -91,6 +92,78 @@ import type { McpAuthRequiredPayload } from "./hooks/use-sse-stream";
 import { useJobDetails } from "./hooks/use-job-details";
 import { MCPAuthModal } from "@/components/chat/mcp-auth/MCPAuthModal";
 import { showToast } from "@/components/ui/ToastNotification";
+
+function normalizeDeliverableRecords(input: any): ProducedFile[] {
+  const rows: any[] = Array.isArray(input)
+    ? input
+    : Array.isArray(input?.files)
+      ? input.files
+      : Array.isArray(input?.produced_files)
+        ? input.produced_files
+        : Array.isArray(input?.producedFiles)
+          ? input.producedFiles
+          : Array.isArray(input?.artifacts)
+            ? input.artifacts
+            : Array.isArray(input?.deliverables)
+              ? input.deliverables
+              : [];
+
+  const seen = new Set<string>();
+  const out: ProducedFile[] = [];
+  for (const entry of rows) {
+    const rawPath =
+      typeof entry === "string"
+        ? entry
+        : entry?.path ||
+          entry?.relative_path ||
+          entry?.rel_root ||
+          entry?.name ||
+          entry?.filename ||
+          "";
+    if (!rawPath || typeof rawPath !== "string") continue;
+    const cleanPath = rawPath.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!cleanPath) continue;
+    if (cleanPath.split("/").some((seg) => seg.startsWith("."))) continue;
+    if (seen.has(cleanPath)) continue;
+    seen.add(cleanPath);
+    out.push({ name: cleanPath.split("/").pop() || cleanPath, path: cleanPath });
+  }
+  return out;
+}
+
+function extractSessionDeliverables(payload: any): ProducedFile[] {
+  const session = payload?.chat || payload?.session || payload || {};
+  const turns = Array.isArray(session?.turns)
+    ? session.turns
+    : Array.isArray(payload?.turns)
+      ? payload.turns
+      : [];
+  const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  const fromTurn = normalizeDeliverableRecords(
+    lastTurn?.produced_files ??
+      lastTurn?.producedFiles ??
+      lastTurn?.deliverables ??
+      lastTurn?.artifacts ??
+      lastTurn?.files ??
+      []
+  );
+  if (fromTurn.length > 0) return fromTurn;
+  return normalizeDeliverableRecords(session);
+}
+
+function mergeDeliverableLists(...lists: ProducedFile[][]): ProducedFile[] {
+  const seen = new Set<string>();
+  const out: ProducedFile[] = [];
+  for (const list of lists) {
+    for (const file of list || []) {
+      const key = file?.path || file?.name;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(file);
+    }
+  }
+  return out;
+}
 
 export type { ChatContainerProps };
 
@@ -334,6 +407,178 @@ export function ChatContainer({
   const [elapsedSeconds, setElapsedSeconds] = useElapsedTimer(status as any);
   const { producedFiles, setProducedFiles, fetchJobFiles } = useJobFiles();
 
+  // Project-scoped deliverables captured from artifact events.
+  //
+  // useJobFiles polls /api/run/jobs/{jobId}/files, which lists the
+  // per-chat session directory. In project mode the agent writes into
+  // the project workspace instead, so that listing comes back empty and
+  // the "Task Deliverables & Output Files" card never renders. Artifact
+  // events carry the exact workspace-relative path of every generated
+  // file, so accumulating them restores the card with correct per-run
+  // semantics: only this run's output, never the whole workspace.
+  const [projectDeliverables, setProjectDeliverables] =
+    useState<ProducedFile[]>([]);
+
+  // Reset the accumulator whenever a different run becomes active, so
+  // each turn's card shows only its own output. Artifact events arrive
+  // over SSE, which is connected AFTER activeJobId is set, so this
+  // always runs before the first event of a new run.
+  useEffect(() => {
+    // Only clear when a run is actually active. On F5 the job id
+    // transitions null -> resolved while status is still idle/completed;
+    // clearing there would wipe the list restored from storage before it
+    // ever renders. A real new run always sets an active status first.
+    if (
+      status === "running" ||
+      status === "pending" ||
+      status === "queued" ||
+      status === "starting" ||
+      status === "retrying"
+    ) {
+      setProjectDeliverables([]);
+    }
+  }, [activeJobId, status]);
+
+  // Per-run storage key. Survives F5 in the same tab; the backend
+  // hydration below covers a fresh tab or cleared storage.
+  const deliverableStorageKey = useMemo(() => {
+    if (!projectId) return null;
+    const scope = activeJobId || activeChatId;
+    return scope ? `peldrun:project-deliverables:${projectId}:${scope}` : null;
+  }, [projectId, activeJobId, activeChatId]);
+
+  useEffect(() => {
+    if (!deliverableStorageKey || typeof window === "undefined") return;
+    if (status === "running" || status === "cancelling") return;
+    try {
+      const raw = window.sessionStorage.getItem(deliverableStorageKey);
+      if (!raw) return;
+      const restored = normalizeDeliverableRecords(JSON.parse(raw));
+      if (restored.length > 0) {
+        setProjectDeliverables((prev) => mergeDeliverableLists(prev, restored));
+      }
+    } catch {
+      // Corrupt storage is non-fatal; backend hydration still runs.
+    }
+  }, [deliverableStorageKey, status]);
+
+  // Merge chat-scoped and project-scoped deliverables, de-duplicated by
+  // path. Legacy chats return `producedFiles` untouched (zero behavior
+  // change); projects fall back to the event-derived list whenever the
+  // job-files listing is empty.
+  const effectiveProducedFiles = useMemo(() => {
+    if (!projectId || projectDeliverables.length === 0) return producedFiles;
+    const seen = new Set(producedFiles.map((f) => f.path || f.name));
+    const merged = [...producedFiles];
+    for (const f of projectDeliverables) {
+      const key = f.path || f.name;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(f);
+    }
+    return merged;
+  }, [projectId, producedFiles, projectDeliverables]);
+
+  // Persist the merged list so a same-tab refresh restores the card
+  // instantly, without waiting for any network round-trip.
+  useEffect(() => {
+    if (!deliverableStorageKey || typeof window === "undefined") return;
+    try {
+      if (effectiveProducedFiles.length > 0) {
+        window.sessionStorage.setItem(
+          deliverableStorageKey,
+          JSON.stringify(effectiveProducedFiles)
+        );
+      } else {
+        window.sessionStorage.removeItem(deliverableStorageKey);
+      }
+    } catch {
+      // Best-effort; the card still renders from live state.
+    }
+  }, [deliverableStorageKey, effectiveProducedFiles]);
+
+  // Backend hydration for a fresh tab / cleared storage. Tries the
+  // persisted session first (per-turn semantics), then project artifacts
+  // scoped to this session, and only as a last resort the workspace
+  // listing. Skips entirely while a run is active or when the list is
+  // already populated, so it never fights the live capture.
+  useEffect(() => {
+    if (!projectId || (!activeChatId && !activeJobId)) return;
+    if (status === "running" || status === "cancelling") return;
+    if (effectiveProducedFiles.length > 0) return;
+    if (!finalResult && steps.length === 0 && historyTurns.length === 0) return;
+
+    let cancelled = false;
+    const scope = activeChatId || activeJobId || "";
+
+    const hydrate = async () => {
+      let collected: ProducedFile[] = [];
+
+      if (activeChatId) {
+        try {
+          const res = await fetch(`/api/chats/${encodeURIComponent(activeChatId)}`, { cache: "no-store" });
+          if (res.ok) collected = mergeDeliverableLists(collected, extractSessionDeliverables(await res.json()));
+        } catch { /* fall through */ }
+      }
+
+      if (collected.length === 0 && activeJobId) {
+        try {
+          const res = await fetch(`/api/run/jobs/${encodeURIComponent(activeJobId)}`, { cache: "no-store" });
+          if (res.ok) collected = mergeDeliverableLists(collected, extractSessionDeliverables(await res.json()));
+        } catch { /* fall through */ }
+      }
+
+      if (collected.length === 0) {
+        try {
+          const res = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/artifacts?session_id=${encodeURIComponent(scope)}`,
+            { cache: "no-store" }
+          );
+          if (res.ok) {
+            const data = await res.json();
+            const rows = Array.isArray(data) ? data : data?.artifacts || data?.files || [];
+            const scoped = Array.isArray(rows)
+              ? rows.filter((r: any) => {
+                  const sid = r?.session_id || r?.chat_id;
+                  const jid = r?.job_id;
+                  if (sid && sid !== activeChatId && sid !== activeJobId) return false;
+                  if (jid && activeJobId && jid !== activeJobId) return false;
+                  return true;
+                })
+              : [];
+            collected = mergeDeliverableLists(collected, normalizeDeliverableRecords(scoped));
+          }
+        } catch { /* fall through */ }
+      }
+
+      if (collected.length === 0) {
+        try {
+          const res = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/workspace/files?path=&t=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (res.ok) collected = normalizeDeliverableRecords(await res.json());
+        } catch { /* no recoverable deliverables */ }
+      }
+
+      if (!cancelled && collected.length > 0) {
+        setProjectDeliverables((prev) => mergeDeliverableLists(prev, collected));
+      }
+    };
+
+    hydrate();
+    return () => { cancelled = true; };
+  }, [
+    projectId,
+    activeChatId,
+    activeJobId,
+    status,
+    finalResult,
+    steps.length,
+    historyTurns.length,
+    effectiveProducedFiles.length,
+  ]);
+
   // Master switch from the settings store. When this is false, the
   // entire Source Control subsystem is treated as opt-in and none
   // of its UI is rendered. See `source-control-settings-store.ts`
@@ -513,27 +758,60 @@ export function ChatContainer({
       const ce = e as CustomEvent<{
         artifact?: string;
         path?: string;
+        relative_path?: string;
         file?: string;
       }>;
-      const artName = ce.detail?.path || ce.detail?.file || ce.detail?.artifact;
+      const artName =
+        ce.detail?.relative_path ||
+        ce.detail?.path ||
+        ce.detail?.file ||
+        ce.detail?.artifact;
       if (artName) {
         const cat = getFileCategory(artName);
         if (cat === "preview" || cat === "artifacts") {
           setSelectedFileForEditor(artName);
         }
       }
+      // Project mode: record the deliverable so the output-files card
+      // renders even though the chat-scoped job listing is empty.
+      if (artName && projectId) {
+        const cleanPath = artName.replace(/\\/g, "/").replace(/^\/+/, "");
+        // Skip workspace internals (.git objects, caches, dotfiles) —
+        // mirrors the filter ChatDeliverable applies when rendering.
+        const isInternal = cleanPath
+          .split("/")
+          .some((seg) => seg.startsWith("."));
+        if (cleanPath && !isInternal) {
+          setProjectDeliverables((prev) =>
+            prev.some((f) => f.path === cleanPath)
+              ? prev
+              : [
+                  ...prev,
+                  {
+                    name: cleanPath.split("/").pop() || cleanPath,
+                    path: cleanPath,
+                  },
+                ]
+          );
+        }
+      }
       setShowRightPanel(true);
     };
     window.addEventListener("peldrun:artifact-created", handleArtifactEvent);
+    window.addEventListener("peldrun:artifact-updated", handleArtifactEvent);
     window.addEventListener("peldrun:open-in-sandbox", handleSandboxEvent);
     return () => {
       window.removeEventListener(
         "peldrun:artifact-created",
         handleArtifactEvent
       );
+      window.removeEventListener(
+        "peldrun:artifact-updated",
+        handleArtifactEvent
+      );
       window.removeEventListener("peldrun:open-in-sandbox", handleSandboxEvent);
     };
-  }, [setShowRightPanel]);
+  }, [setShowRightPanel, projectId]);
 
   // Hydration entry point for the chat container.
   //
@@ -1254,7 +1532,7 @@ export function ChatContainer({
             finalResult,
             status: status === "failed" ? "failed" : "completed",
             tokensUsed: { ...tokensUsed },
-            producedFiles: [...producedFiles],
+            producedFiles: [...effectiveProducedFiles],
             attachedFiles: [...submittedFiles],
             // ChatTurn.model is typed `string | undefined`. Coerce
             // `null` (unselected) to `undefined` so the shape matches
@@ -1437,6 +1715,7 @@ export function ChatContainer({
       sessionTimestamp,
       tokensUsed,
       producedFiles,
+      effectiveProducedFiles,
       submittedFiles,
       currentUsageMetrics,
       elapsedSeconds,
@@ -1892,7 +2171,7 @@ export function ChatContainer({
             status={threadStatus}
             elapsedSeconds={elapsedSeconds}
             finalResult={finalResult}
-            producedFiles={producedFiles}
+            producedFiles={effectiveProducedFiles}
             copiedSection={copiedSection}
             copyText={copyText}
             expandedSteps={expandedSteps}

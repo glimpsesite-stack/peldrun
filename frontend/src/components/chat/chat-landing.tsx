@@ -143,12 +143,19 @@ interface UploadWorkspaceResponse {
 async function uploadFileToWorkspace(
   file: File,
   chatId: string,
+  projectId?: string | null,
 ): Promise<{ name: string; path: string }> {
   const formData = new FormData();
   formData.append("files", file);
   formData.append("chat_id", chatId);
-
-  const res = await fetch("/api/files/upload", {
+  // Project-scoped chats upload into the persistent project workspace
+  // so the agent's file tools and the dispatcher's context_refs
+  // resolver can see the file. Legacy chats keep the per-chat upload.
+  // Mirrors the routing ChatContainer.handleStartTask already uses.
+  const endpoint = projectId
+    ? `/api/projects/${encodeURIComponent(projectId)}/workspace/upload`
+    : "/api/files/upload";
+  const res = await fetch(endpoint, {
     method: "POST",
     body: formData,
   });
@@ -204,6 +211,13 @@ interface SkillMeta {
 }
 
 interface ChatLandingProps {
+  /**
+   * Project scope for this landing session, when the chat belongs to
+   * a project. Routes non-image uploads into the project workspace
+   * (persistent, agent-visible) instead of the per-chat directory.
+   * Images are scope-agnostic (temp artifact store) and unaffected.
+   */
+  projectId?: string | null;
   inputValue: string;
   setInputValue: (val: string) => void;
   execMode: "agent" | "chat";
@@ -215,6 +229,7 @@ interface ChatLandingProps {
 }
 
 export function ChatLanding({
+  projectId,
   inputValue,
   setInputValue,
   execMode,
@@ -638,10 +653,11 @@ export function ChatLanding({
           const refId = ref.id;
           void (async () => {
             try {
-              const uploaded = await uploadFileToWorkspace(
-                file,
-                landingChatId
-              );
+                const uploaded = await uploadFileToWorkspace(
+                  file,
+                  landingChatId,
+                  projectId
+                );
               setUploadedFileRefs((prev) =>
                 prev.map((current) =>
                   current.id === refId
@@ -739,7 +755,7 @@ export function ChatLanding({
         })();
       });
     },
-    [landingChatId]
+    [landingChatId, projectId]
   );
 
   const handleLandingFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {

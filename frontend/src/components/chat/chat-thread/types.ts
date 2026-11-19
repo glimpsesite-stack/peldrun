@@ -115,6 +115,13 @@ export interface ChatTurn {
 export interface ChatThreadProps {
   historyTurns: ChatTurn[];
   chatId?: string;
+  /**
+   * Project scope for this conversation, when the chat belongs to a
+   * project. Forwarded to HistoricalTurn and ChatDeliverable so media
+   * thumbnails resolve against the project workspace instead of the
+   * chat session folder.
+   */
+  projectId?: string | null;
   submittedPrompt: string;
   submittedFiles?: AttachedUserFile[];
   sessionTimestamp: string;

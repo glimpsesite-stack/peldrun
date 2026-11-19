@@ -9,6 +9,15 @@ export interface EditorTabProps {
   filePath?: string | null;
   initialContent?: string | null;
   activeJobId?: string | null;
+  /**
+   * When provided, file reads and writes target the project's
+   * workspace (external or internal), not the chat session's
+   * directory. This is required for the Editor to work correctly
+   * inside `ProjectWorkspacePanel` — the agent writes deliverables
+   * to the project workspace, and the editor must read/write from
+   * the same location.
+   */
+  projectId?: string | null;
   onSave?: (filePath: string, content: string) => void;
 }
 
@@ -38,8 +47,13 @@ const extToLangMap: Record<string, string> = {
   txt: "text",
 };
 
-export function EditorTab({ filePath, initialContent, activeJobId, onSave }: EditorTabProps) {
+export function EditorTab({ filePath, initialContent, activeJobId, projectId, onSave }: EditorTabProps) {
   const [content, setContent] = useState<string>(initialContent || "");
+  // SHA-256 version hash returned by the project workspace endpoint.
+  // Used for Optimistic Concurrency Control (OCC) on save — if the
+  // file changed since we last read it, the PUT is rejected with 409
+  // instead of silently overwriting another writer's changes.
+  const [version, setVersion] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -64,39 +78,86 @@ export function EditorTab({ filePath, initialContent, activeJobId, onSave }: Edi
       return;
     }
 
+    let cancelled = false;
+
     const loadFile = async () => {
       setLoading(true);
       setStatusMsg(null);
+      setVersion("");
       try {
         let res: Response | null = null;
-        // 1. FIRST PRIORITY: Always load directly from active chat session files
-        if (activeJobId) {
-          res = await fetch(`/api/run/jobs/${activeJobId}/content?path=${encodeURIComponent(filePath)}&t=${Date.now()}`, {
-            cache: "no-store",
-          });
+
+        // ── 1. Project-scoped read (preferred when projectId is set) ──
+        //
+        // Files inside a project live in the project workspace, not
+        // the chat-scoped directory. Reading from the project endpoint
+        // guarantees we always see the file the agent wrote, and it
+        // returns a `version` hash that the save handler uses for OCC.
+        if (projectId) {
+          try {
+            const projectRes = await fetch(
+              `/api/projects/${encodeURIComponent(projectId)}/workspace/file?path=${encodeURIComponent(filePath)}&t=${Date.now()}`,
+              { cache: "no-store" }
+            );
+            if (projectRes.ok) {
+              const data = await projectRes.json();
+              if (!cancelled) {
+                setContent(data.content || "");
+                setVersion(data.version || "");
+                setLoading(false);
+              }
+              return;
+            }
+          } catch {
+            /* fall through to chat-scoped / generic */
+          }
         }
-        // 2. FALLBACK ONLY: If not in active job context, fallback to generic files
+
+        // ── 2. Chat-scoped read (legacy chats) ──
+        if (activeJobId) {
+          try {
+            const chatRes = await fetch(
+              `/api/run/jobs/${activeJobId}/content?path=${encodeURIComponent(filePath)}&t=${Date.now()}`,
+              { cache: "no-store" }
+            );
+            if (chatRes.ok) res = chatRes;
+          } catch {
+            /* fall through */
+          }
+        }
+
+        // ── 3. Generic files endpoint (with project_id for correct resolution) ──
         if (!res || !res.ok) {
-          res = await fetch(`/api/files/content?path=${encodeURIComponent(filePath)}&t=${Date.now()}`, {
-            cache: "no-store",
-          });
+          const query = projectId
+            ? `&project_id=${encodeURIComponent(projectId)}`
+            : "";
+          res = await fetch(
+            `/api/files/content?path=${encodeURIComponent(filePath)}${query}&t=${Date.now()}`,
+            { cache: "no-store" }
+          );
         }
 
         if (res && res.ok) {
           const data = await res.json();
-          setContent(data.content || "");
-        } else {
+          if (!cancelled) {
+            setContent(data.content || "");
+            setVersion(data.version || "");
+          }
+        } else if (!cancelled) {
           setContent("// Error loading file or binary file.");
         }
       } catch {
-        setContent("// Failed to fetch file content.");
+        if (!cancelled) setContent("// Failed to fetch file content.");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
     loadFile();
-  }, [filePath, initialContent, activeJobId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [filePath, initialContent, activeJobId, projectId]);
 
   const handleScroll = (e: React.UIEvent<HTMLTextAreaElement>) => {
     const target = e.currentTarget;
@@ -152,41 +213,89 @@ export function EditorTab({ filePath, initialContent, activeJobId, onSave }: Edi
     setSaving(true);
     setStatusMsg(null);
     try {
-      let res: Response;
-      if (activeJobId) {
-        // Direct save into active chat session folder
-        res = await fetch(`/api/run/jobs/${activeJobId}/content`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            path: filePath,
-            content,
-          }),
-        });
-      } else {
+      let res: Response | null = null;
+
+      // ── 1. Project-scoped PUT (OCC-based) ──
+      //
+      // Uses the version hash captured at read time. If the file was
+      // modified by the agent between our read and this save, the
+      // backend rejects with 409 and we surface the conflict instead
+      // of silently overwriting. This is the only path that preserves
+      // concurrent edits — the POST fallbacks below always overwrite.
+      if (projectId && version) {
+        try {
+          const projectRes = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/workspace/file`,
+            {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                path: filePath,
+                content,
+                expected_version: version,
+              }),
+            }
+          );
+          if (projectRes.ok) {
+            const data = await projectRes.json();
+            setVersion(data.version || version);
+            res = projectRes;
+          } else if (projectRes.status === 409) {
+            // The file was modified since we loaded it. Do NOT
+            // overwrite — ask the user to reload.
+            setStatusMsg(
+              "Conflict: file was modified by another process. Reload to see latest."
+            );
+            return;
+          }
+          // Non-409 failure — fall through to POST fallbacks
+        } catch {
+          /* fall through */
+        }
+      }
+
+      // ── 2. Chat-scoped POST (legacy) ──
+      if (!res || !res.ok) {
+        if (activeJobId) {
+          try {
+            const chatRes = await fetch(`/api/run/jobs/${activeJobId}/content`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ path: filePath, content }),
+            });
+            if (chatRes.ok) res = chatRes;
+          } catch {
+            /* fall through */
+          }
+        }
+      }
+
+      // ── 3. Generic POST (supports project_id for correct path resolution) ──
+      if (!res || !res.ok) {
         res = await fetch("/api/files/content", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             path: filePath,
             content,
+            project_id: projectId || null,
           }),
         });
       }
 
-      if (res.ok) {
+      if (res && res.ok) {
         setStatusMsg("Saved successfully");
         onSave?.(filePath, content);
         if (typeof window !== "undefined") {
           window.dispatchEvent(
             new CustomEvent("peldrun:file-saved", {
-              detail: { path: filePath, content },
+              detail: { path: filePath, content, projectId },
             })
           );
         }
         setTimeout(() => setStatusMsg(null), 3500);
       } else {
-        const errData = await res.json().catch(() => ({}));
+        const errData = res ? await res.json().catch(() => ({})) : {};
         setStatusMsg(errData.detail || "Failed to save");
       }
     } catch {

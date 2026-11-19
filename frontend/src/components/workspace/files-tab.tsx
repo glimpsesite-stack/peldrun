@@ -8,7 +8,7 @@
 
 "use client";
 
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useCallback } from "react";
 import { Folder, FolderOpen, FileText, Download, Trash2, RefreshCw, Filter, ChevronRight, ChevronDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/Icon/Icon";
@@ -28,6 +28,14 @@ export interface FilesTabProps {
   onSelectFile?: (path: string) => void;
   onOpenFile?: (path: string) => void;
   activeJobId?: string | null;
+  /**
+   * When provided, the tree lists the project's workspace (external or
+   * internal) via the Workspace API instead of the chat/global listings.
+   * Required inside ProjectWorkspacePanel: the agent writes deliverables
+   * into the project workspace, which the legacy chat-scoped endpoints
+   * and the /api/files artifact walk cannot see.
+   */
+  projectId?: string | null;
 }
 
 function buildFileTree(flatFiles: FileItem[]): FileItem[] {
@@ -97,9 +105,10 @@ function buildFileTree(flatFiles: FileItem[]): FileItem[] {
   return rootItems;
 }
 
-export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProps) {
+export function FilesTab({ onSelectFile, onOpenFile, activeJobId, projectId }: FilesTabProps) {
   const [allFiles, setAllFiles] = useState<FileItem[]>([]);
   const [taskFiles, setTaskFiles] = useState<FileItem[]>([]);
+  const [projectFiles, setProjectFiles] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [filterCurrentOnly, setFilterCurrentOnly] = useState(true);
   // User-driven expand/collapse overrides. Any directory not present in
@@ -129,16 +138,65 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
     });
   };
 
-  const fetchFiles = async () => {
+  const fetchFiles = useCallback(async () => {
     setLoading(true);
     try {
+      // ── Project mode: list the project workspace (internal or external) ──
+      // The Workspace API returns a flat JSON array of workspace-relative
+      // path strings. buildFileTree synthesizes the folder hierarchy from
+      // those paths, so only file entries are needed here.
+      if (projectId) {
+        const resProject = await fetch(
+          `/api/projects/${encodeURIComponent(projectId)}/workspace/files?path=&t=${Date.now()}`,
+          { cache: "no-store" }
+        );
+        if (resProject.ok) {
+          const dataProject = await resProject.json();
+          // Primary shape: string[]. Tolerate {files:[...]} / {entries:[...]}
+          // wrappers and object entries so a backend variation does not
+          // blank the tree.
+          const entries: any[] = Array.isArray(dataProject)
+            ? dataProject
+            : dataProject?.files || dataProject?.entries || [];
+          const normalized: FileItem[] = entries
+            .map((entry: any): FileItem | null => {
+              const rawPath =
+                typeof entry === "string"
+                  ? entry
+                  : entry?.path || entry?.relative_path || entry?.name || "";
+              if (!rawPath) return null;
+              if (
+                typeof entry === "object" &&
+                entry !== null &&
+                (entry.is_dir || entry.isDir || entry.type === "directory")
+              ) {
+                return null;
+              }
+              const cleanPath = rawPath.replace(/\\/g, "/").replace(/^\/+/, "");
+              return {
+                name: cleanPath.split("/").pop() || cleanPath,
+                path: cleanPath,
+                isDir: false,
+                size: typeof entry === "object" && entry !== null ? entry.size : undefined,
+                modified: typeof entry === "object" && entry !== null ? entry.modified : undefined,
+              };
+            })
+            .filter((f: FileItem | null): f is FileItem => f !== null);
+          setProjectFiles(normalized);
+        } else {
+          setProjectFiles([]);
+        }
+        // Project mode is self-contained; skip the chat/global listings.
+        return;
+      }
+
+      // ── Legacy chat mode (unchanged behavior) ──
       // 1. Fetch generic workspace files
       const resAll = await fetch("/api/files?t=" + Date.now());
       if (resAll.ok) {
         const dataAll = await resAll.json();
         setAllFiles(dataAll.files || []);
       }
-
       // 2. Fetch active job deliverable files
       if (activeJobId) {
         const resTask = await fetch(`/api/run/jobs/${activeJobId}/files?t=` + Date.now());
@@ -154,14 +212,23 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
     } finally {
       setLoading(false);
     }
-  };
+  }, [projectId, activeJobId]);
 
   const handleDelete = async (filePath: string) => {
     if (!confirm(`Are you sure you want to delete ${filePath}?`)) return;
     try {
-      const res = await fetch(`/api/files?path=${encodeURIComponent(filePath)}`, {
-        method: "DELETE",
-      });
+      // Project mode: delete through the Workspace API so the target is
+      // resolved inside the project workspace. The generic /api/files
+      // DELETE cannot resolve workspace-relative project paths and could
+      // hit a same-named legacy file elsewhere.
+      const res = projectId
+        ? await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/workspace/file?path=${encodeURIComponent(filePath)}`,
+            { method: "DELETE" }
+          )
+        : await fetch(`/api/files?path=${encodeURIComponent(filePath)}`, {
+            method: "DELETE",
+          });
       if (res.ok) {
         fetchFiles();
       }
@@ -172,19 +239,26 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
 
   useEffect(() => {
     fetchFiles();
-  }, [activeJobId]);
-
+  }, [fetchFiles]);
   useEffect(() => {
     const handleSaved = () => fetchFiles();
     window.addEventListener("peldrun:file-saved", handleSaved);
     window.addEventListener("peldrun:artifact-created", handleSaved);
+    window.addEventListener("peldrun:artifact-updated", handleSaved);
     return () => {
       window.removeEventListener("peldrun:file-saved", handleSaved);
       window.removeEventListener("peldrun:artifact-created", handleSaved);
+      window.removeEventListener("peldrun:artifact-updated", handleSaved);
     };
-  }, []);
+  }, [fetchFiles]);
 
-  const rawList = filterCurrentOnly && activeJobId ? taskFiles : allFiles;
+  // In project mode the tree always reflects the project workspace; the
+  // chat-centric "This Task / All Workspace" toggle does not apply there.
+  const rawList = projectId
+    ? projectFiles
+    : filterCurrentOnly && activeJobId
+      ? taskFiles
+      : allFiles;
   const hierarchicalTree = useMemo(() => buildFileTree(rawList), [rawList]);
 
   const renderTree = (items: FileItem[]) => {
@@ -259,7 +333,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
                 {!item.isDir && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                     <a
-                      href={`/api/files/download?path=${encodeURIComponent(item.path)}`}
+                      href={projectId ? `/api/files/raw-project/${encodeURIComponent(projectId)}/${encodeURI(item.path)}` : `/api/files/download?path=${encodeURIComponent(item.path)}`}
                       download
                       className="p-1 text-[#eee] hover:text-[#eee]"
                       title="Download"
@@ -297,7 +371,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
             WORKSPACE FILES
           </span>
           <button
-            onClick={() => setFilterCurrentOnly(!filterCurrentOnly)}
+            onClick={() => { if (!projectId) setFilterCurrentOnly(!filterCurrentOnly); }}
             className={`px-1.5 py-0.5 rounded text-[10px] flex items-center gap-1 transition cursor-pointer font-sans ${
               filterCurrentOnly
                 ? "bg-black text-rby border border-rb font-medium"
@@ -306,7 +380,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId }: FilesTabProp
             title="Toggle between current task deliverables and global workspace"
           >
             <Filter size={10} />
-            {filterCurrentOnly ? "This Task" : "All Workspace"}
+            {projectId ? "Project" : filterCurrentOnly ? "This Task" : "All Workspace"}
           </button>
         </div>
         <Button

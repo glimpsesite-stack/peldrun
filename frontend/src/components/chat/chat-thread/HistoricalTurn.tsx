@@ -1,3 +1,4 @@
+// frontend/src/components/chat/chat-thread/HistoricalTurn.tsx
 "use client";
 
 /**
@@ -26,6 +27,13 @@ export interface HistoricalTurnProps {
   turn: ChatTurn;
   tIdx: number;
   chatId?: string;
+  /**
+   * Project scope for this conversation, when the chat belongs to a
+   * project. Forwarded to ChatDeliverable so media thumbnails resolve
+   * against the project workspace (internal or external) instead of
+   * the chat session folder, which does not hold project deliverables.
+   */
+  projectId?: string | null;
   copiedSection: string | null;
   copyText: (text: string, id: string) => void;
   expandedSteps: Record<string, boolean>;
@@ -69,6 +77,7 @@ export function HistoricalTurn({
   turn,
   tIdx,
   chatId,
+  projectId,
   copiedSection,
   copyText,
   expandedSteps,
@@ -182,6 +191,7 @@ export function HistoricalTurn({
       {turn.finalResult && (
         <ChatDeliverable
           chatId={chatId}
+          projectId={projectId}
           finalResult={turn.finalResult}
           status={turn.status}
           turnIndex={tIdx}

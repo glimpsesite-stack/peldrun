@@ -1604,8 +1604,43 @@ async def run_instrumented(
     chat = project_manager.get_chat(job_id) or {}
     chat_id = chat.get("id", f"chat_{job_id}")
     project_id = chat.get("project_id", "default_project")
-    project_dir = project_manager.get_chat_files_dir(chat_id, project_id)
+
+    # ── Resolve the SHARED project workspace ──
+    #
+    # Every chat inside a project MUST operate on the SAME workspace
+    # directory. This is the core invariant from the engineering
+    # plan:
+    #
+    #   Session Files (per-chat, ephemeral) ≠ Project Workspace
+    #   (per-project, persistent, shared).
+    #
+    # Resolution order:
+    #   1. ``workspace_type == "external"`` and ``workspace_path`` set
+    #      → that absolute path (created if missing).
+    #   2. Any real project id (not ``default_project``)
+    #      → ``storage/projects/{id}/workspace`` (created if missing).
+    #   3. No project context (default_project / legacy chat)
+    #      → per-chat ``files/`` dir (legacy behavior preserved).
+    project_meta = project_manager.get_project(project_id) or {}
+    ws_type = (project_meta.get("workspace_type") or "internal").lower()
+    ws_cfg = (project_meta.get("workspace_path") or "").strip()
+
+    if ws_type == "external" and ws_cfg:
+        project_dir = Path(ws_cfg).expanduser()
+    elif project_id and project_id != "default_project":
+        project_dir = project_manager.projects_dir / project_id / "workspace"
+    else:
+        project_dir = project_manager.get_chat_files_dir(chat_id, project_id)
+
     project_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "[BRIDGE] Workspace for job %s resolved to %s "
+        "(project=%s, type=%s)",
+        job_id,
+        project_dir,
+        project_id,
+        ws_type,
+    )
 
     _append_session_log(
         chat_id,
@@ -2249,6 +2284,44 @@ async def run_direct_chat(
         turns = chat.get("turns", [])
         _append_session_log(chat_id, project_id, "SYSTEM", f"User: {prompt}")
 
+        # ── Resolve the SHARED project workspace for chat mode ──
+        #
+        # Chat mode does not run tools, but it does:
+        #   * resolve ``context_refs`` / inline ``@file`` references
+        #   * execute ``web_search`` with a ``workspace_root``
+        #   * persist attachment copies under ``.peldrun/user_uploads/``
+        #
+        # All three must target the SAME directory agent mode uses,
+        # otherwise a file attached in agent mode is invisible to the
+        # next chat-mode turn (and vice versa). Centralizing the
+        # resolution here guarantees both modes never diverge.
+        _project_meta_chat = project_manager.get_project(project_id) or {}
+        _ws_type_chat = (
+            _project_meta_chat.get("workspace_type") or "internal"
+        ).lower()
+        _ws_cfg_chat = (
+            _project_meta_chat.get("workspace_path") or ""
+        ).strip()
+        if _ws_type_chat == "external" and _ws_cfg_chat:
+            _chat_ws_dir = Path(_ws_cfg_chat).expanduser()
+        elif project_id and project_id != "default_project":
+            _chat_ws_dir = (
+                project_manager.projects_dir / project_id / "workspace"
+            )
+        else:
+            _chat_ws_dir = project_manager.get_chat_files_dir(
+                chat_id, project_id
+            )
+        _chat_ws_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "[BRIDGE DIRECT CHAT] Workspace for job %s resolved to %s "
+            "(project=%s, type=%s)",
+            job_id,
+            _chat_ws_dir,
+            project_id,
+            _ws_type_chat,
+        )
+
         # --- Optional Web Search (chat-only, single-shot, before LLM call) ---
         search_used_successfully = False
         augmented_prompt = prompt
@@ -2264,7 +2337,7 @@ async def run_direct_chat(
                 chat_id, project_id, "SEARCH", f"Web search requested for: {prompt[:120]}"
             )
             search_tool = WebSearchTool(
-                workspace_root=str(project_manager.get_chat_files_dir(chat_id, project_id)),
+                workspace_root=str(_chat_ws_dir),
                 run_id=job_id,
                 job_id=job_id,
                 session_id=chat_id,
@@ -2418,10 +2491,7 @@ async def run_direct_chat(
         # ─────────────────────────────────────────────────────────────
         if _chat_context_refs:
             try:
-                _chat_project_dir = project_manager.get_chat_files_dir(
-                    chat_id, project_id
-                )
-                _chat_project_dir.mkdir(parents=True, exist_ok=True)
+                _chat_project_dir = _chat_ws_dir
 
                 _resolved_refs = resolve_context_refs(
                     _chat_context_refs, _chat_project_dir
@@ -2578,11 +2648,8 @@ async def run_direct_chat(
                 _temp_dir = _get_root() / "artifacts" / "temp"
                 _workspace_uploads_dir = None
                 try:
-                    _ws_files_dir = project_manager.get_chat_files_dir(
-                        chat_id, project_id
-                    )
                     _workspace_uploads_dir = (
-                        _ws_files_dir / ".peldrun" / "user_uploads"
+                        _chat_ws_dir / ".peldrun" / "user_uploads"
                     )
                 except Exception:
                     _workspace_uploads_dir = None
