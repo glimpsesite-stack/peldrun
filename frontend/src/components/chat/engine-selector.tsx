@@ -49,6 +49,47 @@ export interface EngineSelectorProps {
   direction?: "up" | "down" | "auto";
 }
 
+/**
+ * Returns true when a model key represents an embedding model that
+ * must NOT be offered as a chat engine in the selector.
+ *
+ * Rationale
+ * ---------
+ * Embedding models can only serve `/v1/embeddings` — they cannot
+ * answer `/chat/completions`. Listing one as a selectable engine
+ * would let the user activate it, then fail on the first message
+ * with an opaque provider error. Filtering them here keeps the
+ * dropdown limited to chat-capable engines.
+ *
+ * Detection priority (any match wins):
+ *   1. Metadata `capabilities.is_embedding === true` — authoritative
+ *      flag written by Scan Models or by a manual user toggle.
+ *   2. Metadata `is_embedding === true` — legacy top-level field
+ *      retained for entries written before the capability layer.
+ *   3. Metadata `type === "embeddings"` — provider-declared type.
+ *   4. Model-name pattern match — last-resort fallback for models
+ *      whose metadata was never scanned (e.g. a vault synced from
+ *      another machine without the metadata cache).
+ */
+function isEmbeddingModelKey(
+  modelKey: string | null | undefined,
+  metadataVault: Record<string, any>
+): boolean {
+  if (!modelKey || typeof modelKey !== "string") return false;
+
+  const entry = metadataVault?.[modelKey];
+  if (entry && typeof entry === "object") {
+    const caps = entry.capabilities;
+    if (caps && typeof caps === "object" && caps.is_embedding === true) {
+      return true;
+    }
+    if (entry.is_embedding === true) return true;
+    if (entry.type === "embeddings") return true;
+  }
+
+  return /embed/i.test(modelKey);
+}
+
 export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [openUpward, setOpenUpward] = useState(false);
@@ -455,6 +496,63 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
     return fallback;
   };
 
+  /**
+   * Return the subset of `modelKeys` that are NOT embedding models.
+   *
+   * Called at render time — not at state-write time — because the
+   * metadata vault resolves asynchronously (`fetchServerMetadata()`),
+   * after the synchronous localStorage loaders populate the lists.
+   * Filtering at render guarantees the dropdown always reflects the
+   * latest metadata without requiring the loaders to re-run.
+   */
+  const filterEmbeddingModels = (modelKeys: string[]): string[] =>
+    modelKeys.filter((m) => !isEmbeddingModelKey(m, metadataVault));
+
+  // Local providers — flatten to the visible subset.
+  const visibleLocalGPUModels = filterEmbeddingModels(localGPUModels);
+  const visibleOllamaModels = filterEmbeddingModels(
+    ollamaItem?.savedModels || []
+  );
+
+  // Cloud providers — normalize `savedModels` to the visible subset
+  // and drop cards whose entire saved list turned out to be
+  // embedding-only (they cannot serve chat completions).
+  const visibleCloudProviders = activeCloudProviders
+    .map((cp) => ({
+      ...cp,
+      savedModels:
+        cp.savedModels && cp.savedModels.length > 0
+          ? filterEmbeddingModels(cp.savedModels)
+          : cp.model && !isEmbeddingModelKey(cp.model, metadataVault)
+          ? [cp.model]
+          : [],
+    }))
+    .filter((cp) => cp.savedModels.length > 0);
+
+  // Custom endpoints — same normalization as cloud providers, using
+  // `defaultModel` as the single-model fallback.
+  const visibleCustomEndpoints = activeCustomEndpoints
+    .map((ce) => ({
+      ...ce,
+      savedModels:
+        ce.savedModels && ce.savedModels.length > 0
+          ? filterEmbeddingModels(ce.savedModels)
+          : ce.defaultModel &&
+            !isEmbeddingModelKey(ce.defaultModel, metadataVault)
+          ? [ce.defaultModel]
+          : [],
+    }))
+    .filter((ce) => ce.savedModels.length > 0);
+
+  // Store provider packages — filter each package's model list and
+  // drop packages whose entire list is embedding-only.
+  const visibleProviderPackages = activeProviderPackages
+    .map((pkg) => ({
+      ...pkg,
+      models: filterEmbeddingModels(pkg.models),
+    }))
+    .filter((pkg) => pkg.models.length > 0);
+
   // Null-safe derived labels for the trigger button.
   const displayProvider = activeProvider || "No provider";
   const displayModel = activeModel || "Not selected";
@@ -510,13 +608,13 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                 <span>LM Studio (Local GPU)</span>
               </span>
               <span className="text-[10px] text-muted-foreground font-mono">
-                {localGPUModels.length}{" "}
-                {localGPUModels.length === 1 ? "model" : "models"}
+                {visibleLocalGPUModels.length}{" "}
+                {visibleLocalGPUModels.length === 1 ? "model" : "models"}
               </span>
             </div>
 
             <div className="space-y-0.5 pl-3">
-              {localGPUModels.map((m) => {
+              {visibleLocalGPUModels.map((m) => {
                 // `activeProvider` may be null; `(activeProvider || "")`
                 // makes the `.includes()` guard null-safe.
                 const isSelected =
@@ -558,9 +656,7 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
           </div>
 
           {/* ── Ollama (local server) ───────────────────────────── */}
-          {ollamaItem &&
-            ollamaItem.savedModels &&
-            ollamaItem.savedModels.length > 0 && (
+          {ollamaItem && visibleOllamaModels.length > 0 && (
               <div className="rounded-md bg-card border border-card p-1.5 space-y-1">
                 <div className="flex items-center justify-between px-1 py-0.5 text-[11px] font-semibold text-foreground">
                   <span className="flex items-center gap-1.5">
@@ -571,13 +667,13 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
                     <span>Ollama (Local Server)</span>
                   </span>
                   <span className="text-[10px] text-muted-foreground font-mono">
-                    {ollamaItem.savedModels.length}{" "}
-                    {ollamaItem.savedModels.length === 1 ? "model" : "models"}
+                    {visibleOllamaModels.length}{" "}
+                    {visibleOllamaModels.length === 1 ? "model" : "models"}
                   </span>
                 </div>
 
                 <div className="space-y-0.5 pl-3">
-                  {ollamaItem.savedModels.map((m: string) => {
+                  {visibleOllamaModels.map((m: string) => {
                     const isSelected =
                       (activeProvider || "").includes("Ollama") &&
                       activeModel === m;
@@ -622,17 +718,16 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
             )}
 
           {/* ── Cloud providers (badge-driven icons) ─────────────── */}
-          {activeCloudProviders.length > 0 && (
+          {visibleCloudProviders.length > 0 && (
             <div className="pt-1 border-t border-border/40 space-y-1.5">
               <span className="text-[9px] font-bold text-muted-foreground uppercase px-2 block mb-1">
                 Cloud Providers & Saved Models
               </span>
 
-              {activeCloudProviders.map((cp) => {
-                const modelsList =
-                  cp.savedModels && cp.savedModels.length > 0
-                    ? cp.savedModels
-                    : [cp.model];
+              {visibleCloudProviders.map((cp) => {
+                // `savedModels` was already normalized to the visible
+                // subset by `visibleCloudProviders` above.
+                const modelsList = cp.savedModels;
                 return (
                   <div
                     key={cp.id}
@@ -697,17 +792,16 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
           )}
 
           {/* ── Custom endpoints ─────────────────────────────────── */}
-          {activeCustomEndpoints.length > 0 && (
+          {visibleCustomEndpoints.length > 0 && (
             <div className="pt-1 border-t border-border/40 space-y-1.5">
               <span className="text-[9px] font-bold text-muted-foreground uppercase px-2 block mb-1">
                 Custom Endpoints
               </span>
 
-              {activeCustomEndpoints.map((ce) => {
-                const modelsList =
-                  ce.savedModels && ce.savedModels.length > 0
-                    ? ce.savedModels
-                    : [ce.defaultModel];
+              {visibleCustomEndpoints.map((ce) => {
+                // `savedModels` was already normalized to the visible
+                // subset by `visibleCustomEndpoints` above.
+                const modelsList = ce.savedModels;
                 return (
                   <div
                     key={ce.id}
@@ -772,13 +866,13 @@ export function EngineSelector({ direction = "auto" }: EngineSelectorProps) {
           )}
 
           {/* ── Store provider packages ──────────────────────────── */}
-          {activeProviderPackages.length > 0 && (
+          {visibleProviderPackages.length > 0 && (
             <div className="pt-1 border-t border-border/40 space-y-1.5">
               <span className="text-[9px] font-bold text-muted-foreground uppercase px-2 block mb-1">
                 Store Provider Packages
               </span>
 
-              {activeProviderPackages.map((pkg) => (
+              {visibleProviderPackages.map((pkg) => (
                 <div
                   key={pkg.id}
                   className="rounded-md bg-card border border-card p-1.5 space-y-1"
