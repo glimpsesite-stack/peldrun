@@ -80,7 +80,8 @@ export function parsePromptAndAttachments(
 export function resolveFileCategory(
   fileName: string,
   customUrl?: string,
-  fileId?: string
+  fileId?: string,
+  projectId?: string | null
 ) {
   const extension = fileName.includes(".")
     ? fileName.slice(fileName.lastIndexOf(".")).toLowerCase()
@@ -115,18 +116,27 @@ export function resolveFileCategory(
   } else if (isImage && fileId) {
     // [WORKSPACE-FIRST] Prefer the workspace copy over the temp store.
     //
-    // ``start_run.py`` copies every attachment to
-    // ``<chat_files>/.peldrun/user_uploads/<fileId>`` and removes the
-    // temp original as soon as the copy succeeds. The temp URL would
-    // therefore 404 for every image after the first turn. The workspace
-    // path resolves through ``/api/files/raw`` → ``find_file_in_storage``
-    // → recursive lookup across all chat workspaces, which succeeds
-    // because fileIds are opaque UUIDs.
+    // ``start_run.py`` copies every attachment to a workspace location
+    // before the run starts and deletes the temp original. The copy
+    // destination depends on the project kind:
     //
-    // The ``<img onError>`` handler in AttachedFileCard hides the
-    // element when even this URL fails (extremely rare — only if the
-    // workspace copy was also deleted manually).
-    previewUrl = `/api/files/raw/.peldrun/user_uploads/${fileId}`;
+    //   * default (chat)   →  <chat_files>/.peldrun/user_uploads/<fid>
+    //   * internal project →  storage/projects/<pid>/workspace/.peldrun/user_uploads/<fid>
+    //   * external project →  <external_ws_root>/.peldrun/user_uploads/<fid>
+    //
+    // The default route ``/api/files/raw/...`` only searches chat
+    // workspaces (plus the project fast-path added in files.py), so it
+    // does not cover external project workspaces at all, and would rely
+    // on a storage-tree walk for internal projects. When a projectId is
+    // known we use the explicit ``raw-project`` route instead: it
+    // resolves through ``_resolve_project_workspace_root`` and handles
+    // BOTH internal (storage/projects/<pid>/workspace) and external
+    // (arbitrary configured path) workspaces in a single call, with no
+    // recursive scan. This is the branch that fixes thumbnails for
+    // project-scoped chats and, in particular, for external workspaces.
+    previewUrl = projectId
+      ? `/api/files/raw-project/${projectId}/.peldrun/user_uploads/${fileId}`
+      : `/api/files/raw/.peldrun/user_uploads/${fileId}`;
   } else if (isImage) {
     previewUrl = `/api/files/raw/${fileName}`;
   } else {

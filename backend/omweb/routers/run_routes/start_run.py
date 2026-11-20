@@ -980,18 +980,47 @@ async def start_run(req: RunRequest, background_tasks: BackgroundTasks):
                     # up later. The copy is best-effort: a failure here
                     # must NOT break the run (the temp file still exists
                     # for immediate use).
+                    #
+                    # [FIX-PROJECT-PATH] For projects, the dispatcher
+                    # searches in the SHARED project workspace
+                    # (storage/projects/<id>/workspace), NOT in the
+                    # per-chat files directory. We must copy to the
+                    # correct location based on project type.
                     try:
                         import shutil as _shutil
                         from peldrun.storage_paths import (
                             get_storage_root as _get_storage_root,
                         )
-
                         _temp_root = (
                             _get_storage_root() / "artifacts" / "temp"
                         )
-                        _user_uploads_dir = (
-                            files_dir / ".peldrun" / "user_uploads"
-                        )
+
+                        # [FIX-PROJECT-PATH] Determine the correct
+                        # user_uploads directory based on project type.
+                        # For projects (not default_project), the
+                        # dispatcher searches in the shared workspace.
+                        # For legacy chats, it searches in files_dir.
+                        _project_meta = project_manager.get_project(project_id) or {}
+                        _ws_type = (_project_meta.get("workspace_type") or "internal").lower()
+                        _ws_cfg = (_project_meta.get("workspace_path") or "").strip()
+
+                        if _ws_type == "external" and _ws_cfg:
+                            _user_uploads_dir = (
+                                Path(_ws_cfg).expanduser() / ".peldrun" / "user_uploads"
+                            )
+                        elif project_id and project_id != "default_project":
+                            _user_uploads_dir = (
+                                project_manager.projects_dir
+                                / project_id
+                                / "workspace"
+                                / ".peldrun"
+                                / "user_uploads"
+                            )
+                        else:
+                            _user_uploads_dir = (
+                                files_dir / ".peldrun" / "user_uploads"
+                            )
+
                         _user_uploads_dir.mkdir(
                             parents=True, exist_ok=True
                         )

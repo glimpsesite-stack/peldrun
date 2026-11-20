@@ -929,6 +929,7 @@ export function Composer({
       agent_id:
         execMode === "agent" || directives.agentId ? effectiveAgentId : "peldrun",
       delegation_allowed: canDelegate,
+      ...(projectId ? { project_id: projectId } : {}),
     };
 
     if (directives.toolIds.length > 0) {

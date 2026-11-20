@@ -468,6 +468,67 @@ def find_file_in_storage(
                         if sub_file.is_file() and sub_file.stat().st_size > 0:
                             return sub_file
 
+    # 4. Recursive lookup inside project workspaces.
+    #
+    # Attachments uploaded via /api/files/upload-temp are copied by
+    # ``start_run.py`` into
+    # ``<project_workspace>/.peldrun/user_uploads/<fileId>`` before the
+    # run starts, and the temp original is deleted in the same step.
+    # Without this branch, requests such as
+    # ``/api/files/raw/.peldrun/user_uploads/<fileId>`` 404 for every
+    # project-scoped chat even though the identical URL resolves
+    # correctly in chat scope (covered by step 3 above). This is the
+    # concrete reason thumbnails vanished in projects while the same
+    # attachments kept working in chat mode.
+    if PROJECTS_DIR.exists():
+        for project_dir in PROJECTS_DIR.iterdir():
+            if not project_dir.is_dir():
+                continue
+
+            # Fast path for uploaded attachments. ``fileId`` tokens are
+            # globally unique (``img_<hex>.<ext>``), so a basename match
+            # inside any project's ``.peldrun/user_uploads`` directory
+            # is unambiguous. Avoids a full workspace walk for the
+            # common case (rendering thumbnails for the current turn).
+            user_uploads = (
+                project_dir / "workspace" / ".peldrun" / "user_uploads"
+            )
+            if user_uploads.exists():
+                direct_upload = user_uploads / target_name
+                if direct_upload.is_file():
+                    return direct_upload
+
+            # Direct hit for top-level deliverables. The full
+            # ``rglob`` fallback is intentionally NOT performed on
+            # ``workspace/`` because a project may hold thousands of
+            # files; callers that know the project should pass
+            # ``project_id`` so step 0 resolves the file directly
+            # without any scan.
+            ws_root = project_dir / "workspace"
+            if ws_root.exists():
+                direct_ws = (ws_root / clean).resolve()
+                if direct_ws.is_file():
+                    return direct_ws
+
+            # Project-scoped chat files. Mirrors step 3's layout so
+            # both storage hierarchies remain searchable from this
+            # single helper. Chat file directories are small, so the
+            # recursive scan here is bounded.
+            proj_chats = project_dir / "chats"
+            if proj_chats.exists():
+                for pchat_dir in proj_chats.iterdir():
+                    if not pchat_dir.is_dir():
+                        continue
+                    files_sub = pchat_dir / "files"
+                    if not files_sub.exists():
+                        continue
+                    target_match = (files_sub / clean).resolve()
+                    if target_match.is_file():
+                        return target_match
+                    for sub_file in files_sub.rglob(target_name):
+                        if sub_file.is_file() and sub_file.stat().st_size > 0:
+                            return sub_file
+
     return None
 
 

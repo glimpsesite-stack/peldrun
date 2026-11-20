@@ -861,6 +861,8 @@ export function ChatLanding({
       // when this field is absent — which would orphan every upload the
       // user just did.
       chat_id: landingChatId,
+          // to resolve files and attachments against.
+    ...(projectId ? { project_id: projectId } : {}),
       // [SKILLS] Explicit skill invocations from the / menu.
       // Forwarded to EngineRunContext.invoked_skills; the engine
       // merges them with the agent's assigned skills at prompt time.
