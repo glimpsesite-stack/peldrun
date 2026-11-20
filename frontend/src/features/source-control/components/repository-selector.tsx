@@ -97,6 +97,12 @@ export const RepositorySelector: React.FC<RepositorySelectorProps> = ({
     }
   };
 
+  // If there are no repositories and we are not currently loading, hide the component entirely.
+  // This avoids showing useless UI elements or messages when no Git repo exists.
+  if (!isLoading && repositories.length === 0) {
+    return null;
+  }
+
   return (
     <div className={`repository-selector ${className}`}>
       <div className="flex items-center gap-2">
@@ -121,7 +127,7 @@ export const RepositorySelector: React.FC<RepositorySelectorProps> = ({
             }}
           >
             <option value="">
-              {isLoading ? "Loading..." : repositories.length === 0 ? "No repositories found" : "Select a repository"}
+              {isLoading ? "Loading..." : "Select a repository"}
             </option>
             {repositories.map((repo) => (
               <option key={repo.id} value={repo.id}>
@@ -172,16 +178,6 @@ export const RepositorySelector: React.FC<RepositorySelectorProps> = ({
       {error && (
         <div className="mt-2 p-2 bg-destructive/10 border border-destructive/30 rounded-md text-xs text-destructive">
           <span className="font-medium">Error:</span> {error}
-        </div>
-      )}
-
-      {!isLoading && !error && repositories.length === 0 && (
-        <div className="mt-2 p-2 bg-muted/30 border border-border rounded-md text-xs text-muted-foreground text-center">
-          No Git repositories found in this project workspace.
-          <br />
-          <span className="text-[10px]">
-            Initialize a repository with <code className="font-mono bg-background px-1 rounded">git init</code>
-          </span>
         </div>
       )}
     </div>

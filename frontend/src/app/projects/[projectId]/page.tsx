@@ -76,9 +76,29 @@ export default function ProjectDashboardPage() {
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
-  const [rightPanel, setRightPanel] = useState<
-    "workspace" | "source-control" | null
-  >("workspace");
+
+  // Initialize from localStorage to persist state across F5, default to null (closed)
+  const [rightPanel, setRightPanel] = useState<"workspace" | "source-control" | null>(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("project_right_panel_state");
+      if (saved === "workspace" || saved === "source-control") {
+        return saved;
+      }
+    }
+    return null; // Default to closed
+  });
+
+  // Helper to update state and persist to localStorage
+  const handleSetRightPanel = (panel: "workspace" | "source-control" | null) => {
+    setRightPanel(panel);
+    if (typeof window !== "undefined") {
+      if (panel) {
+        localStorage.setItem("project_right_panel_state", panel);
+      } else {
+        localStorage.removeItem("project_right_panel_state");
+      }
+    }
+  };
 
   // ── Live stats: sessions / tasks / files counts ──
   // `null` means "loading" and renders as "…" in the UI,
@@ -538,7 +558,7 @@ export default function ProjectDashboardPage() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => setRightPanel("workspace")}
+                        onClick={() => handleSetRightPanel("workspace")}
                         className="gap-1.5 ml-2"
                         title="Open Workspace / Source Control Panel"
                       >
@@ -680,10 +700,10 @@ export default function ProjectDashboardPage() {
           <motion.aside
             key="right-panel"
             initial={{ width: 0, opacity: 0 }}
-            animate={{ width: "33.333333%", opacity: 1 }}
+            animate={{ width: "40%", opacity: 1 }}
             exit={{ width: 0, opacity: 0 }}
             transition={{ duration: 0.32, ease: EASE_OUT }}
-            className="hidden lg:flex flex-col shrink-0 border-l border-border bg-background overflow-hidden"
+            className="hidden lg:flex flex-col shrink-0 border-l border-border bg-background overflow-auto"
           >
             {/* Toggle header */}
             <div className="h-12 border-b border-border bg-card px-3 flex items-center justify-between shrink-0">
@@ -703,7 +723,7 @@ export default function ProjectDashboardPage() {
                     <button
                       key={key}
                       type="button"
-                      onClick={() => setRightPanel(key)}
+                      onClick={() => handleSetRightPanel(key)}
                       className={`relative px-2.5 py-1.5 rounded-md transition-colors flex items-center gap-1.5 text-xs cursor-pointer whitespace-nowrap ${
                         isActive
                           ? "text-foreground font-medium"
@@ -731,7 +751,7 @@ export default function ProjectDashboardPage() {
               </div>
               <motion.button
                 type="button"
-                onClick={() => setRightPanel(null)}
+                onClick={() => handleSetRightPanel(null)}
                 whileHover={{ scale: 1.06 }}
                 whileTap={{ scale: 0.94 }}
                 className="p-1.5 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground transition-colors cursor-pointer"

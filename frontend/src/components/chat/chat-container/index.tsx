@@ -551,15 +551,8 @@ export function ChatContainer({
         } catch { /* fall through */ }
       }
 
-      if (collected.length === 0) {
-        try {
-          const res = await fetch(
-            `/api/projects/${encodeURIComponent(projectId)}/workspace/files?path=&t=${Date.now()}`,
-            { cache: "no-store" }
-          );
-          if (res.ok) collected = normalizeDeliverableRecords(await res.json());
-        } catch { /* no recoverable deliverables */ }
-      }
+      // Do not use the project workspace listing as a deliverables fallback.
+      // It contains files from other turns and chats in the shared workspace.
 
       if (!cancelled && collected.length > 0) {
         setProjectDeliverables((prev) => mergeDeliverableLists(prev, collected));
