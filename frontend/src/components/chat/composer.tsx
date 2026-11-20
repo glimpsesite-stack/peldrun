@@ -239,16 +239,22 @@ interface UploadWorkspaceResponse {
 async function uploadFileToWorkspace(
   file: File,
   chatId: string,
+  projectId?: string | null,
 ): Promise<{ name: string; path: string }> {
   const formData = new FormData();
   formData.append("files", file);
   formData.append("chat_id", chatId);
-
-  const res = await fetch("/api/files/upload", {
+  // Project-scoped chats upload into the persistent project workspace
+  // so the agent's file tools and the dispatcher's context_refs
+  // resolver can see the file. Legacy chats keep the per-chat upload.
+  // Mirrors the routing ChatContainer.handleStartTask already uses.
+  const endpoint = projectId
+    ? `/api/projects/${encodeURIComponent(projectId)}/workspace/upload`
+    : "/api/files/upload";
+  const res = await fetch(endpoint, {
     method: "POST",
     body: formData,
   });
-
   if (!res.ok) {
     let detail = "";
     try {
@@ -282,6 +288,13 @@ async function uploadFileToWorkspace(
 const LEGACY_AGENTIC_MODE_KEY = "peldrun_agentic_mode";
 
 interface ComposerProps {
+  /**
+   * Project scope for this composer session, when the chat belongs to
+   * a project. Routes non-image uploads into the project workspace
+   * (persistent, agent-visible) instead of the per-chat directory.
+   * Images are scope-agnostic (temp artifact store) and unaffected.
+   */
+  projectId?: string | null;
   onSend: (
     text: string,
     files?: File[],
@@ -295,6 +308,7 @@ interface ComposerProps {
 }
 
 export function Composer({
+  projectId,
   onSend,
   onStop,
   isRunning,
@@ -1062,7 +1076,11 @@ export function Composer({
     filesToUpload.forEach(({ id, file }) => {
       void (async () => {
         try {
-          const uploaded = await uploadFileToWorkspace(file, uploadChatId);
+          const uploaded = await uploadFileToWorkspace(
+            file,
+            uploadChatId,
+            projectId
+          );
           setPendingAttachments((prev) =>
             prev.map((att) =>
               att.id === id
@@ -1098,7 +1116,7 @@ export function Composer({
         }
       })();
     });
-  }, [activeSessionId]);
+  }, [activeSessionId, projectId]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -1614,6 +1632,7 @@ export function Composer({
         <LexicalEditorComponent
           ref={editorRef}
           chatId={activeSessionId}
+          projectId={projectId}
           placeholder={
             pendingAttachments.length > 0
               ? "Add instructions for attached files..."

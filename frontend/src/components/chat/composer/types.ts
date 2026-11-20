@@ -31,6 +31,13 @@ export interface LexicalEditorProps {
   autoFocus?: boolean;
   onClearEditor?: () => void;
   chatId?: string;
+    /**
+   * Project scope for the active session. When provided, the @-mention
+   * catalogue lists files from the persistent project workspace instead
+   * of the per-chat directory, enabling the user to reference any file
+   * the agent can see.
+   */
+  projectId?: string | null;
   /**
    * When ``false``, the composer's typeahead menu (``/`` slash
    * commands and ``@`` mentions) is suppressed. The characters remain

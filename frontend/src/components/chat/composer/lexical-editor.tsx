@@ -39,7 +39,7 @@ import { MarkdownClipboardPlugin } from './plugins/markdown-clipboard-plugin';
 import { FloatingToolbarPlugin } from './plugins/floating-toolbar-plugin';
 import { ImagePastePlugin } from './plugins/image-paste-plugin';
 import { COMPOSER_TRANSFORMERS, extractCleanText } from './serialization';
-import { LexicalEditorHandle, LexicalEditorProps } from './types';
+import type { LexicalEditorHandle, LexicalEditorProps } from './types';
 import {
   $isFileMentionNode,
   FileMentionNode,
@@ -106,6 +106,7 @@ export const LexicalEditorComponent = forwardRef<
     autoFocus = false,
     onClearEditor,
     chatId,
+    projectId,
     typeaheadEnabled = true,
     onImagePasted,
   },
@@ -315,6 +316,7 @@ export const LexicalEditorComponent = forwardRef<
         <TypeaheadMenuPlugin
           onClearEditor={onClearEditor}
           chatId={chatId}
+          projectId={projectId}
           enabled={typeaheadEnabled}
         />
         <SubmitCommandPlugin onSubmit={handleSubmit} disabled={disabled} />

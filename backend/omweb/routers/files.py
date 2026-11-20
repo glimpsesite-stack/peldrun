@@ -599,6 +599,217 @@ async def list_workspace_files(
     }
 
 
+@router.get("/browse")
+async def browse_workspace(
+    scope: str = Query(
+        "global",
+        description="Workspace scope: 'global' | 'chat' | 'project'.",
+    ),
+    chat_id: Optional[str] = Query(
+        None, description="Chat id (required when scope='chat')."
+    ),
+    project_id: Optional[str] = Query(
+        None, description="Project id (required when scope='project')."
+    ),
+    path: str = Query(
+        "", description="Relative path within the scope root. Empty = scope root."
+    ),
+    query: str = Query(
+        "",
+        description="Optional case-insensitive filter applied to entry names.",
+    ),
+):
+    """
+    List the immediate children (files AND folders) of a directory within
+    one of three workspace scopes.
+
+    Why a dedicated endpoint instead of reusing ``list_workspace_files``?
+    ---------------------------------------------------------------------
+    ``list_workspace_files`` walks the whole storage tree and returns a
+    FLAT list of every file. That is the right shape for the artifacts
+    gallery, but the wrong shape for a folder-navigation UI: it has no
+    notion of "current directory", it discards empty folders, and it
+    forces the client to reconstruct the hierarchy (which is fragile
+    once paths get deep or when the workspace has thousands of files).
+
+    This endpoint returns exactly ONE level, treats folders as
+    first-class entries, and gives the client everything it needs to
+    drill down (``current_path``, ``parent_path``, per-entry ``is_dir``).
+
+    Scopes
+    ------
+    * ``global``  — the shared ``workspace/`` directory at PROJECT_ROOT.
+    * ``chat``    — ``storage/chats/<chat_id>/files/``. Requires
+      ``chat_id``. Auto-created on first use.
+    * ``project`` — the project's workspace root (internal OR external,
+      resolved via ``_resolve_project_workspace_root``). Requires
+      ``project_id``.
+
+    Security
+    --------
+    * ``path`` is always treated as relative to the scope root.
+    * Absolute paths, traversal (``..``), and symlink escapes are
+      rejected with HTTP 403.
+    * Hidden entries (leading dot), known system files, and internal
+      build/VCS directories are excluded from the listing.
+    """
+    # ── Resolve the scope root ────────────────────────────────────────
+    if scope == "project":
+        if not project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="project_id is required when scope='project'",
+            )
+        root = _resolve_project_workspace_root(project_id)
+        if root is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Workspace for project {project_id!r} not found",
+            )
+    elif scope == "chat":
+        if not chat_id:
+            raise HTTPException(
+                status_code=400,
+                detail="chat_id is required when scope='chat'",
+            )
+        # Reject path-like chat ids (separator / traversal injection).
+        if any(c in chat_id for c in ("/", "\\")) or ".." in chat_id:
+            raise HTTPException(status_code=400, detail="Invalid chat_id")
+        root = (CHATS_DIR / chat_id / "files").resolve()
+        # No ``mkdir`` here: browsing must be a pure read. A chat that
+        # has never had a file uploaded returns an empty tree via the
+        # ``not target.exists()`` branch below, and the chat's files
+        # directory is created by ``upload_workspace_files`` on the
+        # first real upload instead of being fabricated by navigation.
+    elif scope == "global":
+        # Global scope browses the ENTIRE project root, not just the
+        # ``workspace/`` subdirectory. The composer @ menu is a project
+        # file picker: users expect to drill into ``backend/``,
+        # ``frontend/``, ``docs/``, ``scripts/``, ``installer/``, and
+        # ``workspace/`` side by side, exactly like an IDE file tree.
+        #
+        # Safety: ``_SKIP_DIR_NAMES`` and the leading-dot filter below
+        # keep VCS metadata, virtualenvs, node_modules, and dotfiles out
+        # of the listing. Individual file paths are validated again by
+        # the mention resolver (``_safe_resolve``) before any content is
+        # inlined into the prompt, so browsing wide does not mean the
+        # agent automatically reads everything.
+        root = PROJECT_ROOT.resolve()
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown scope {scope!r}. Expected 'global', 'chat', "
+                f"or 'project'."
+            ),
+        )
+
+    # ── Resolve target directory, enforcing containment ──────────────
+    clean_path = (path or "").replace("\\", "/").strip("/")
+    if clean_path:
+        segments = clean_path.split("/")
+        if any(seg == ".." or seg == "" for seg in segments):
+            raise HTTPException(
+                status_code=403,
+                detail="Path traversal not allowed",
+            )
+
+    target = (root / clean_path).resolve() if clean_path else root
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(
+            status_code=403, detail="Path outside workspace"
+        )
+
+    if not target.exists():
+        # A scope root may legitimately be empty on first visit: a
+        # chat with no uploads yet, a project whose workspace folder
+        # has not been created, or any scope whose root directory the
+        # user has not populated. Return an empty tree at the scope
+        # root instead of 404 so the composer menu opens cleanly.
+        #
+        # Sub-path misses still 404 because they indicate a real
+        # mistake -- a typo, a stale path from a previous chat, or a
+        # folder deleted out from under the user.
+        if clean_path == "":
+            return {
+                "scope": scope,
+                "current_path": "",
+                "parent_path": None,
+                "entries": [],
+                "count": 0,
+            }
+        raise HTTPException(status_code=404, detail="Directory not found")
+    if not target.is_dir():
+        raise HTTPException(
+            status_code=400, detail="Path is not a directory"
+        )
+
+    # ── Enumerate immediate children ─────────────────────────────────
+    lower_query = (query or "").strip().lower()
+    entries: List[Dict[str, Any]] = []
+
+    try:
+        children = list(target.iterdir())
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list directory: {exc}",
+        )
+
+    for child in children:
+        name = child.name
+
+        # Skip hidden, system, and internal build/VCS directories.
+        # The same filter set is used during the artifacts walk so the
+        # browse UI and the gallery never disagree about what exists.
+        if name.startswith("."):
+            continue
+        if name.lower() in SYSTEM_FILES:
+            continue
+        if name in _SKIP_DIR_NAMES:
+            continue
+
+        try:
+            is_dir = child.is_dir()
+            rel = str(child.relative_to(root)).replace("\\", "/")
+
+            if lower_query and lower_query not in name.lower():
+                continue
+
+            entries.append({
+                "name": name,
+                "path": rel,
+                "is_dir": is_dir,
+                "type": "folder" if is_dir else detect_file_type(name),
+                "size": 0 if is_dir else child.stat().st_size,
+            })
+        except OSError:
+            # A single unreadable child must not fail the whole listing.
+            # Permission hiccups on Windows are common (antivirus locks).
+            continue
+
+    # Folders first, then files; each group sorted case-insensitively so
+    # the menu ordering matches Finder / Explorer conventions.
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+
+    # ── Parent path for "go up" navigation ───────────────────────────
+    # An empty string means "the scope root" — the client uses this to
+    # render the "Up one level" affordance without a second round-trip.
+    parent_path: Optional[str] = None
+    if clean_path:
+        parent_path = "/".join(clean_path.split("/")[:-1])
+
+    return {
+        "scope": scope,
+        "current_path": clean_path,
+        "parent_path": parent_path,
+        "entries": entries,
+        "count": len(entries),
+    }
+
+
 # [FIX-5.2] When True, files are also mirrored to WORKSPACE_DIR for
 # backward compatibility with tooling that still references it.
 # Set to False once the transition to per-chat storage is complete.

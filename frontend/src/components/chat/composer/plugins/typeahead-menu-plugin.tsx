@@ -20,7 +20,15 @@ import {
   KEY_TAB_COMMAND,
   LexicalEditor,
 } from 'lexical';
-import { Bot, FileText, Sparkles, Terminal, Wrench } from 'lucide-react';
+import {
+  Bot,
+  ChevronLeft,
+  FileText,
+  Folder,
+  Sparkles,
+  Terminal,
+  Wrench,
+} from 'lucide-react';
 import {
   commandRegistry,
   MentionItem,
@@ -34,6 +42,14 @@ import {
 interface TypeaheadMenuPluginProps {
   onClearEditor?: () => void;
   chatId?: string;
+  /**
+   * Project scope for the active session, if any. Forwarded to
+   * ``commandRegistry.getMentionItems`` as part of the mention context
+   * so the file browser queries the project workspace endpoint instead
+   * of the per-chat or global one. Without this prop, `@` inside a
+   * project chat would silently fall back to the wrong scope.
+   */
+  projectId?: string | null;
   /**
    * When ``false``, the plugin does not open the typeahead menu for
    * either ``/`` (slash commands) or ``@`` (mentions). The characters
@@ -77,6 +93,7 @@ function getTextBeforeCaret(editor: LexicalEditor): string {
 export function TypeaheadMenuPlugin({
   onClearEditor,
   chatId,
+  projectId,
   enabled = true,
 }: TypeaheadMenuPluginProps) {
   const [editor] = useLexicalComposerContext();
@@ -90,6 +107,28 @@ export function TypeaheadMenuPlugin({
   const [isLoading, setIsLoading] = useState(false);
   const [, setRegistryTick] = useState(0);
   const menuRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * Current drill-down directory within the active scope. Empty string
+   * means "the scope root" (workspace/ for chat, project workspace for
+   * project scope, PROJECT_ROOT for global scope).
+   *
+   * This is local UI state owned by the menu, never persisted. It is
+   * populated when the user selects a folder entry and reset to '' on
+   * every menu close so the next `@` always starts at the scope root.
+   */
+  const [currentPath, setCurrentPath] = useState('');
+
+  /**
+   * Tracks the last observed trigger so we can distinguish a FRESH `@`
+   * (user just typed it, drilling should start at root) from a
+   * CONTINUATION (user is typing within an already-open mention menu,
+   * currentPath must be preserved).
+   *
+   * Without this, typing `@` would reset currentPath on every keystroke
+   * after a folder drill-down, making folder navigation impossible.
+   */
+  const lastTriggerRef = useRef<'slash' | 'mention' | null>(null);
 
   useEffect(() => {
     return commandRegistry.subscribe(() => {
@@ -106,12 +145,14 @@ export function TypeaheadMenuPlugin({
     let active = true;
     if (triggerType === 'mention') {
       setIsLoading(true);
-      commandRegistry.getMentionItems(queryString, { chatId }).then((items) => {
-        if (active) {
-          setDynamicMentions(items);
-          setIsLoading(false);
-        }
-      });
+      commandRegistry
+        .getMentionItems(queryString, { chatId, projectId, currentPath })
+        .then((items) => {
+          if (active) {
+            setDynamicMentions(items);
+            setIsLoading(false);
+          }
+        });
     } else {
       setDynamicMentions([]);
       setIsLoading(false);
@@ -119,7 +160,19 @@ export function TypeaheadMenuPlugin({
     return () => {
       active = false;
     };
-  }, [triggerType, queryString, chatId]);
+  }, [triggerType, queryString, chatId, projectId, currentPath]);
+
+  /**
+   * Reset the drill-down whenever the menu closes, no matter the reason
+   * (Escape, file selection, no more matches, disabled prop). This
+   * guarantees that the next `@` always opens at the scope root — the
+   * user never has to remember "where was I last time".
+   */
+  useEffect(() => {
+    if (!isOpen) {
+      setCurrentPath('');
+    }
+  }, [isOpen]);
 
   const activeResultsCount =
     triggerType === 'slash' ? slashResults.length : dynamicMentions.length;
@@ -141,6 +194,9 @@ export function TypeaheadMenuPlugin({
 
       const slashMatch = textBeforeCaret.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/);
       if (slashMatch) {
+        // Slash commands have no drill-down; reset lastTriggerRef so a
+        // subsequent @ is treated as a fresh open.
+        lastTriggerRef.current = 'slash';
         setTriggerType('slash');
         setQueryString(slashMatch[1]);
         setIsOpen(true);
@@ -152,6 +208,14 @@ export function TypeaheadMenuPlugin({
         /(?:^|\s)@([a-zA-Z0-9_./-]*)$/
       );
       if (mentionMatch) {
+        // Fresh `@` (transition from null or slash) resets drill-down.
+        // Continuation (user typing inside an already-open mention)
+        // preserves the current folder so navigation is not reset on
+        // every keystroke.
+        if (lastTriggerRef.current !== 'mention') {
+          setCurrentPath('');
+        }
+        lastTriggerRef.current = 'mention';
         setTriggerType('mention');
         setQueryString(mentionMatch[1]);
         setIsOpen(true);
@@ -159,6 +223,7 @@ export function TypeaheadMenuPlugin({
         return;
       }
 
+      lastTriggerRef.current = null;
       setIsOpen(false);
       setTriggerType(null);
     });
@@ -232,6 +297,61 @@ export function TypeaheadMenuPlugin({
         const selectedItem: MentionItem | undefined =
           dynamicMentions[indexToExecute];
         if (!selectedItem) return false;
+
+        // ── Folder drill-down ─────────────────────────────────────
+        // Selecting a folder does NOT insert anything. Instead it
+        // navigates into the folder (updates currentPath) and clears
+        // the typed query from the editor, leaving a bare `@` behind
+        // so the user can immediately type a fresh filter within the
+        // new folder. The menu stays open — this is a navigation
+        // action, not a selection.
+        if (selectedItem.category === 'folder') {
+          const folderPath = selectedItem.metadata?.folderPath;
+          if (typeof folderPath !== 'string') return false;
+
+          let drilled = false;
+          editor.update(() => {
+            const selection = $getSelection();
+            if (!$isRangeSelection(selection)) return;
+
+            const anchorNode = selection.anchor.getNode();
+            if (!$isTextNode(anchorNode)) return;
+
+            const fullText = anchorNode.getTextContent();
+            const cursorOffset = selection.anchor.offset;
+            const textBeforeCursor = fullText.slice(0, cursorOffset);
+            const textAfterCursor = fullText.slice(cursorOffset);
+
+            // Match the `@<query>` immediately before the cursor. The
+            // queryString character set is [a-zA-Z0-9_./-], so no
+            // regex-special characters are possible here — the only
+            // metachar within that set is `.`, which matches its
+            // literal self anyway when the query is exactly what is
+            // in the editor.
+            const pattern = new RegExp(`@${queryString}$`);
+            const match = textBeforeCursor.match(pattern);
+            if (!match || match.index === undefined) return;
+
+            const beforeMention = textBeforeCursor.slice(0, match.index);
+            // Leave the bare `@` behind, preserving anything after the
+            // cursor (user can click mid-text, drill, and continue).
+            const newText = beforeMention + '@' + textAfterCursor;
+            anchorNode.setTextContent(newText);
+            anchorNode.select(
+              beforeMention.length + 1,
+              beforeMention.length + 1,
+            );
+            drilled = true;
+          });
+
+          if (drilled) {
+            setCurrentPath(folderPath);
+            setSelectedIndex(0);
+          }
+          // Menu remains open; the fetch effect re-runs because
+          // currentPath is in its dependency array.
+          return true;
+        }
 
         // File references become structured Lexical nodes so they can be
         // styled distinctly, clicked, and carry their canonical path as a
@@ -441,12 +561,36 @@ export function TypeaheadMenuPlugin({
       className="absolute bottom-full mb-2 start-0 z-[9999] w-80 max-h-64 overflow-y-auto rounded-xl border border-border/80 bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-150 font-sans"
     >
       <div className="px-2 py-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase flex items-center justify-between border-b border-border/40 mb-1">
-        <span>
-          {triggerType === 'slash'
-            ? 'Slash Commands'
-            : 'Context & Store Mentions'}
+        <div className="flex items-center gap-1 min-w-0 flex-1">
+          {triggerType === 'mention' && currentPath && (
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.preventDefault();
+                const parts = currentPath.split('/').filter(Boolean);
+                parts.pop();
+                setCurrentPath(parts.join('/'));
+                setSelectedIndex(0);
+              }}
+              className="flex items-center justify-center w-4 h-4 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
+              title="Go up one folder"
+              aria-label="Go up one folder"
+            >
+              <ChevronLeft size={11} />
+            </button>
+          )}
+          <span className="truncate">
+            {triggerType === 'slash'
+              ? 'Slash Commands'
+              : currentPath
+                ? currentPath
+                : 'Files & folders'}
+          </span>
+        </div>
+        <span className="font-mono text-[9px] shrink-0 ml-2">
+          Tab / Enter to select
         </span>
-        <span className="font-mono text-[9px]">Tab / Enter to select</span>
       </div>
 
       {isLoading ? (
@@ -540,6 +684,8 @@ export function TypeaheadMenuPlugin({
                       <Bot size={13} />
                     ) : item.category === 'tool' ? (
                       <Wrench size={13} />
+                    ) : item.category === 'folder' ? (
+                      <Folder size={13} className="text-amber-500" />
                     ) : item.category === 'file' ? (
                       <FileText size={13} />
                     ) : (
@@ -551,9 +697,11 @@ export function TypeaheadMenuPlugin({
                       <span className="font-mono font-medium truncate">
                         {item.label}
                       </span>
-                      <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-muted/80 text-muted-foreground font-mono">
-                        {item.category}
-                      </span>
+                      {item.category !== 'file' && (
+                        <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-muted/80 text-muted-foreground font-mono">
+                          {item.category}
+                        </span>
+                      )}
                     </div>
                     {item.description && (
                       <span

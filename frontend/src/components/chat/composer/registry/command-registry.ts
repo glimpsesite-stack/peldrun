@@ -30,7 +30,13 @@ export interface SlashCommandItem {
   execute: (context: SlashCommandExecutionContext) => void | Promise<void>;
 }
 
-export type MentionCategory = 'agent' | 'tool' | 'skill' | 'file' | 'custom';
+export type MentionCategory =
+  | 'agent'
+  | 'tool'
+  | 'skill'
+  | 'file'
+  | 'folder'
+  | 'custom';
 
 // [FIX-1.1] Add explicit mentionToken field for reliable matching.
 // `insertText` is what gets inserted into the editor (no @ prefix).
@@ -52,12 +58,27 @@ export interface MentionItem {
    * New code (as of the mention-refactor) SHOULD always populate this.
    * Legacy call sites may omit it during the transition period.
    */
-  mentionToken?: string;   // ← [FIX-1.1b] أصبح اختياريًا
+  mentionToken?: string;
   metadata?: Record<string, unknown>;
 }
 
 export interface MentionContext {
   chatId?: string;
+    /**
+   * Project scope for the active session. When provided, the file
+   * mention provider queries the project workspace endpoint instead
+   * of the per-chat directory, listing every file the agent can see.
+   */
+  projectId?: string | null;
+  /**
+   * Current browse directory within the resolved scope, relative to the
+   * scope root. Empty string (or omitted) means the scope root itself.
+   *
+   * Populated by the typeahead plugin as the user drills into folders;
+   * reset to empty every time the @ menu closes. Never persisted across
+   * sessions -- folder navigation is a per-interaction concern.
+   */
+  currentPath?: string;
 }
 
 export type DynamicMentionProvider = (
@@ -184,199 +205,139 @@ export function resolveExecutionDirectives(
 }
 
 /**
- * Client-side Workspace Files Provider.
+ * Workspace Browser Provider (folder-aware).
  *
- * [FIX-1.2]
- *   - `insertText` now uses the bare filename wrapped in backticks, WITHOUT
- *     the @ prefix. The editor stores a plain, human-readable token that the
- *     LLM will treat as a literal filename reference.
- *   - `mentionToken` carries the bare filename for existence checks.
- *   - `metadata` carries canonical file information (relPath, fileName, origin)
- *     so the composer can build a `context_refs` array without re-parsing.
- *   - `id` now uses the full path (not just the name) to disambiguate files
- *     with identical basenames in different subdirectories.
+ * Replaces the old flat-file providers so the @ menu shows EXACTLY what
+ * the workspace contains at the current drill-down level: folders first,
+ * then files, like a standard file picker. The three previous providers
+ * (``sessionWorkspaceFilesProvider``, ``storeAgentsProvider``,
+ * ``storeToolsProvider``) are gone: agents and tools are selected from
+ * the toolbar, not from the @ menu.
+ *
+ * Scope resolution (highest precedence first)
+ * -------------------------------------------
+ *   * ``context.projectId`` -> scope=project (project workspace, may be
+ *     an external path that lives outside storage/).
+ *   * ``context.chatId``    -> scope=chat (per-chat files directory).
+ *   * neither               -> scope=global (project root).
+ *
+ * The global fallback keeps @ usable on the landing page before any
+ * chat or project exists, which matches the pre-existing behaviour where
+ * the menu always worked outside a session.
+ *
+ * Folder navigation
+ * -----------------
+ * ``context.currentPath`` selects the directory to list within the
+ * scope. Empty string (or undefined) means the scope root. The typeahead
+ * plugin owns this state and passes it on every ``getMentionItems``
+ * call. Folders are returned as ``category: 'folder'`` items with an
+ * empty ``insertText``: selecting one navigates into it rather than
+ * inserting text. Files keep the pre-existing structured-mention shape
+ * (``@[name]`` + ``metadata.relPath``) so the composer's file resolution
+ * pipeline is unchanged.
+ *
+ * Why level-scoped, not recursive
+ * -------------------------------
+ * The old provider returned every file in the workspace as a flat list.
+ * That becomes unusable once the workspace grows past a few hundred
+ * entries and gives no way to reach folders that are empty at the
+ * moment. Folder-by-folder navigation mirrors the screenshot UX and
+ * stays readable at any workspace size. Recursive fuzzy search can be
+ * layered on later as an opt-in; it is intentionally NOT part of this
+ * change.
  */
-async function sessionWorkspaceFilesProvider(
+async function workspaceBrowserProvider(
   query = '',
   context?: MentionContext
 ): Promise<MentionItem[]> {
   if (typeof window === 'undefined') return [];
 
+  const params = new URLSearchParams();
+  if (context?.projectId) {
+    params.set('scope', 'project');
+    params.set('project_id', context.projectId);
+  } else if (context?.chatId) {
+    params.set('scope', 'chat');
+    params.set('chat_id', context.chatId);
+  } else {
+    params.set('scope', 'global');
+  }
+
+  const currentPath = (context?.currentPath || '')
+    .replace(/\\/g, '/')
+    .trim();
+  if (currentPath) params.set('path', currentPath);
+  if (query) params.set('query', query);
+
   try {
-    const res = await fetch('/api/files');
-    if (!res.ok) return [];
+    const res = await fetch(`/api/files/browse?${params.toString()}`);
+    if (!res.ok) {
+      // Non-OK means the endpoint rejected the request (bad scope,
+      // traversal attempt, project not found). A genuine error worth
+      // surfacing in the console -- unlike an empty folder, which is a
+      // legitimate and common state.
+      console.debug(
+        `[CommandRegistry] browse failed: ${res.status} ${res.statusText}`
+      );
+      return [];
+    }
 
     const data = await res.json();
-    const filesList: Array<{ name: string; path?: string; rel_root?: string; origin?: string }> =
-      Array.isArray(data) ? data : data.files || [];
+    const entries: Array<{
+      name: string;
+      path: string;
+      is_dir: boolean;
+      type: string;
+      size: number;
+    }> = Array.isArray(data?.entries) ? data.entries : [];
 
-    const lower = query.toLowerCase();
-    const targetChatId = context?.chatId;
+    return entries.map((entry) => {
+      const fullPath = entry.path;
 
-    const filtered = filesList.filter((f) => {
-      const normalizedPath = (f.path || f.rel_root || '').replace(/\\/g, '/');
-
-      if (targetChatId) {
-        // [FIX-5.3] When a chat is active, restrict the @ mention menu to
-        // files belonging to this specific chat. This prevents legacy
-        // workspace/ duplicates (created by the old mirror-upload behavior)
-        // from appearing twice.
-        //
-        // Legacy files that were uploaded BEFORE the mirror-upload removal
-        // exist in BOTH `workspace/` and `chats/<cid>/files/`. The chat
-        // copy is canonical; the workspace copy is discarded here.
-        const isThisChatFile = normalizedPath.includes(
-          `chats/${targetChatId}/files/`
-        );
-        if (!isThisChatFile) return false;
-      } else {
-        // No chat context yet (fresh session): fall back to workspace files
-        // so the user can reference previously uploaded material.
-        const isWorkspaceFile =
-          f.origin === 'workspace' || normalizedPath.startsWith('workspace/');
-        if (!isWorkspaceFile) return false;
+      if (entry.is_dir) {
+        // Folders: no insertText. Selecting one triggers a drill-down in
+        // the typeahead plugin's folder branch. The label omits any
+        // trailing slash so the menu reads like an IDE sidebar; the
+        // description spells out the kind explicitly.
+        return {
+          id: `folder-${fullPath}`,
+          label: entry.name,
+          description: `Folder \u00b7 ${fullPath}`,
+          category: 'folder' as MentionCategory,
+          insertText: '',
+          mentionToken: entry.name,
+          icon: 'Folder',
+          metadata: {
+            folderPath: fullPath,
+            isDir: true,
+          },
+        };
       }
 
-      return !lower || f.name.toLowerCase().includes(lower);
-    });
-
-    return filtered.map((f) => {
-      const normalizedRelPath = (f.path || f.rel_root || f.name).replace(/\\/g, '/');
       return {
-        // [FIX-1.2a] Use full relative path as the unique id.
-        id: `file-${normalizedRelPath}`,
-        // [FIX-1.2b] Label stays with @ for the menu UI.
-        label: `@${f.name}`,
-        description: f.path ? `Workspace: ${f.path}` : 'Workspace file',
+        id: `file-${fullPath}`,
+        label: `@${entry.name}`,
+        description: `Workspace \u00b7 ${fullPath}`,
         category: 'file' as MentionCategory,
-        // [FIX-1.2c] Insert the bare filename in backticks — NO @ prefix.
-        insertText: `@[${f.name}] `,
-        // [FIX-1.2d] Bare token for existence checks.
-        mentionToken: f.name,
+        insertText: `@[${entry.name}] `,
+        mentionToken: entry.name,
         icon: 'FileText',
-        // [FIX-1.2e] Canonical metadata for downstream context_refs.
         metadata: {
-          relPath: normalizedRelPath,
-          fileName: f.name,
-          origin: f.origin || 'unknown',
+          relPath: fullPath,
+          fileName: entry.name,
+          origin: 'workspace',
         },
       };
     });
   } catch (err) {
-    console.error('[CommandRegistry] Error fetching workspace files:', err);
+    console.error('[CommandRegistry] browse provider error:', err);
     return [];
   }
 }
 
-/**
- * Dynamic Store & Core Agents Provider:
- * Automatically loads built-in agents and store-installed agents into the @ selector.
- *
- * [FIX-1.3] `insertText` no longer contains the @ prefix.
- * The user sees "@peldrun" in the menu, but the editor receives "peldrun".
- */
-async function storeAgentsProvider(query = ''): Promise<MentionItem[]> {
-  if (typeof window === 'undefined') return [];
 
-  try {
-    let agentsList: any[] = [];
-    const res = await fetch('/api/agents');
-    if (res.ok) {
-      const data = await res.json();
-      agentsList = Array.isArray(data) ? data : data.agents || [];
-    } else {
-      const fallbackRes = await fetch('/api/store/agents');
-      if (fallbackRes.ok) {
-        const fallbackData = await fallbackRes.json();
-        agentsList = Array.isArray(fallbackData) ? fallbackData : fallbackData.agents || [];
-      }
-    }
 
-    const lower = query.toLowerCase();
-    const filtered = agentsList.filter((a) => {
-      const id = String(a.id || '').toLowerCase();
-      const name = String(a.name || '').toLowerCase();
-      return !lower || id.includes(lower) || name.includes(lower);
-    });
 
-    return filtered.map((a) => {
-      const bareId = String(a.id);
-      return {
-        id: `agent-${bareId}`,
-        label: `@${bareId}`,
-        description: a.name ? `${a.name} — ${a.description || 'Agent'}` : a.description || 'Agent',
-        category: 'agent' as MentionCategory,
-        // [FIX-1.3] No @ prefix; bare token in backticks.
-        insertText: `\`${bareId}\` `,
-        mentionToken: bareId,
-        icon: 'Bot',
-        metadata: {
-          agentId: bareId,
-          name: a.name,
-          systemPrompt: a.system_prompt,
-          tools: a.tools,
-        },
-      };
-    });
-  } catch (err) {
-    console.debug('[CommandRegistry] Notice: Could not load store agents:', err);
-    return [];
-  }
-}
-
-/**
- * Dynamic Store & Tools/MCP Provider:
- * Automatically queries active tools, plugins, and MCP capabilities.
- *
- * [FIX-1.4] `insertText` no longer contains the @ prefix.
- */
-async function storeToolsProvider(query = ''): Promise<MentionItem[]> {
-  if (typeof window === 'undefined') return [];
-
-  try {
-    let toolsList: any[] = [];
-    const res = await fetch('/api/tools');
-    if (res.ok) {
-      const data = await res.json();
-      toolsList = Array.isArray(data) ? data : data.tools || [];
-    } else {
-      const storeRes = await fetch('/api/store/tools');
-      if (storeRes.ok) {
-        const storeData = await storeRes.json();
-        toolsList = Array.isArray(storeData) ? storeData : storeData.tools || [];
-      }
-    }
-
-    const lower = query.toLowerCase();
-    const filtered = toolsList.filter((t) => {
-      const id = String(t.id || t.name || '').toLowerCase();
-      const desc = String(t.description || '').toLowerCase();
-      return !lower || id.includes(lower) || desc.includes(lower);
-    });
-
-    return filtered.map((t) => {
-      const toolId = String(t.id || t.name || '');
-      return {
-        id: `tool-${toolId}`,
-        label: `@${toolId}`,
-        description: t.description || 'Callable tool capability',
-        category: 'tool' as MentionCategory,
-        // [FIX-1.4] No @ prefix; bare token in backticks.
-        insertText: `\`${toolId}\` `,
-        mentionToken: toolId,
-        icon: 'Wrench',
-        metadata: {
-          toolId: toolId,
-          name: t.name,
-          parameters: t.parameters,
-        },
-      };
-    });
-  } catch (err) {
-    console.debug('[CommandRegistry] Notice: Could not load store tools:', err);
-    return [];
-  }
-}
 
 class CommandRegistryStore {
   private slashCommands: Map<string, SlashCommandItem> = new Map();
@@ -386,9 +347,11 @@ class CommandRegistryStore {
 
   constructor() {
     this.registerDefaultCommands();
-    this.registerMentionProvider(sessionWorkspaceFilesProvider);
-    this.registerMentionProvider(storeAgentsProvider);
-    this.registerMentionProvider(storeToolsProvider);
+    // Only one dynamic mention provider remains: the workspace browser.
+    // Agents and tools are chosen from the composer toolbar (AgentSelector,
+    // ActiveToolsModal) -- not from the @ menu. Re-adding them here would
+    // reintroduce the clutter this provider consolidation removed.
+    this.registerMentionProvider(workspaceBrowserProvider);
     this.setupExternalEventListener();
   }
 
