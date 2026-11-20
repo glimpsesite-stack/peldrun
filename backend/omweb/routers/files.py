@@ -27,7 +27,16 @@ router = APIRouter()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WORKSPACE_DIR = PROJECT_ROOT / "workspace"
-STORAGE_DIR = PROJECT_ROOT / "storage"
+
+# Match the one canonical storage root used by ProjectManager and the
+# project workspace API. A hard-coded PROJECT_ROOT/storage here can point
+# at a different tree when PELDRUN uses a configured/custom storage root.
+try:
+    from omweb.config import STORAGE_ROOT as _CANONICAL_STORAGE_ROOT
+    STORAGE_DIR = Path(_CANONICAL_STORAGE_ROOT).expanduser().resolve()
+except Exception:
+    STORAGE_DIR = (PROJECT_ROOT / "storage").resolve()
+
 CHATS_DIR = STORAGE_DIR / "chats"
 PROJECTS_DIR = STORAGE_DIR / "projects"
 
@@ -682,7 +691,8 @@ async def browse_workspace(
 ):
     """
     List the immediate children (files AND folders) of a directory within
-    one of three workspace scopes.
+    one of three workspace scopes. ``global`` is retained only as a
+    compatibility response and never enumerates the application/repository root.
 
     Why a dedicated endpoint instead of reusing ``list_workspace_files``?
     ---------------------------------------------------------------------
@@ -699,9 +709,9 @@ async def browse_workspace(
 
     Scopes
     ------
-    * ``global``  — the shared ``workspace/`` directory at PROJECT_ROOT.
-    * ``chat``    — ``storage/chats/<chat_id>/files/``. Requires
-      ``chat_id``. Auto-created on first use.
+    * ``global``  — deprecated; returns an empty list and never exposes PROJECT_ROOT.
+    * ``chat``    — the canonical chat ``files/`` directory. Requires
+      ``chat_id`` and uses ``project_id`` when the chat belongs to a project.
     * ``project`` — the project's workspace root (internal OR external,
       resolved via ``_resolve_project_workspace_root``). Requires
       ``project_id``.
@@ -736,26 +746,33 @@ async def browse_workspace(
         # Reject path-like chat ids (separator / traversal injection).
         if any(c in chat_id for c in ("/", "\\")) or ".." in chat_id:
             raise HTTPException(status_code=400, detail="Invalid chat_id")
-        root = (CHATS_DIR / chat_id / "files").resolve()
-        # No ``mkdir`` here: browsing must be a pure read. A chat that
-        # has never had a file uploaded returns an empty tree via the
-        # ``not target.exists()`` branch below, and the chat's files
-        # directory is created by ``upload_workspace_files`` on the
-        # first real upload instead of being fabricated by navigation.
+
+        # Reject path-like project ids before filesystem resolution.
+        if project_id and (
+            project_id in {".", ".."}
+            or any(c in project_id for c in ("/", "\\"))
+        ):
+            raise HTTPException(status_code=400, detail="Invalid project_id")
+
+        # ProjectManager is the canonical source for chat directory layout.
+        # In project chats this resolves to storage/projects/<project>/chats/<chat>,
+        # not the legacy storage/chats/<chat> path.
+        from omweb.project_manager import project_manager as _pm
+        chat_dir = _pm.get_chat_dir(chat_id, project_id or "default_project")
+        root = (chat_dir / "files").resolve()
+        # No mkdir here: browsing remains a pure read. A chat without a
+        # workspace/files directory deliberately returns an empty tree.
     elif scope == "global":
-        # Global scope browses the ENTIRE project root, not just the
-        # ``workspace/`` subdirectory. The composer @ menu is a project
-        # file picker: users expect to drill into ``backend/``,
-        # ``frontend/``, ``docs/``, ``scripts/``, ``installer/``, and
-        # ``workspace/`` side by side, exactly like an IDE file tree.
-        #
-        # Safety: ``_SKIP_DIR_NAMES`` and the leading-dot filter below
-        # keep VCS metadata, virtualenvs, node_modules, and dotfiles out
-        # of the listing. Individual file paths are validated again by
-        # the mention resolver (``_safe_resolve``) before any content is
-        # inlined into the prompt, so browsing wide does not mean the
-        # agent automatically reads everything.
-        root = PROJECT_ROOT.resolve()
+        # A missing chat/project workspace is NOT permission to browse the
+        # application checkout. Keep the old scope token for compatibility,
+        # but make it fail closed with an empty result.
+        return {
+            "scope": "global",
+            "current_path": "",
+            "parent_path": None,
+            "entries": [],
+            "count": 0,
+        }
     else:
         raise HTTPException(
             status_code=400,
@@ -1331,21 +1348,44 @@ async def get_raw_file(
 
 
 def _resolve_project_workspace_root(project_id: str) -> Optional[Path]:
-    """Resolve the workspace root for a project (external or internal).
+    """Resolve the exact project workspace used by the Projects API.
 
-    Returns ``None`` when project metadata cannot be read, so callers
-    can respond with a clean 404 instead of a 500.
+    Internal and external workspaces are resolved from project metadata.
+    Unknown projects and invalid workspace metadata return ``None``; they
+    must never silently fall back to the application checkout or another
+    project's directory.
     """
+    if (
+        not project_id
+        or any(sep in project_id for sep in ("/", "\\"))
+        or ".." in project_id
+    ):
+        return None
+
     try:
         from omweb.project_manager import project_manager as _pm
-        meta = _pm.get_project(project_id) or {}
-        ws_type = (meta.get("workspace_type") or "internal").lower()
+        meta = _pm.get_project(project_id)
+        if not isinstance(meta, dict):
+            return None
+
+        ws_type = (meta.get("workspace_type") or "internal").strip().lower()
         ws_cfg = (meta.get("workspace_path") or "").strip()
-        if ws_type == "external" and ws_cfg:
-            return Path(ws_cfg).expanduser().resolve()
-        return (
-            Path(_pm.storage_dir) / "projects" / project_id / "workspace"
-        ).resolve()
+
+        if ws_type == "external":
+            if not ws_cfg:
+                return None
+            root = Path(ws_cfg).expanduser().resolve()
+        elif ws_type == "internal":
+            root = (Path(_pm.storage_dir) / "projects" / project_id / "workspace").resolve()
+        else:
+            return None
+
+        # Missing workspace directories are an empty workspace, not a
+        # reason to fall back to the repository root. Existing non-directory
+        # targets are invalid workspace metadata.
+        if root.exists() and not root.is_dir():
+            return None
+        return root
     except Exception:
         return None
 

@@ -23,6 +23,7 @@ import {
 import {
   Bot,
   ChevronLeft,
+  ChevronRight,
   FileText,
   Folder,
   Sparkles,
@@ -51,18 +52,18 @@ interface TypeaheadMenuPluginProps {
    */
   projectId?: string | null;
   /**
-   * When ``false``, the plugin does not open the typeahead menu for
-   * either ``/`` (slash commands) or ``@`` (mentions). The characters
-   * themselves remain typeable as plain text; only the popup is
-   * suppressed.
-   *
-   * Used by both composers to disable slash-command and mention
-   * behaviour in chat mode, where skills are not supported and file
-   * references flow through the paperclip upload pipeline.
-   *
-   * Defaults to ``true``.
+   * Controls the slash-command (`/`) menu. Kept separate from file
+   * mentions so Chat mode can still browse folders and files with `@`
+   * while slash commands remain Agent-only.
+   * Defaults to `true`.
    */
   enabled?: boolean;
+  /**
+   * Controls the file/folder browser (`@`). It is enabled in both Chat
+   * and Agent modes by default and never exposes agent, tool, or skill
+   * mentions.
+   */
+  mentionsEnabled?: boolean;
 }
 
 function getTextBeforeCaret(editor: LexicalEditor): string {
@@ -95,6 +96,7 @@ export function TypeaheadMenuPlugin({
   chatId,
   projectId,
   enabled = true,
+  mentionsEnabled = true,
 }: TypeaheadMenuPluginProps) {
   const [editor] = useLexicalComposerContext();
   const [isOpen, setIsOpen] = useState(false);
@@ -143,13 +145,30 @@ export function TypeaheadMenuPlugin({
 
   useEffect(() => {
     let active = true;
-    if (triggerType === 'mention') {
+
+    if (triggerType === 'mention' && mentionsEnabled) {
       setIsLoading(true);
+
       commandRegistry
         .getMentionItems(queryString, { chatId, projectId, currentPath })
         .then((items) => {
           if (active) {
-            setDynamicMentions(items);
+            setDynamicMentions(
+              items.filter(
+                (item) =>
+                  item.category === 'folder' || item.category === 'file'
+              )
+            );
+            setIsLoading(false);
+          }
+        })
+        .catch((error) => {
+          if (active) {
+            console.error(
+              '[TypeaheadMenuPlugin] Failed to load files/folders:',
+              error
+            );
+            setDynamicMentions([]);
             setIsLoading(false);
           }
         });
@@ -157,10 +176,18 @@ export function TypeaheadMenuPlugin({
       setDynamicMentions([]);
       setIsLoading(false);
     }
+
     return () => {
       active = false;
     };
-  }, [triggerType, queryString, chatId, projectId, currentPath]);
+  }, [
+    triggerType,
+    queryString,
+    chatId,
+    projectId,
+    currentPath,
+    mentionsEnabled,
+  ]);
 
   /**
    * Reset the drill-down whenever the menu closes, no matter the reason
@@ -178,12 +205,10 @@ export function TypeaheadMenuPlugin({
     triggerType === 'slash' ? slashResults.length : dynamicMentions.length;
 
   useEffect(() => {
-    // When disabled, close any open menu and skip trigger detection
-    // entirely. Slash and mention characters remain typeable as plain
-    // text — only the popup is suppressed. This effect also re-runs
-    // when ``enabled`` flips, so a menu already open when the user
-    // switches to chat mode is closed cleanly.
-    if (!enabled) {
+    // Slash commands and file mentions have independent gates. This
+    // lets the composer keep `/` Agent-only without disabling `@` in
+    // direct Chat mode.
+    if (!enabled && !mentionsEnabled) {
       setIsOpen(false);
       setTriggerType(null);
       return;
@@ -192,7 +217,9 @@ export function TypeaheadMenuPlugin({
     return editor.registerUpdateListener(() => {
       const textBeforeCaret = getTextBeforeCaret(editor);
 
-      const slashMatch = textBeforeCaret.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/);
+      const slashMatch = enabled
+        ? textBeforeCaret.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/)
+        : null;
       if (slashMatch) {
         // Slash commands have no drill-down; reset lastTriggerRef so a
         // subsequent @ is treated as a fresh open.
@@ -204,9 +231,9 @@ export function TypeaheadMenuPlugin({
         return;
       }
 
-      const mentionMatch = textBeforeCaret.match(
-        /(?:^|\s)@([a-zA-Z0-9_./-]*)$/
-      );
+      const mentionMatch = mentionsEnabled
+        ? textBeforeCaret.match(/(?:^|\s)@([a-zA-Z0-9_./-]*)$/)
+        : null;
       if (mentionMatch) {
         // Fresh `@` (transition from null or slash) resets drill-down.
         // Continuation (user typing inside an already-open mention)
@@ -227,7 +254,24 @@ export function TypeaheadMenuPlugin({
       setIsOpen(false);
       setTriggerType(null);
     });
-  }, [editor, enabled]);
+  }, [editor, enabled, mentionsEnabled]);
+
+  // Close the active menu immediately when its feature is disabled.
+  useEffect(() => {
+    if (!enabled && triggerType === 'slash') {
+      setIsOpen(false);
+      setTriggerType(null);
+      lastTriggerRef.current = null;
+    }
+
+    if (!mentionsEnabled && triggerType === 'mention') {
+      setIsOpen(false);
+      setTriggerType(null);
+      setDynamicMentions([]);
+      setCurrentPath('');
+      lastTriggerRef.current = null;
+    }
+  }, [enabled, mentionsEnabled, triggerType]);
 
   const handleExecuteSelection = useCallback(
     (targetIndex?: number) => {
@@ -297,6 +341,11 @@ export function TypeaheadMenuPlugin({
         const selectedItem: MentionItem | undefined =
           dynamicMentions[indexToExecute];
         if (!selectedItem) return false;
+        // Defensive allowlist: this menu must never execute an agent, tool,
+        // skill, or custom mention even if a provider bypasses the fetch filter.
+        if (selectedItem.category !== 'folder' && selectedItem.category !== 'file') {
+          return false;
+        }
 
         // ── Folder drill-down ─────────────────────────────────────
         // Selecting a folder does NOT insert anything. Instead it
@@ -328,7 +377,8 @@ export function TypeaheadMenuPlugin({
             // metachar within that set is `.`, which matches its
             // literal self anyway when the query is exactly what is
             // in the editor.
-            const pattern = new RegExp(`@${queryString}$`);
+            const escapedQuery = queryString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(`@${escapedQuery}$`);
             const match = textBeforeCursor.match(pattern);
             if (!match || match.index === undefined) return;
 
@@ -355,8 +405,8 @@ export function TypeaheadMenuPlugin({
 
         // File references become structured Lexical nodes so they can be
         // styled distinctly, clicked, and carry their canonical path as a
-        // node attribute. Non-file mentions (agent / tool) fall through to
-        // the plain-text insertion path below.
+        // node attribute. The allowlist above prevents agent/tool/skill
+        // mentions from ever reaching this selection branch.
         const isFileMention =
           selectedItem.category === 'file' &&
           typeof selectedItem.metadata?.relPath === 'string' &&
@@ -366,6 +416,8 @@ export function TypeaheadMenuPlugin({
           const relPath = String(selectedItem.metadata!.relPath);
           const displayPath = getDisplayPathFromRelPath(relPath);
           const mentionText = `@[${displayPath}]`;
+          const fileOrigin =
+            selectedItem.metadata?.origin === 'global' ? 'global' : 'workspace';
 
           editor.update(() => {
             const selection = $getSelection();
@@ -383,13 +435,14 @@ export function TypeaheadMenuPlugin({
             const textBeforeCursor = fullText.slice(0, cursorOffset);
             const textAfterCursor = fullText.slice(cursorOffset);
 
-            const pattern = new RegExp(`@${queryString}$`);
+            const escapedQuery = queryString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(`@${escapedQuery}$`);
             const match = textBeforeCursor.match(pattern);
             if (!match || match.index === undefined) return;
 
             const beforeMention = textBeforeCursor.slice(0, match.index);
 
-            const mentionNode = $createFileMentionNode(mentionText, relPath);
+            const mentionNode = $createFileMentionNode(mentionText, relPath, fileOrigin);
             const spaceNode = $createTextNode(' ');
 
             if (textAfterCursor.length > 0) {
@@ -436,31 +489,6 @@ export function TypeaheadMenuPlugin({
           return true;
         }
 
-        // Non-file mention: insert plain text as before.
-        editor.update(() => {
-          const selection = $getSelection();
-          if ($isRangeSelection(selection)) {
-            const anchorNode = selection.anchor.getNode();
-            if ($isTextNode(anchorNode)) {
-              const text = anchorNode.getTextContent();
-              const pattern = new RegExp(`@${queryString}$`);
-              const newText = text.replace(pattern, selectedItem.insertText);
-              anchorNode.setTextContent(newText);
-              anchorNode.select();
-            }
-          }
-        });
-
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(
-            new CustomEvent('peldrun:mention-selected', {
-              detail: selectedItem,
-            })
-          );
-        }
-
-        setIsOpen(false);
-        return true;
       }
 
       return false;
@@ -558,9 +586,9 @@ export function TypeaheadMenuPlugin({
   return (
     <div
       ref={menuRef}
-      className="absolute bottom-full mb-2 start-0 z-[9999] w-80 max-h-64 overflow-y-auto rounded-xl border border-border/80 bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-150 font-sans"
+      className="absolute bottom-full mb-2 start-0 z-[9999] w-full max-h-[32rem] overflow-y-auto rounded-2xl border border-border/80 bg-popover/95 p-1.5 text-popover-foreground shadow-2xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-150 font-sans"
     >
-      <div className="px-2 py-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase flex items-center justify-between border-b border-border/40 mb-1">
+      <div className="sticky top-0 z-10 flex items-center justify-between border-b border-border/50 bg-popover/95 px-3 py-2">
         <div className="flex items-center gap-1 min-w-0 flex-1">
           {triggerType === 'mention' && currentPath && (
             <button
@@ -573,34 +601,37 @@ export function TypeaheadMenuPlugin({
                 setCurrentPath(parts.join('/'));
                 setSelectedIndex(0);
               }}
-              className="flex items-center justify-center w-4 h-4 rounded hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
+              className="me-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
               title="Go up one folder"
               aria-label="Go up one folder"
             >
-              <ChevronLeft size={11} />
+              <ChevronLeft size={15} />
             </button>
           )}
-          <span className="truncate">
-            {triggerType === 'slash'
-              ? 'Slash Commands'
-              : currentPath
-                ? currentPath
-                : 'Files & folders'}
+          <span className="truncate text-sm font-semibold text-foreground">
+            {triggerType === 'slash' ? 'Slash Commands' : 'Files & folders'}
           </span>
+          {triggerType === 'mention' && currentPath && (
+            <span className="ms-2 truncate text-xs font-normal text-muted-foreground">
+              {currentPath}
+            </span>
+          )}
         </div>
-        <span className="font-mono text-[9px] shrink-0 ml-2">
-          Tab / Enter to select
+        <span className="ms-2 shrink-0 text-[11px] text-muted-foreground">
+          ↑ ↓ to navigate · Enter to select
         </span>
       </div>
 
       {isLoading ? (
-        <div className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
-          <Sparkles size={14} className="animate-spin text-primary" />
-          <span>Querying available capabilities...</span>
+        <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-primary" />
+          <span>Loading files and folders...</span>
         </div>
       ) : activeResultsCount === 0 ? (
-        <div className="py-4 text-center text-xs text-muted-foreground">
-          No {triggerType === 'slash' ? 'commands' : 'matching items'} found
+        <div className="py-8 text-center text-sm text-muted-foreground">
+          {triggerType === 'slash'
+            ? 'No commands found'
+            : 'No files or folders found'}
         </div>
       ) : (
         <div className="flex flex-col gap-0.5">
@@ -659,62 +690,48 @@ export function TypeaheadMenuPlugin({
           {triggerType === 'mention' &&
             dynamicMentions.map((item, index) => {
               const isSelected = index === selectedIndex;
+              const isFolder = item.category === 'folder';
               return (
                 <button
                   key={item.id}
                   type="button"
+                  title={item.description || item.label}
                   onMouseDown={(e) => e.preventDefault()}
                   onMouseEnter={() => setSelectedIndex(index)}
                   onClick={(e) => {
                     e.preventDefault();
                     handleExecuteSelection(index);
                   }}
-                  className={`flex items-center gap-2.5 w-full px-2.5 py-1.5 rounded-lg text-start text-xs transition-colors cursor-pointer ${
+                  className={`flex min-h-10 w-full items-center gap-3 rounded-xl px-3 py-2 text-start text-sm transition-colors cursor-pointer ${
                     isSelected
-                      ? 'bg-primary text-primary-foreground font-medium'
-                      : 'hover:bg-muted text-foreground'
+                      ? 'bg-muted/80 text-foreground'
+                      : 'text-foreground hover:bg-muted/60'
                   }`}
                 >
-                  <div
-                    className={`p-1 rounded-md shrink-0 ${
-                      isSelected ? 'bg-primary-foreground/20' : 'bg-muted'
-                    }`}
-                  >
-                    {item.category === 'agent' ? (
-                      <Bot size={13} />
-                    ) : item.category === 'tool' ? (
-                      <Wrench size={13} />
-                    ) : item.category === 'folder' ? (
-                      <Folder size={13} className="text-amber-500" />
-                    ) : item.category === 'file' ? (
-                      <FileText size={13} />
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-muted/70">
+                    {isFolder ? (
+                      <Folder size={17} className="text-muted-foreground" />
                     ) : (
-                      <Sparkles size={13} />
+                      <FileText size={17} className="text-muted-foreground" />
                     )}
-                  </div>
-                  <div className="flex flex-col min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <span className="font-mono font-medium truncate">
-                        {item.label}
-                      </span>
-                      {item.category !== 'file' && (
-                        <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-muted/80 text-muted-foreground font-mono">
-                          {item.category}
-                        </span>
-                      )}
-                    </div>
-                    {item.description && (
-                      <span
-                        className={`text-[10px] truncate ${
-                          isSelected
-                            ? 'text-primary-foreground/80'
-                            : 'text-muted-foreground'
-                        }`}
-                      >
-                        {item.description}
-                      </span>
-                    )}
-                  </div>
+                  </span>
+                  <span className="min-w-0 flex-1 truncate font-medium">
+                    {item.label}{isFolder ? '/' : ''}
+                  </span>
+                  {isSelected && isFolder && (
+                    <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+                      <span>Browse folder</span>
+                      <kbd className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px]">
+                        Tab
+                      </kbd>
+                    </span>
+                  )}
+                  {isSelected && !isFolder && (
+                    <span className="shrink-0 text-xs text-muted-foreground">
+                      Enter to add
+                    </span>
+                  )}
+                  {isFolder && <ChevronRight size={15} className="shrink-0 text-muted-foreground/70" />}
                 </button>
               );
             })}

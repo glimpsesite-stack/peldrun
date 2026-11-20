@@ -2224,6 +2224,7 @@ export function ChatContainer({
           <div className="p-3 sm:p-4 bg-background shrink-0">
             <Composer
               chatId={activeChatId || undefined}
+              projectId={projectId}
               onSend={(textToSend, files, llmOverride) =>
                 handleStartTask(textToSend, llmOverride, files)
               }

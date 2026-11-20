@@ -21,12 +21,21 @@ from typing import Any, Dict, List, Optional
 storage_default = Path(__file__).resolve().parent.parent.parent / "storage"
 try:
     import omweb.config as om_cfg
-    if hasattr(om_cfg, "settings") and hasattr(om_cfg.settings, "storage_dir"):
-        storage_root = Path(om_cfg.settings.storage_dir).resolve()
-    elif hasattr(om_cfg, "STORAGE_DIR"):
-        storage_root = Path(om_cfg.STORAGE_DIR).resolve()
+
+    # ``STORAGE_ROOT`` is the canonical storage location used by the
+    # projects API, workspace services, and the rest of omweb. Prefer it
+    # over legacy settings names so ProjectManager never creates a second
+    # parallel ``storage/`` tree when the operator configured a custom root.
+    if getattr(om_cfg, "STORAGE_ROOT", None):
+        storage_root = Path(om_cfg.STORAGE_ROOT).expanduser().resolve()
+    elif hasattr(om_cfg, "settings") and hasattr(om_cfg.settings, "storage_dir"):
+        storage_root = Path(om_cfg.settings.storage_dir).expanduser().resolve()
+    elif getattr(om_cfg, "STORAGE_DIR", None):
+        storage_root = Path(om_cfg.STORAGE_DIR).expanduser().resolve()
     elif hasattr(om_cfg, "get_settings"):
-        storage_root = Path(om_cfg.get_settings().storage_dir).resolve()
+        storage_root = Path(om_cfg.get_settings().storage_dir).expanduser().resolve()
+    elif hasattr(om_cfg, "get_storage_root"):
+        storage_root = Path(om_cfg.get_storage_root()).expanduser().resolve()
     else:
         storage_root = storage_default.resolve()
 except Exception:

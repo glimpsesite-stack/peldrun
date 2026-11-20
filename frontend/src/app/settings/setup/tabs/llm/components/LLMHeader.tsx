@@ -65,7 +65,7 @@ export function LLMHeader({ activeSubTab, onSubTabChange }: LLMHeaderProps) {
       initial={{ opacity: 0, y: -12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-      className="border-b border-border backdrop-blur-xl w-full bg-muted"
+      className="border-b border-border backdrop-blur-xl w-full bg-muted relative"
     >
       {/* Title row */}
       <div className="max-w-full mx-auto px-4 pt-4 flex items-center gap-2.5">
@@ -84,7 +84,7 @@ export function LLMHeader({ activeSubTab, onSubTabChange }: LLMHeaderProps) {
       </p>
 
       {/* Sub-tab navigation */}
-      <div className="w-full mx-auto bg-custom">
+      <div className="w-full mx-auto bg-custom sticky top-0 z-50">
         <div className="flex items-center gap-1 border-b border-border/60 overflow-x-auto scrollbar-thin">
           {SUB_TABS.map((tab) => {
             const isActive = activeSubTab === tab.id;

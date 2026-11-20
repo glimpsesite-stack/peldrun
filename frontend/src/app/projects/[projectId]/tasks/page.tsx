@@ -78,26 +78,31 @@ export default function TasksPage() {
     }
   };
 
-  const handleCreateTask = async (taskData: {
-    title: string;
-    description?: string;
-    priority: TaskPriority;
-    assignee?: string;
-  }) => {
-    try {
-      // Add required fields: status and metadata
-      const newTask = await workspaceApi.createTask(projectId, {
-        ...taskData,
-        status: "todo" as TaskStatus,
-        metadata: {},
-      });
-      setTasks((prev) => [newTask, ...prev]);
-      setShowCreateModal(false);
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "Failed to create task";
-      alert(errorMessage);
-    }
-  };
+const handleCreateTask = async (taskData: {
+  title: string;
+  description?: string;
+  priority: TaskPriority;
+  assignee?: string;
+}) => {
+  try {
+    // Build payload, omitting undefined fields and empty metadata to avoid validation errors
+    const payload: any = {
+      title: taskData.title,
+      priority: taskData.priority,
+      status: "todo" as TaskStatus,
+    };
+
+    if (taskData.description) payload.description = taskData.description;
+    if (taskData.assignee) payload.assignee = taskData.assignee;
+
+    const newTask = await workspaceApi.createTask(projectId, payload);
+    setTasks((prev) => [newTask, ...prev]);
+    setShowCreateModal(false);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "Failed to create task";
+    alert(errorMessage);
+  }
+};
 
   const handleUpdateStatus = async (taskId: string, newStatus: TaskStatus) => {
     try {

@@ -244,7 +244,11 @@ export function categorizeChatTimeBucket(val?: string | number | null): ChatTime
 export async function fetchProjects(): Promise<Project[]> {
   const endpoint = "/api/chats/projects";
   try {
-    const res = await fetch(endpoint, { cache: "no-store" });
+    const res = await fetch(endpoint, {
+      cache: "no-store",
+      credentials: "include", // CRITICAL: Ensures auth cookies are sent on F5
+      headers: { "Accept": "application/json" }
+    });
     if (!res.ok) {
       throw new ApiError(
         `Failed to load projects (HTTP ${res.status})`,

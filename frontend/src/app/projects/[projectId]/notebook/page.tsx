@@ -8,23 +8,17 @@
  *
  * Features:
  * - List all Markdown files in the notebook directory
- * - Create new notes with Markdown content
- * - Edit notes with OCC (Optimistic Concurrency Control) support
+ * - Create new notes and open directly in rich editor mode
+ * - Edit notes with OCC (Optimistic Concurrency Control) support and toolbars
  * - Delete notes with confirmation
- * - Preview rendered Markdown
+ * - Preview rendered Markdown via MarkdownRenderer
  * - Support for internal links between notes ([[note-name]] syntax)
  * - Search notes by title and content
- *
- * Design Decisions:
- * - Uses workspaceApi for all file operations
- * - Integrates with OCCFileEditor for safe concurrent editing
- * - Notes are stored as .md files in the workspace's notebook/ directory
- * - Internal links use [[note-name]] syntax and are resolved to file paths
  */
 
 "use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   BookOpen,
@@ -38,12 +32,12 @@ import {
   FileText,
   X,
   Link as LinkIcon,
-  Clock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { workspaceApi } from "@/features/workspace/workspace-api";
 import { OCCConflictError } from "@/features/workspace/types";
-import { OCCFileEditor } from "@/features/workspace/occ-file-editor";
+import { NotebookEditor } from "@/features/workspace/notebook-editor";
 
 const NOTEBOOK_DIR = "notebook";
 
@@ -86,12 +80,17 @@ export default function NotebookPage() {
         }));
       setNotes(markdownFiles);
     } catch (err) {
-      // If the notebook directory doesn't exist, create it
-      if (err instanceof Error && err.message.includes("404")) {
+      // If the notebook directory doesn't exist, initialize empty notes list
+      const errorMessage = err instanceof Error ? err.message : "";
+      const isNotFoundError =
+        errorMessage.includes("404") ||
+        errorMessage.toLowerCase().includes("not found") ||
+        errorMessage.toLowerCase().includes("directory not found");
+
+      if (isNotFoundError) {
         setNotes([]);
       } else {
-        const errorMessage = err instanceof Error ? err.message : "Failed to load notes";
-        setError(errorMessage);
+        setError(errorMessage || "Failed to load notes");
         console.error("[NotebookPage] Failed to load notes:", err);
       }
     } finally {
@@ -107,6 +106,7 @@ export default function NotebookPage() {
     }
 
     const notePath = `${NOTEBOOK_DIR}/${safeName}.md`;
+    const newNote = { name: safeName, path: notePath };
 
     try {
       // Create the note with OCC (expected_version is empty for new files)
@@ -116,13 +116,17 @@ export default function NotebookPage() {
         expected_version: "",
       });
 
+      // Close modal immediately for better UX
       setShowCreateModal(false);
-      await loadNotes();
 
-      // Select the newly created note
-      const newNote = { name: safeName, path: notePath };
+      // Update state in correct order to ensure smooth transition to editor
+      setPreviewContent(content);
       setSelectedNote(newNote);
       setViewMode("edit");
+
+      // Update notes list in background without blocking UI
+      loadNotes();
+
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Failed to create note";
       alert(errorMessage);
@@ -164,10 +168,10 @@ export default function NotebookPage() {
     if (!selectedNote) return;
 
     try {
-      const response = await workspaceApi.updateFile(projectId, {
+      await workspaceApi.updateFile(projectId, {
         path: selectedNote.path,
         content,
-        expected_version: "", // Will be updated by OCCFileEditor
+        expected_version: "",
       });
       setPreviewContent(content);
     } catch (err) {
@@ -203,41 +207,17 @@ export default function NotebookPage() {
     return extractInternalLinks(previewContent);
   }, [selectedNote, previewContent]);
 
-  // Render markdown to HTML (basic implementation)
-  const renderMarkdown = (content: string): string => {
-    let html = content
-      // Headers
-      .replace(/^### (.*$)/gim, '<h3 class="text-lg font-semibold mt-4 mb-2">$1</h3>')
-      .replace(/^## (.*$)/gim, '<h2 class="text-xl font-semibold mt-5 mb-3">$1</h2>')
-      .replace(/^# (.*$)/gim, '<h1 class="text-2xl font-bold mt-6 mb-4">$1</h1>')
-      // Bold and italic
-      .replace(/\*\*\*(.*?)\*\*\*/gim, '<strong><em>$1</em></strong>')
-      .replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/gim, '<em>$1</em>')
-      // Code blocks
-      .replace(/```(\w+)?\n([\s\S]*?)```/gim, '<pre class="bg-muted p-3 rounded-md overflow-x-auto my-3"><code>$2</code></pre>')
-      // Inline code
-      .replace(/`([^`]+)`/gim, '<code class="bg-muted px-1.5 py-0.5 rounded text-sm">$1</code>')
-      // Links
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/gim, '<a href="$2" class="text-primary hover:underline" target="_blank" rel="noopener noreferrer">$1</a>')
-      // Internal links
-      .replace(/\[\[([^\]]+)\]\]/gim, (match, noteName) => {
-        const linkedNote = notes.find((n) => n.name === noteName);
-        if (linkedNote) {
-          return `<a href="#" onclick="window.selectNote('${linkedNote.path}'); return false;" class="text-primary hover:underline font-medium">$1</a>`;
-        }
-        return `<span class="text-muted-foreground line-through">$1</span>`;
-      })
-      // Lists
-      .replace(/^\s*-\s+(.*)$/gim, '<li class="ml-4">$1</li>')
-      .replace(/^\s*\d+\.\s+(.*)$/gim, '<li class="ml-4 list-decimal">$1</li>')
-      // Paragraphs
-      .replace(/\n\n/gim, '</p><p class="mb-3">')
-      // Line breaks
-      .replace(/\n/gim, '<br/>');
-
-    return `<div class="prose prose-sm max-w-none">${html}</div>`;
-  };
+  // Resolve [[note-name]] links to markdown links or strikethrough for missing notes
+  const resolvedPreviewContent = useMemo(() => {
+    if (!previewContent) return "";
+    return previewContent.replace(/\[\[([^\]]+)\]\]/g, (_match, noteName: string) => {
+      const linkedNote = notes.find((n) => n.name === noteName);
+      if (linkedNote) {
+        return `[${noteName}](#note-${encodeURIComponent(linkedNote.path)})`;
+      }
+      return `~~${noteName}~~`;
+    });
+  }, [previewContent, notes]);
 
   if (isLoading && notes.length === 0) {
     return (
@@ -250,9 +230,9 @@ export default function NotebookPage() {
   }
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-full ">
       {/* Notes List Sidebar */}
-      <div className="w-80 border-r border-border bg-card flex flex-col">
+      <div className="w-80 border-r border-border bg-sidebg flex flex-col">
         {/* Header */}
         <div className="p-4 border-b border-border">
           <div className="flex items-center justify-between mb-3">
@@ -368,8 +348,8 @@ export default function NotebookPage() {
             </div>
           </div>
         ) : viewMode === "edit" ? (
-          <div className="flex-1 flex flex-col">
-            <div className="h-12 border-b border-border bg-card px-4 flex items-center justify-between">
+          <div className="flex-1 flex flex-col overflow-auto ">
+            <div className="h-12 border-b border-border bg-muted px-4 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Edit size={14} className="text-muted-foreground" />
                 <span className="text-sm font-medium">Editing: {selectedNote.name}</span>
@@ -396,12 +376,14 @@ export default function NotebookPage() {
                 </Button>
               </div>
             </div>
-            <div className="flex-1 overflow-auto">
-              <OCCFileEditor
+            <div className="flex-1 overflow-hidden">
+              <NotebookEditor
+                key={selectedNote.path}
                 projectId={projectId}
                 filePath={selectedNote.path}
-                onSave={(response) => {
-                  setPreviewContent(response.content);
+                initialContent={previewContent}
+                onSave={(content) => {
+                  setPreviewContent(content);
                 }}
               />
             </div>
@@ -437,11 +419,24 @@ export default function NotebookPage() {
             </div>
 
             {/* Preview Content */}
-            <div className="flex-1 overflow-auto p-6">
+            <div className="flex-1 overflow-auto p-6 bg-card">
               <div
-                className="max-w-3xl mx-auto"
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(previewContent) }}
-              />
+                className="max-w-7xl mx-auto"
+                onClick={(e) => {
+                  const target = (e.target as HTMLElement).closest("a");
+                  const href = target?.getAttribute("href");
+                  if (href && href.startsWith("#note-")) {
+                    e.preventDefault();
+                    const notePath = decodeURIComponent(href.replace("#note-", ""));
+                    const linkedNote = notes.find((n) => n.path === notePath);
+                    if (linkedNote) {
+                      handleSelectNote(linkedNote);
+                    }
+                  }
+                }}
+              >
+                <MarkdownRenderer content={resolvedPreviewContent} />
+              </div>
 
               {/* Internal Links Section */}
               {internalLinks.length > 0 && (
@@ -503,17 +498,17 @@ interface CreateNoteModalProps {
 
 function CreateNoteModal({ onClose, onCreate }: CreateNoteModalProps) {
   const [name, setName] = useState("");
-  const [content, setContent] = useState("# New Note\n\nStart writing here...\n");
+  const defaultTemplate = "# New Note\n\nStart writing here...\n";
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
-    onCreate(name, content);
+    onCreate(name, defaultTemplate);
   };
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-auto">
+      <div className="bg-card border border-border rounded-xl p-6 max-w-lg w-full shadow-xl">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xl font-semibold flex items-center gap-2">
             <Plus size={20} />
@@ -531,7 +526,7 @@ function CreateNoteModal({ onClose, onCreate }: CreateNoteModalProps) {
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full px-3 py-2 bg-background border border-border rounded-md
+              className="w-full px-3 py-2 bg-background border border-border rounded-lg
                          focus:outline-none focus:ring-2 focus:ring-primary/50"
               placeholder="my-note-name"
               autoFocus
@@ -542,23 +537,13 @@ function CreateNoteModal({ onClose, onCreate }: CreateNoteModalProps) {
             </p>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium mb-1">Content</label>
-            <textarea
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              className="w-full px-3 py-2 bg-background border border-border rounded-md
-                         focus:outline-none focus:ring-2 focus:ring-primary/50 font-mono text-sm"
-              rows={12}
-            />
-            <p className="text-xs text-muted-foreground mt-1">
-              Supports Markdown. Use [[note-name]] for internal links.
-            </p>
+          <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs text-muted-foreground">
+            The note will open directly inside the rich editor box with the fixed formatting toolbar and floating selection toolbar active.
           </div>
 
-          <div className="flex gap-2 pt-4">
+          <div className="flex gap-2 pt-2">
             <Button type="submit" className="flex-1">
-              Create Note
+              Create &amp; Edit Note
             </Button>
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel

@@ -334,28 +334,28 @@ export default function ProjectDashboardPage() {
       label: "Sessions",
       value: sessionsCount === null ? "…" : String(sessionsCount),
       hint: "Active conversations",
-      color: "text-blue-500 bg-blue-500/10",
+      color: "text-blue-500",
     },
     {
       icon: CheckSquare,
       label: "Tasks",
       value: tasksCount === null ? "…" : String(tasksCount),
       hint: "Pending tasks",
-      color: "text-emerald-500 bg-emerald-500/10",
+      color: "text-emerald-500",
     },
     {
       icon: Folder,
       label: "Files",
       value: filesCount === null ? "…" : String(filesCount),
       hint: "Workspace files",
-      color: "text-amber-500 bg-amber-500/10",
+      color: "text-amber-500",
     },
     {
       icon: Calendar,
       label: "Created",
       value: formatDate(project.created_at),
       hint: "Project creation date",
-      color: "text-violet-500 bg-violet-500/10",
+      color: "text-violet-500",
       isDate: true,
     },
   ];
@@ -363,10 +363,10 @@ export default function ProjectDashboardPage() {
   const actions = [
     {
       icon: MessageSquare,
-      title: "Start Chat",
+      title: "Conversations & Chats",
       desc: "Begin a new conversation",
       href: `/projects/${projectId}/chat`,
-      color: "text-blue-500 bg-blue-500/10 group-hover:bg-blue-500/20",
+      color: "text-blue-500 group-hover:bg-blue-500/20",
     },
     {
       icon: CheckSquare,
@@ -374,7 +374,7 @@ export default function ProjectDashboardPage() {
       desc: "View and organize tasks",
       href: `/projects/${projectId}/tasks`,
       color:
-        "text-emerald-500 bg-emerald-500/10 group-hover:bg-emerald-500/20",
+        "text-emerald-500 group-hover:bg-emerald-500/20",
     },
     {
       icon: FileText,
@@ -382,7 +382,7 @@ export default function ProjectDashboardPage() {
       desc: "Project notes and docs",
       href: `/projects/${projectId}/notebook`,
       color:
-        "text-violet-500 bg-violet-500/10 group-hover:bg-violet-500/20",
+        "text-violet-500 group-hover:bg-violet-500/20",
     },
     {
       icon: GitBranch,
@@ -390,7 +390,7 @@ export default function ProjectDashboardPage() {
       desc: "Git repositories",
       href: `/projects/${projectId}/source-control`,
       color:
-        "text-amber-500 bg-amber-500/10 group-hover:bg-amber-500/20",
+        "text-amber-500 group-hover:bg-amber-500/20",
     },
   ];
 
@@ -432,7 +432,7 @@ export default function ProjectDashboardPage() {
         {/* Header */}
         <motion.div
           variants={fadeIn}
-          className="border-b border-border bg-card p-6"
+          className="border-b border-border bg-muted p-6"
         >
           <div className="flex items-start justify-between mb-6 gap-4">
             <div className="flex-1 min-w-0">
@@ -564,10 +564,10 @@ export default function ProjectDashboardPage() {
                     y: -2,
                     transition: { duration: 0.18, ease: "easeOut" },
                   }}
-                  className="group bg-card border border-border rounded-xl p-4 transition-colors hover:border-accent/40"
+                  className="group bg-card border border-card rounded-md p-4 transition-colors hover:border-rb/40 shadow-sm"
                 >
                   <div className="flex items-center gap-2 mb-3">
-                    <div className={`p-1.5 rounded-md ${stat.color}`}>
+                    <div className={`p-1.5 rounded-sm ${stat.color}`}>
                       <Icon size={14} />
                     </div>
                     <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
@@ -595,7 +595,7 @@ export default function ProjectDashboardPage() {
         {/* Quick actions */}
         <motion.div
           variants={fadeUp}
-          className="p-6 border-b border-border"
+          className="p-6 border-b border-border bg-custom"
         >
           <h2 className="text-xs font-semibold mb-3 text-muted-foreground uppercase tracking-wider">
             Quick Actions
@@ -613,11 +613,11 @@ export default function ProjectDashboardPage() {
                   }}
                   whileTap={{ scale: 0.98 }}
                   onClick={() => router.push(action.href)}
-                  className="group relative bg-card border border-border rounded-xl p-4 text-left hover:border-accent/40 hover:shadow-sm transition-all cursor-pointer"
+                  className="group relative bg-card border border-card rounded-md p-4 text-left hover:border-rby/40 shadow-sm hover:shadow-md transition-all cursor-pointer"
                 >
                   <div className="flex items-start justify-between mb-3">
                     <div
-                      className={`p-2 rounded-lg transition-colors ${action.color}`}
+                      className={`p-2 rounded-md transition-colors ${action.color}`}
                     >
                       <Icon size={16} />
                     </div>
@@ -640,10 +640,10 @@ export default function ProjectDashboardPage() {
 
         {/* Info */}
         <motion.div variants={fadeUp} className="p-6">
-          <h2 className="text-xs font-semibold mb-3 text-muted-foreground uppercase tracking-wider">
+          <h2 className="text-xs font-semibold mb-3 text-black uppercase tracking-wider">
             Project Information
           </h2>
-          <div className="bg-card border border-border rounded-xl p-5 space-y-4">
+          <div className="bg-card border border-card rounded-md p-5 space-y-4 shadow-sm">
             {infoRows.map((row, i) => {
               const Icon = row.icon;
               return (
@@ -656,14 +656,14 @@ export default function ProjectDashboardPage() {
                     duration: 0.35,
                     ease: EASE_OUT,
                   }}
-                  className="flex items-start gap-3"
+                  className="flex items-center gap-3"
                 >
-                  <div className="p-1.5 bg-muted rounded-md mt-0.5 shrink-0">
+                  <div className="mt-0.5 shrink-0">
                     <Icon size={13} className="text-muted-foreground" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium">{row.label}</div>
-                    <div className="text-xs text-muted-foreground mt-1">
+                    <div className="text-xs text-muted-foreground mt-1 bg-muted/60 p-1">
                       {row.value}
                     </div>
                   </div>

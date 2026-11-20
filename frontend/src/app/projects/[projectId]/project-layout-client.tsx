@@ -265,10 +265,10 @@ export function ProjectLayoutClient({
   }
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-background ">
       {/* Breadcrumbs */}
       <motion.div
-        className="border-b border-border bg-card px-6 py-3"
+        className="border-b border-border bg-custom px-6 py-3"
         initial={{ opacity: 0, y: -4 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3, ease: EASE_OUT }}

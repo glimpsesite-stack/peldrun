@@ -1,15 +1,11 @@
 // frontend/src/components/chat/composer/nodes/file-mention-node.ts
 /**
  * FileMentionNode — a Lexical TextNode subclass that represents an inline
- * clickable reference to a workspace file inside the composer editor.
+ * clickable reference to a workspace or application-root file.
  *
- * Renders as a blue, underlined, clickable span. Clicking dispatches a
- * `peldrun:open-file-in-workspace` event handled by ChatContainer, which
- * opens the file in the workspace panel.
- *
- * The node stores the canonical workspace-relative path as a node attribute
- * so downstream consumers (composer submit handler, backend injection) can
- * rely on the correct path rather than a lossy basename extraction.
+ * The node stores both the canonical relative path and its origin. A
+ * `workspace` reference is resolved inside the active chat/project workspace;
+ * a `global` reference is resolved inside the Peldrun application root.
  */
 
 import {
@@ -23,35 +19,56 @@ import {
   TextNode,
 } from "lexical";
 
+export type FileMentionOrigin = "workspace" | "global";
+
 export type SerializedFileMentionNode = Spread<
   {
     filePath: string;
+    /** Older serialized nodes omit this and are treated as workspace refs. */
+    fileOrigin?: FileMentionOrigin;
   },
   SerializedTextNode
 >;
 
 export class FileMentionNode extends TextNode {
   __filePath: string;
+  __fileOrigin: FileMentionOrigin;
 
   static getType(): string {
     return "file-mention";
   }
 
   static clone(node: FileMentionNode): FileMentionNode {
-    return new FileMentionNode(node.__text, node.__filePath, node.__key);
+    return new FileMentionNode(
+      node.__text,
+      node.__filePath,
+      node.__fileOrigin,
+      node.__key
+    );
   }
 
-  constructor(text: string, filePath: string, key?: NodeKey) {
+  constructor(
+    text: string,
+    filePath: string,
+    fileOrigin: FileMentionOrigin = "workspace",
+    key?: NodeKey
+  ) {
     super(text, key);
     this.__filePath = filePath;
+    this.__fileOrigin = fileOrigin;
   }
 
-  /** Returns the canonical workspace-relative path of the referenced file. */
+  /** Returns the canonical relative path of the referenced file. */
   getFilePath(): string {
     return this.getLatest().__filePath;
   }
 
-  /** Human-readable display text (without the @[...] wrapper). */
+  /** Identifies which safe root the backend should use for this path. */
+  getFileOrigin(): FileMentionOrigin {
+    return this.getLatest().__fileOrigin;
+  }
+
+  /** Human-readable display text (without the `@[...]` wrapper). */
   getDisplayName(): string {
     const text = this.getTextContent();
     const m = text.match(/^@\[([^\]]+)\]$/);
@@ -62,18 +79,19 @@ export class FileMentionNode extends TextNode {
     const dom = super.createDOM(config);
     dom.classList.add("peldrun-file-mention");
     dom.dataset.filePath = this.__filePath;
+    dom.dataset.fileOrigin = this.__fileOrigin;
     dom.dataset.fileName = this.getDisplayName();
     dom.setAttribute(
       "title",
-      `Click to open "${this.__filePath}" in the workspace panel`
+      this.__fileOrigin === "global"
+        ? `Application-root reference: ${this.__filePath} (included as context)`
+        : `Click to open "${this.__filePath}" in the workspace panel`
     );
     // Inline styles keep the node styled regardless of Tailwind purge.
-    // This DOM is created programmatically and would not survive Tailwind's
-    // static analysis pass, so utility classes must not be relied upon.
     dom.style.color = "#2563eb";
     dom.style.textDecoration = "underline";
     dom.style.textUnderlineOffset = "2px";
-    dom.style.cursor = "pointer";
+    dom.style.cursor = this.__fileOrigin === "global" ? "default" : "pointer";
     dom.style.fontWeight = "500";
     return dom;
   }
@@ -89,7 +107,19 @@ export class FileMentionNode extends TextNode {
       dom.dataset.filePath = newPath;
       dom.setAttribute(
         "title",
-        `Click to open "${newPath}" in the workspace panel`
+        this.__fileOrigin === "global"
+          ? `Application-root reference: ${newPath} (included as context)`
+          : `Click to open "${newPath}" in the workspace panel`
+      );
+    }
+    if (prevNode.getFileOrigin() !== this.getFileOrigin()) {
+      dom.dataset.fileOrigin = this.getFileOrigin();
+      dom.style.cursor = this.getFileOrigin() === "global" ? "default" : "pointer";
+      dom.setAttribute(
+        "title",
+        this.getFileOrigin() === "global"
+          ? `Application-root reference: ${this.getFilePath()} (included as context)`
+          : `Click to open "${this.getFilePath()}" in the workspace panel`
       );
     }
     return updated;
@@ -100,13 +130,18 @@ export class FileMentionNode extends TextNode {
   }
 
   static importJSON(serialized: SerializedFileMentionNode): FileMentionNode {
-    return $createFileMentionNode(serialized.text, serialized.filePath);
+    return $createFileMentionNode(
+      serialized.text,
+      serialized.filePath,
+      serialized.fileOrigin ?? "workspace"
+    );
   }
 
   exportJSON(): SerializedFileMentionNode {
     return {
       ...super.exportJSON(),
       filePath: this.__filePath,
+      fileOrigin: this.__fileOrigin,
       type: "file-mention",
       version: 1,
     };
@@ -129,9 +164,12 @@ export class FileMentionNode extends TextNode {
 
 export function $createFileMentionNode(
   text: string,
-  filePath: string
+  filePath: string,
+  fileOrigin: FileMentionOrigin = "workspace"
 ): FileMentionNode {
-  return $applyNodeReplacement(new FileMentionNode(text, filePath));
+  return $applyNodeReplacement(
+    new FileMentionNode(text, filePath, fileOrigin)
+  );
 }
 
 export function $isFileMentionNode(
@@ -142,9 +180,7 @@ export function $isFileMentionNode(
 
 /**
  * Extract the display-worthy portion of a canonical workspace-relative path.
- * Strips the `storage/chats/<cid>/files/` prefix (or the `workspace/`
- * prefix) so the mention shows `notes/todo.md` rather than the full
- * internal storage path.
+ * Strips storage prefixes used by the chat-scoped upload endpoints.
  */
 export function getDisplayPathFromRelPath(relPath: string): string {
   if (!relPath) return relPath;
@@ -157,16 +193,9 @@ export function getDisplayPathFromRelPath(relPath: string): string {
   return clean;
 }
 
-
 /**
- * Inject a one-time stylesheet that prepends a small paperclip glyph to
- * every `.peldrun-file-mention` span. This gives the mention a visible
- * icon without requiring an ElementNode wrapper (which would change
- * the node's decoration semantics and complicate the editor tree).
- *
- * The stylesheet is only injected in the browser, guarded by a unique
- * ID so it never duplicates across HMR cycles or multiple component
- * mounts.
+ * Inject a one-time stylesheet for the paperclip glyph. The node is styled
+ * here rather than through Tailwind because Lexical creates its DOM directly.
  */
 if (
   typeof document !== "undefined" &&

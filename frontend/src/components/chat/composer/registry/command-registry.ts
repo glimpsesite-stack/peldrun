@@ -260,7 +260,7 @@ async function workspaceBrowserProvider(
     params.set('scope', 'chat');
     params.set('chat_id', context.chatId);
   } else {
-    params.set('scope', 'global');
+    return [];
   }
 
   const currentPath = (context?.currentPath || '')
@@ -515,6 +515,10 @@ class CommandRegistryStore {
     query = '',
     context?: MentionContext
   ): Promise<MentionItem[]> {
+    if (!context?.projectId && !context?.chatId) {
+      return [];
+    }
+
     const staticList = Array.from(this.staticMentions.values());
     const lower = query.toLowerCase();
 
@@ -527,24 +531,30 @@ class CommandRegistryStore {
         )
       : staticList;
 
-    if (this.dynamicProviders.size === 0) {
-      return filteredStatic;
-    }
-
-    const dynamicPromises = Array.from(this.dynamicProviders).map(async (provider) => {
-      try {
-        return await provider(query, context);
-      } catch (err) {
-        console.debug('[CommandRegistry] Dynamic mention provider exception:', err);
-        return [];
+    const dynamicPromises = Array.from(this.dynamicProviders).map(
+      async (provider) => {
+        try {
+          return await provider(query, context);
+        } catch (err) {
+          console.debug(
+            '[CommandRegistry] Dynamic mention provider exception:',
+            err
+          );
+          return [];
+        }
       }
-    });
+    );
 
     const dynamicResults = await Promise.all(dynamicPromises);
     const combined = [...filteredStatic, ...dynamicResults.flat()];
 
     const uniqueMap = new Map<string, MentionItem>();
+
     for (const item of combined) {
+      if (item.category !== 'file' && item.category !== 'folder') {
+        continue;
+      }
+
       uniqueMap.set(item.id, item);
     }
 

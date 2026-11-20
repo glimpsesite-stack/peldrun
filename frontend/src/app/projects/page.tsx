@@ -43,10 +43,25 @@ export default function ProjectsPage() {
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState<"name" | "created_at">("created_at");
+  const [chatCounts, setChatCounts] = useState<Record<string, number>>({});
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
 
   // Load projects on mount
   React.useEffect(() => {
-    loadProjects();
+    const fetchProjects = async () => {
+      try {
+        // On F5, isInitialized is false, so loadProjects() will fetch automatically.
+        // We do NOT pass `true` here to avoid the store's "forced load honors empty result"
+        // heuristic wiping the state if there's a transient network glitch.
+        await loadProjects();
+      } catch (error) {
+        console.error("[ProjectsPage] Failed to load projects:", error);
+      } finally {
+        setIsInitialLoad(false);
+      }
+    };
+
+    fetchProjects();
   }, [loadProjects]);
 
   // Get all projects (excluding default_project)
@@ -78,6 +93,46 @@ export default function ProjectsPage() {
 
     return filtered;
   }, [allProjects, searchQuery, sortBy]);
+
+  // Fetch chat counts for filtered projects in parallel
+  React.useEffect(() => {
+    let cancelled = false;
+
+    const fetchChatCounts = async () => {
+      const counts: Record<string, number> = {};
+
+      await Promise.all(
+        filteredProjects.map(async (project) => {
+          try {
+            const res = await fetch(
+              `/api/chats/?project_id=${encodeURIComponent(project.id)}&limit=1`,
+              { credentials: "include", headers: { Accept: "application/json" } }
+            );
+            if (res.ok) {
+              const data = await res.json();
+              counts[project.id] = typeof data?.total === "number" ? data.total : 0;
+            } else {
+              counts[project.id] = 0;
+            }
+          } catch {
+            counts[project.id] = 0;
+          }
+        })
+      );
+
+      if (!cancelled) {
+        setChatCounts(counts);
+      }
+    };
+
+    if (filteredProjects.length > 0) {
+      fetchChatCounts();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [filteredProjects]);
 
   const handleCreateProject = () => {
     router.push("/projects/new");
@@ -124,7 +179,8 @@ export default function ProjectsPage() {
     });
   };
 
-  if (isLoading && allProjects.length === 0) {
+  // Show loader while explicitly waiting for the initial fetch to complete
+  if (isInitialLoad) {
     return (
       <div className="container mx-auto px-4 py-8">
         <div className="flex items-center justify-center h-64">
@@ -264,7 +320,7 @@ export default function ProjectsPage() {
                 </div>
                 <div className="flex items-center gap-1">
                   <MessageSquare size={12} />
-                  <span>0 chats</span>
+                  <span>{chatCounts[project.id] ?? 0} chats</span>
                 </div>
               </div>
 
@@ -331,7 +387,7 @@ export default function ProjectsPage() {
                 </div>
                 <div className="flex items-center gap-1">
                   <MessageSquare size={14} />
-                  <span>0 chats</span>
+                  <span>{chatCounts[project.id] ?? 0} chats</span>
                 </div>
               </div>
               <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">

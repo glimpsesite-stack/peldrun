@@ -55,25 +55,60 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 def _get_project_workspace_path(project_id: str) -> Path:
     """
-    Retrieves the workspace path for a project.
-    If not set, defaults to storage/projects/{project_id}/workspace
+    Resolves the canonical workspace path for a project.
+
+    Internal workspaces always use the canonical project storage path.
+    External workspaces use the configured absolute workspace path.
+    Invalid metadata must never fall back to another workspace.
     """
-    project = project_manager.get_project(project_id)
-    if not project:
+    if (
+        not project_id
+        or project_id in {".", ".."}
+        or any(sep in project_id for sep in ("/", "\\"))
+    ):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project not found: {project_id}"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project_id",
         )
 
-    workspace_path = project.get("workspace_path", "")
-    if not workspace_path:
-        # Default workspace path
-        workspace_path = str(STORAGE_ROOT / "projects" / project_id / "workspace")
-        # Update project metadata
-        project["workspace_path"] = workspace_path
-        # Note: In production, you'd want to persist this update
+    project = project_manager.get_project(project_id)
+    if not isinstance(project, dict):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project not found: {project_id}",
+        )
 
-    return Path(workspace_path).resolve()
+    workspace_type = str(
+        project.get("workspace_type") or "internal"
+    ).strip().lower()
+
+    if workspace_type == "internal":
+        workspace_path = (
+            STORAGE_ROOT / "projects" / project_id / "workspace"
+        )
+    elif workspace_type == "external":
+        configured_path = project.get("workspace_path")
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="External workspace path is not configured",
+            )
+        workspace_path = Path(configured_path).expanduser()
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid workspace_type: {workspace_type}",
+        )
+
+    resolved_path = workspace_path.resolve()
+
+    if resolved_path.exists() and not resolved_path.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Configured workspace path is not a directory",
+        )
+
+    return resolved_path
 
 
 def _get_workspace_service(project_id: str) -> WorkspaceService:
@@ -422,15 +457,25 @@ async def list_workspace_files(
     """
     workspace_path = _get_project_workspace_path(project_id)
 
-    if not workspace_path.exists():
-        return []
+    from omweb.projects.workspace_service import resolve_safe_path
 
-    target_dir = workspace_path / path if path else workspace_path
+    target_dir = resolve_safe_path(
+        str(workspace_path),
+        path or "",
+    )
 
-    if not target_dir.exists() or not target_dir.is_dir():
+    if not target_dir.exists():
+        if not path:
+            return []
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Directory not found: {path}"
+            detail=f"Directory not found: {path}",
+        )
+
+    if not target_dir.is_dir():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Directory not found: {path}",
         )
 
     files = []
@@ -715,19 +760,29 @@ async def get_task(project_id: str, task_id: str):
     return TaskResponse(**task)
 
 
+class TaskCreateRequest(BaseModel):
+    """Payload for creating a new task.
+    Only includes fields that the client should provide during creation.
+    """
+    title: str = Field(..., min_length=1, description="Task title")
+    description: Optional[str] = Field(default=None, description="Task description")
+    priority: str = Field(default="medium", description="Task priority: low, medium, high, critical")
+    status: str = Field(default="todo", description="Initial task status")
+    assignee: Optional[str] = Field(default=None, description="Task assignee")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Additional metadata")
+
+
 @router.post("/{project_id}/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(
     project_id: str,
-    task: TaskResponse
+    task: TaskCreateRequest
 ):
     """
     Creates a new task in the project.
     """
     import uuid
-
     task_manager = _get_task_manager()
     task_id = f"task_{uuid.uuid4().hex[:8]}"
-
     created_task = task_manager.create_task(
         task_id=task_id,
         project_id=project_id,
@@ -735,39 +790,43 @@ async def create_task(
         description=task.description,
         priority=task.priority,
         assignee=task.assignee,
-        metadata=task.metadata
+        metadata=task.metadata or {},
+        actor="user"
     )
-
     return TaskResponse(**created_task)
+
+
+class TaskStatusUpdateRequest(BaseModel):
+    """Payload for updating task status.
+    Accepts status change data from request body.
+    """
+    status: str = Field(..., description="New task status")
+    actor: str = Field(default="user", description="Actor making the change")
+    reason: Optional[str] = Field(default=None, description="Reason for status change")
 
 
 @router.patch("/{project_id}/tasks/{task_id}/status", response_model=TaskResponse)
 async def update_task_status(
     project_id: str,
     task_id: str,
-    status: str = Query(..., description="New task status"),
-    actor: str = Query(default="user", description="Actor making the change"),
-    reason: Optional[str] = Query(default=None, description="Reason for status change")
+    request: TaskStatusUpdateRequest
 ):
     """
     Updates task status with validation and audit logging.
     """
     task_manager = _get_task_manager()
-
     try:
         updated_task = task_manager.update_task_status(
             task_id=task_id,
-            new_status=status,
-            actor=actor,
-            reason=reason
+            new_status=request.status,
+            actor=request.actor,
+            reason=request.reason
         )
-
         if updated_task["project_id"] != project_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Task not found in project: {task_id}"
             )
-
         return TaskResponse(**updated_task)
     except Exception as e:
         raise HTTPException(
