@@ -350,7 +350,8 @@ export function AgentCard({
           size="sm"
           disabled={isDisabled}
           onClick={() => onStartChat(agent)}
-          className="bg-primary hover:bg-rb/90 hover:text-primary-foreground text-primary text-xs px-3.5 h-8 font-medium shadow-xs transition group/btn cursor-pointer disabled:opacity-40"
+          variant = "primary"
+          className=" hover:text-primary-foreground text-card text-xs px-3.5 h-8 font-medium shadow-xs transition group/btn cursor-pointer disabled:opacity-40"
         >
           <span>Start Chat</span>
           <ArrowRight

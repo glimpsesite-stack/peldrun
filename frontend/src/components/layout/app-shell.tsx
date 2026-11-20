@@ -5,8 +5,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   MessageSquare,
-  Folder,
-  FolderOpen,
+  LibraryBig,
+  BriefcaseBusiness,
   Settings,
   Store,
   History,
@@ -27,8 +27,8 @@ import { SystemHealthPill } from '@/components/layout/SystemHealthPill';
 
 const navItems = [
   { href: "/chat", icon: MessageSquare, label: "Chat" },
-  { href: "/projects", icon: FolderOpen, label: "Projects" },
-  { href: "/files", icon: Folder, label: "Files" },
+  { href: "/projects", icon: BriefcaseBusiness, label: "Projects" },
+  { href: "/files", icon: LibraryBig, label: "Files" },
   { href: "/history", icon: History, label: "History" },
 
 

@@ -372,16 +372,16 @@ useEffect(() => {
         )}
 
         {isMarkdown && (
-          <div className="w-full h-full overflow-y-auto p-6 md:p-8 bg-card/40">
-            <div className="max-w-3xl mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
+          <div className="w-full h-full overflow-y-auto p-4 bg-card/40">
+            <div className="mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
               <MarkdownRenderer content={rawContent} />
             </div>
           </div>
         )}
 
         {isTxt && (
-          <div className="w-full h-full overflow-y-auto p-6 md:p-8 bg-card/40">
-            <div className="max-w-3xl mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
+          <div className="w-full h-full overflow-y-auto p-2 bg-card/40">
+            <div className="mx-auto rounded-sm border border-border/80 bg-card p-6 shadow-peldrun-sm">
               <pre className="whitespace-pre-wrap break-words font-mono text-xs md:text-sm leading-relaxed text-foreground/90 select-text">
                 {rawContent}
               </pre>

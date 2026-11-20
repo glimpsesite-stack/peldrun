@@ -11,7 +11,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     const base = "inline-flex items-center justify-center font-medium transition-colors focus-visible:outline-none disabled:opacity-50 disabled:pointer-events-none rounded-xs ";
 
     const variants: Record<string, string> = {
-      primary: "bg-black hover:text-[#fff] shadow-peldrun-xs",
+      primary: "bg-black/70 text-card hover:bg-black  hover:text-muted shadow-peldrun-xs",
       secondary: "bg-muted hover:bg-black hover:text-[#fff] border-[1px] border-black hover:border-none shadow-peldrun-xs",
       outline: "border border-rb bg-transparent hover:bg-rb text-black hover:text-[#fff] shadow-peldrun-xs ",
       glow: "bg-primary text-primary-foreground shadow-[0_0_15px_rgba(136,81,255,0.4)] hover:shadow-[0_0_20px_rgba(136,81,255,0.6)]",

@@ -242,8 +242,9 @@ export default function NotebookPage() {
             </h1>
             <Button
               size="sm"
+              variant = "save"
               onClick={() => setShowCreateModal(true)}
-              className="gap-1.5"
+              className="gap-1.5 text-[#fff]"
             >
               <Plus size={14} />
               New
@@ -526,8 +527,8 @@ function CreateNoteModal({ onClose, onCreate }: CreateNoteModalProps) {
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className="w-full px-3 py-2 bg-background border border-border rounded-lg
-                         focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-full px-3 py-2 bg-background border border-border rounded-md
+                         focus:outline-none focus:ring-1 focus:ring-rb/10"
               placeholder="my-note-name"
               autoFocus
               required
@@ -537,12 +538,12 @@ function CreateNoteModal({ onClose, onCreate }: CreateNoteModalProps) {
             </p>
           </div>
 
-          <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs text-muted-foreground">
+          <div className="rounded-lg border border-card bg-muted p-3 text-xxs text-muted-foreground">
             The note will open directly inside the rich editor box with the fixed formatting toolbar and floating selection toolbar active.
           </div>
 
           <div className="flex gap-2 pt-2">
-            <Button type="submit" className="flex-1">
+            <Button type="submit" className="flex-1" variant = "save">
               Create &amp; Edit Note
             </Button>
             <Button type="button" variant="outline" onClick={onClose}>
