@@ -14,10 +14,11 @@
 //   - Open in workspace sandbox (emits a CustomEvent)
 //   - Collapse / expand for long snippets
 
-"use client";
+ "use client";
 
 import React, { useState } from "react";
 import { Highlight, themes } from "prism-react-renderer";
+import { useTheme } from "@/components/layout/theme-provider";
 import {
   Check,
   Copy,
@@ -189,8 +190,20 @@ export function CodeBlock({
   filename,
   className = "",
 }: CodeBlockProps): React.JSX.Element {
+  const { theme } = useTheme();
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+
+  // Determine if the current theme is dark
+  // Handles "dark", "light", and "system" (based on OS preference)
+  const isDark =
+    theme === "dark" ||
+    (theme === "system" &&
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches);
+
+  // Dynamically select the syntax highlighting theme based on the current mode
+  const codeTheme = isDark ? themes.vsDark : themes.vsLight;
 
   const cleanCode = typeof code === "string" ? code.trim() : String(code ?? "");
   const lines = cleanCode.split("\n");
@@ -265,10 +278,10 @@ export function CodeBlock({
   return (
     <div
       dir="ltr"
-      className={`my-3 overflow-hidden rounded-sm border border-border bg-[#0d1117] text-slate-100 shadow-peldrun-sm font-mono ${className}`}
+      className={`my-3 overflow-hidden rounded-sm border border-card bg-card text-slate-100 shadow-peldrun-sm font-mono ${className}`}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-3.5 py-2 border-b border-border/60 bg-[#161b22]">
+      <div className="flex items-center justify-between px-3.5 py-2 border-b border-border/60 bg-custom">
         <div className="flex items-center gap-2 truncate">
           {normalizedLang === "bash" ? (
             <Terminal size={13} className="text-primary flex-shrink-0" />
@@ -339,7 +352,7 @@ export function CodeBlock({
         }`}
       >
         <HighlightComponent
-          theme={themes.nightOwl}
+          theme={codeTheme}
           code={cleanCode}
           language={normalizedLang}
         >
@@ -373,7 +386,7 @@ export function CodeBlock({
 
       {/* Expand / collapse for long snippets */}
       {isLong && (
-        <div className="flex items-center justify-center p-1.5 border-t border-border/40 bg-[#161b22]/70">
+        <div className="flex items-center justify-center p-1.5 border-t border-border/40 bg-custom">
           <button
             type="button"
             onClick={() => setIsExpanded(!isExpanded)}

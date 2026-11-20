@@ -284,7 +284,7 @@ export default function ProjectsPage() {
           {filteredProjects.map((project) => (
             <div
               key={project.id}
-              className="group relative bg-card border border-border rounded-lg p-6 hover:shadow-lg transition-all cursor-pointer"
+              className="group relative bg-card border border-card shadow-sm rounded-md p-6 hover:shadow-lg transition-all cursor-pointer"
               onClick={() => handleOpenProject(project.id)}
             >
               <div className="flex items-start justify-between mb-4">
@@ -332,7 +332,7 @@ export default function ProjectsPage() {
           {filteredProjects.map((project) => (
             <div
               key={project.id}
-              className="group flex items-center gap-4 bg-card border border-border rounded-lg p-4 hover:shadow-md transition-all cursor-pointer"
+              className="group flex items-center gap-4 bg-card border border-card shadow-sm rounded-sm p-4 hover:shadow-md transition-all cursor-pointer"
               onClick={() => handleOpenProject(project.id)}
             >
               <Folder size={24} className="text-primary shrink-0" />

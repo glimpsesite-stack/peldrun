@@ -1,9 +1,11 @@
-﻿"use client";
+﻿//frontend\src\components\workspace\editor-tab.tsx
+"use client";
 
 import React, { useEffect, useState, useRef } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import { Save, FileCode, Check, Copy, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useTheme } from "@/components/layout/theme-provider";
 
 export interface EditorTabProps {
   filePath?: string | null;
@@ -48,7 +50,16 @@ const extToLangMap: Record<string, string> = {
 };
 
 export function EditorTab({ filePath, initialContent, activeJobId, projectId, onSave }: EditorTabProps) {
+  const { theme } = useTheme();
   const [content, setContent] = useState<string>(initialContent || "");
+
+  // Determine if the current theme is dark to apply the correct syntax highlighting
+  const isDark =
+    theme === "dark" ||
+    (theme === "system" &&
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches);
+
   // SHA-256 version hash returned by the project workspace endpoint.
   // Used for Optimistic Concurrency Control (OCC) on save — if the
   // file changed since we last read it, the PUT is rejected with 409
@@ -310,14 +321,14 @@ export function EditorTab({ filePath, initialContent, activeJobId, projectId, on
   const HighlightComponent = Highlight as any;
 
   return (
-    <div className="flex flex-col h-full bg-[#0d1117] text-slate-100 font-sans select-text">
-      <div className="h-10 border-b border-[#30363d] bg-[#161b22] px-3.5 flex items-center justify-between shrink-0">
+    <div className="flex flex-col h-full dark:bg-[#0d1117] bg-white dark:text-slate-100 text-slate-900 font-sans select-text">
+      <div className="h-10 border-b dark:border-[#30363d] border-gray-200 dark:bg-[#161b22] bg-gray-50 px-3.5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <FileCode size={14} className="text-primary text-[#305CDE] shrink-0" />
-          <span className="font-mono text-xs font-semibold  truncate max-w-[180px] color-[#eee]">
+          <FileCode size={14} className="text-[#305CDE] shrink-0" />
+          <span className="font-mono text-xs font-semibold truncate max-w-[180px] dark:text-[#eee] text-slate-800">
             {filePath || "draft-snippet"}
           </span>
-          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#DEB230]/30  border border-border/40 shrink-0 color-[#ccc]">
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono dark:bg-[#DEB230]/30 bg-yellow-100 border border-border/40 shrink-0 dark:text-slate-300 text-slate-700">
             {displayLang}
           </span>
           <span className="text-[11px] font-mono text-muted-foreground hidden sm:inline">
@@ -353,7 +364,8 @@ export function EditorTab({ filePath, initialContent, activeJobId, projectId, on
             type="button"
             onClick={handleCopy}
             disabled={!content || saving}
-            className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all cursor-pointer disabled:opacity-30"
+            className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-mono
+            text-muted-foreground hover:text-card hover:bg-black transition-all cursor-pointer disabled:opacity-30"
             title="Copy file content"
           >
             {copied ? (
@@ -370,7 +382,7 @@ export function EditorTab({ filePath, initialContent, activeJobId, projectId, on
           </button>
 
           <Button
-            variant="primary"
+            variant="save"
             size="sm"
             onClick={handleSave}
             disabled={saving || loading || !filePath}
@@ -392,11 +404,11 @@ export function EditorTab({ filePath, initialContent, activeJobId, projectId, on
         </div>
       </div>
 
-      <div className="relative flex-1 flex min-h-0 bg-[#0d1117] overflow-hidden">
+      <div className="relative flex-1 flex min-h-0 dark:bg-[#0d1117] bg-white overflow-hidden">
         <div
           ref={gutterRef}
           aria-hidden="true"
-          className="select-none py-3 pl-3 pr-2.5 text-right font-mono text-[11px] leading-[20px] text-slate-500 bg-[#161b22]/70 border-r border-[#30363d]/60 overflow-hidden w-11 shrink-0"
+          className="select-none py-3 pl-3 pr-2.5 text-right font-mono text-[11px] leading-[20px] dark:text-slate-500 text-gray-500 dark:bg-[#161b22]/70 bg-gray-100 border-r dark:border-[#30363d]/60 border-gray-200 overflow-hidden w-11 shrink-0"
         >
           {Array.from({ length: lineCount }, (_, i) => (
             <div key={i}>{i + 1}</div>
@@ -411,7 +423,7 @@ export function EditorTab({ filePath, initialContent, activeJobId, projectId, on
             style={{ tabSize: 2 }}
           >
             <HighlightComponent
-              theme={themes.nightOwl}
+                theme={isDark ? themes.nightOwl : themes.vsLight}
               code={content || " "}
               language={detectedLanguage}
             >
@@ -440,7 +452,7 @@ export function EditorTab({ filePath, initialContent, activeJobId, projectId, on
             autoCapitalize="off"
             autoComplete="off"
             autoCorrect="off"
-            className="absolute inset-0 w-full h-full p-3 font-mono text-xs leading-[20px] whitespace-pre bg-transparent text-transparent caret-white resize-none outline-none overflow-auto border-0 focus:ring-0 selection:bg-primary/35 shadow-none"
+            className="absolute inset-0 w-full h-full p-3 font-mono text-xs leading-[20px] whitespace-pre bg-transparent text-transparent dark:caret-white caret-black resize-none outline-none overflow-auto border-0 focus:ring-0 selection:bg-primary/35 shadow-none"
             style={{ tabSize: 2 }}
             placeholder={loading ? "Loading file..." : "Type or paste code here..."}
           />

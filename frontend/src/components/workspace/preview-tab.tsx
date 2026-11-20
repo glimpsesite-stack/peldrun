@@ -282,15 +282,15 @@ useEffect(() => {
 
   if (!effectiveFile || !isPreviewable || !rawContent) {
     return (
-      <div className="flex flex-col items-center justify-center h-full w-full bg-darkest text[#fff] p-8 select-none font-sans">
+      <div className="flex flex-col items-center justify-center h-full w-full bg-background text-black p-8 select-none font-sans">
         <div className="flex flex-col items-center max-w-sm text-center space-y-4">
-          <div className="p-4 rounded-2xl bg-[#000] relative bg-opacity-5">
-            <Code2 className="w-10 h-10 text-peldrun-accent" />
-            <Sparkles className="w-4 h-4 text-peldrun-accent absolute top-2 right-2 animate-pulse" />
+          <div className="p-4 rounded-md bg-card relative bg-opacity-5">
+            <Code2 className="w-10 h-10 text-custom" />
+            <Sparkles className="w-4 h-4 text-black/70 absolute top-2 right-2 animate-pulse" />
           </div>
           <div>
-            <h3 className="text-sm font-semibold font-heading text-[#fff]">Sandbox Standby</h3>
-            <p className="text-xs text-[#eee] mt-1 leading-relaxed">
+            <h3 className="text-sm font-semibold font-heading text-black">Sandbox Standby</h3>
+            <p className="text-xs text-black/50 mt-1 leading-relaxed">
               Live web applications (.html, .svg), Markdown documents (.md), and plain text files (.txt) will render here in real time.
             </p>
           </div>
@@ -324,8 +324,8 @@ useEffect(() => {
 
   return (
     <div className="flex flex-col h-full w-full bg-custom overflow-hidden font-sans">
-      <div className="h-10 border-b border-darkest bg-dark backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
-        <div className="flex items-center gap-2 text-[#eee] min-w-0">
+      <div className="h-10 border-b border-custom bg-muted backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
+        <div className="flex items-center gap-2 text-black min-w-0">
           {isMarkdown ? (
             <FileText className="w-4 h-4 text-primary shrink-0" />
           ) : isTxt ? (

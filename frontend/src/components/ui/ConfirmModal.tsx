@@ -79,9 +79,9 @@ export function useConfirmModal() {
 
     return (
       <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs animate-in fade-in duration-150">
-        <div className="w-full max-w-md bg-card border border-border rounded-2xl p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150">
+        <div className="w-full max-w-md bg-card border border-border rounded-md p-5 shadow-2xl space-y-4 animate-in zoom-in-95 duration-150">
           <div className="flex items-start gap-3.5">
-            <div className={`p-2.5 rounded-xl border ${v.bg} shrink-0`}>
+            <div className={`shrink-0`}>
               {v.icon}
             </div>
             <div className="flex-1 min-w-0 pr-2">

@@ -323,8 +323,8 @@ export function WorkspacePanel({
       : lastPreviewFileRef.current;
 
   return (
-    <div className="flex flex-col h-full bg-custom border-l border-border font-sans">
-      <div className="h-12 border-b border-darkest/50 bg-[#000] backdrop-blur-sm px-4 flex items-center justify-between shrink-0">
+    <div className="flex flex-col h-full bg-sidebg border-l border-border font-sans">
+      <div className="h-12 border-b border-card bg-sidebg backdrop-blur-sm px-4 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-1 overflow-x-auto">
           {tabs.map((tab) => {
             const isActive = activeTab === tab.id;
@@ -335,8 +335,8 @@ export function WorkspacePanel({
                 onClick={() => setActiveTab(tab.id)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 text-xxs font-medium transition-all cursor-pointer ${
                   isActive
-                    ? "bg-primary/20 text-[#ccc] shadow-peldrun-xs text-xs border-slate-100 border-b-2"
-                    : "text-lightest hover:text-[#ffffff]"
+                    ? "bg-primary/20 text-black shadow-peldrun-xs text-xs border-slate-100 border-b-2"
+                    : "text-lightest hover:text-black"
                 }`}
               >
                 {tab.icon}

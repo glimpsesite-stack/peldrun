@@ -851,7 +851,14 @@ export function useSseStream(params: UseSseStreamParams) {
             if (typeof window !== "undefined") {
               window.dispatchEvent(
                 new CustomEvent("peldrun:artifact-created", {
-                  detail: { ...payload.data, file: artName },
+                  detail: {
+                    ...payload.data,
+                    file: artName,
+                    jobId,
+                    chatId: resolvedChatId,
+                    job_id: jobId,
+                    chat_id: resolvedChatId,
+                  },
                 })
               );
             }
@@ -873,7 +880,14 @@ export function useSseStream(params: UseSseStreamParams) {
           if (typeof window !== "undefined") {
             window.dispatchEvent(
               new CustomEvent("peldrun:artifact-created", {
-                detail: { ...payload.data, file: artName },
+                detail: {
+                  ...payload.data,
+                  file: artName,
+                  jobId,
+                  chatId: resolvedChatId,
+                  job_id: jobId,
+                  chat_id: resolvedChatId,
+                },
               })
             );
           }

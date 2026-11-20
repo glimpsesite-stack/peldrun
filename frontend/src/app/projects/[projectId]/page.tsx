@@ -2,7 +2,8 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, usePathname } from "next/navigation";
+import Link from "next/link";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Calendar,
@@ -20,6 +21,7 @@ import {
   PanelRightClose,
   PanelRightOpen,
   FolderTree,
+  ChevronRight,
 } from "lucide-react";
 import { ProjectSourceControlPanel } from "@/features/source-control/components/project-source-control-panel";
 
@@ -31,6 +33,15 @@ import { Project, WorkspaceType } from "@/features/workspace/types";
 /* ───────── Animation primitives ───────── */
 
 const EASE_OUT: [number, number, number, number] = [0.16, 1, 0.3, 1];
+
+const PAGE_LABELS: Record<string, string> = {
+  chat: "Conversations",
+  tasks: "Tasks",
+  notebook: "Notebook",
+  "source-control": "Source Control",
+  migration: "Migration",
+  settings: "Settings",
+};
 
 const fadeUp = {
   hidden: { opacity: 0, y: 14 },
@@ -52,6 +63,7 @@ const stagger = {
 export default function ProjectDashboardPage() {
   const params = useParams();
   const router = useRouter();
+  const pathname = usePathname();
   const projectId = params.projectId as string;
 
   const { getProject, loadProjects } = useProjectStore();
@@ -88,14 +100,25 @@ export default function ProjectDashboardPage() {
     return null; // Default to closed
   });
 
+  // Remember the last opened panel to restore it correctly when re-opening
+  const [lastOpenedPanel, setLastOpenedPanel] = useState<"workspace" | "source-control">("workspace");
+
   // Helper to update state and persist to localStorage
   const handleSetRightPanel = (panel: "workspace" | "source-control" | null) => {
-    setRightPanel(panel);
-    if (typeof window !== "undefined") {
-      if (panel) {
-        localStorage.setItem("project_right_panel_state", panel);
-      } else {
+    if (panel === null) {
+      // Save the current panel before closing so we can restore it later
+      if (rightPanel) {
+        setLastOpenedPanel(rightPanel);
+      }
+      setRightPanel(null);
+      if (typeof window !== "undefined") {
         localStorage.removeItem("project_right_panel_state");
+      }
+    } else {
+      setRightPanel(panel);
+      setLastOpenedPanel(panel);
+      if (typeof window !== "undefined") {
+        localStorage.setItem("project_right_panel_state", panel);
       }
     }
   };
@@ -347,6 +370,22 @@ export default function ProjectDashboardPage() {
       day: "numeric",
     });
 
+  const breadcrumbs = React.useMemo(() => {
+    const items: Array<{ label: string; href: string | null }> = [
+      { label: "Projects", href: "/projects" },
+    ];
+    if (project) {
+      items.push({ label: project.name, href: `/projects/${projectId}` });
+    }
+    const rest = pathname.split("/").filter(Boolean).slice(2);
+    if (rest.length > 0) {
+      const currentPage = rest[0];
+      const label = PAGE_LABELS[currentPage] || currentPage;
+      items.push({ label, href: null });
+    }
+    return items;
+  }, [pathname, project, projectId]);
+
   /* ── Config ── */
   const stats = [
     {
@@ -449,12 +488,57 @@ export default function ProjectDashboardPage() {
         initial="hidden"
         animate="visible"
       >
-        {/* Header */}
+        {/* Breadcrumbs */}
         <motion.div
-          variants={fadeIn}
-          className="border-b border-border bg-muted p-6"
+          className="border-b border-border bg-custom px-6 py-3"
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3, ease: EASE_OUT }}
         >
-          <div className="flex items-start justify-between mb-6 gap-4">
+          <nav className="flex items-center gap-1.5 text-sm">
+            {breadcrumbs.map((item, index) => (
+              <React.Fragment key={index}>
+                {index > 0 && (
+                  <ChevronRight
+                    size={13}
+                    className="text-muted-foreground/60 shrink-0"
+                  />
+                )}
+                <motion.span
+                  initial={{ opacity: 0, x: -4 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{
+                    delay: index * 0.05,
+                    duration: 0.3,
+                    ease: EASE_OUT,
+                  }}
+                >
+                  {item.href ? (
+                    <Link
+                      href={item.href}
+                      className="text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {item.label}
+                    </Link>
+                  ) : (
+                    <span className="text-foreground font-medium">
+                      {item.label}
+                    </span>
+                  )}
+                </motion.span>
+              </React.Fragment>
+            ))}
+          </nav>
+        </motion.div>
+
+        {/* Dashboard Content Container */}
+        <div className="flex flex-col w-full max-w-7xl m-auto">
+          {/* Header */}
+          <motion.div
+            variants={fadeIn}
+            className="border-b border-card bg-background p-6"
+          >
+            <div className="flex items-start justify-between mb-6 gap-4">
             <div className="flex-1 min-w-0">
               <AnimatePresence mode="wait" initial={false}>
                 {isEditing ? (
@@ -556,14 +640,14 @@ export default function ProjectDashboardPage() {
                       }}
                     >
                       <Button
-                        variant="outline"
+                        variant="nonestyle"
                         size="sm"
-                        onClick={() => handleSetRightPanel("workspace")}
+                        onClick={() => handleSetRightPanel(lastOpenedPanel)}
                         className="gap-1.5 ml-2"
-                        title="Open Workspace / Source Control Panel"
+                        title="Open Last Used Panel"
                       >
                         <PanelRightOpen size={15} />
-                        <span className="hidden md:inline">Open Panel</span>
+
                       </Button>
                     </motion.div>
                   )}
@@ -584,7 +668,7 @@ export default function ProjectDashboardPage() {
                     y: -2,
                     transition: { duration: 0.18, ease: "easeOut" },
                   }}
-                  className="group bg-card border border-card rounded-md p-4 transition-colors hover:border-rb/40 shadow-sm"
+                  className="group bg-custom border border-custom rounded-md p-4 transition-colors hover:border-rb/40 shadow-sm"
                 >
                   <div className="flex items-center gap-2 mb-3">
                     <div className={`p-1.5 rounded-sm ${stat.color}`}>
@@ -615,7 +699,7 @@ export default function ProjectDashboardPage() {
         {/* Quick actions */}
         <motion.div
           variants={fadeUp}
-          className="p-6 border-b border-border bg-custom"
+          className="p-6 border-b border-card bg-muted rounded-sm"
         >
           <h2 className="text-xs font-semibold mb-3 text-muted-foreground uppercase tracking-wider">
             Quick Actions
@@ -692,6 +776,7 @@ export default function ProjectDashboardPage() {
             })}
           </div>
         </motion.div>
+        </div>
       </motion.div>
 
       {/* ── Right panel ── */}
@@ -706,8 +791,8 @@ export default function ProjectDashboardPage() {
             className="hidden lg:flex flex-col shrink-0 border-l border-border bg-background overflow-auto"
           >
             {/* Toggle header */}
-            <div className="h-12 border-b border-border bg-card px-3 flex items-center justify-between shrink-0">
-              <div className="relative flex items-center bg-muted/50 rounded-lg border border-border p-0.5">
+            <div className="h-12 border-b border-border bg-custom px-3 flex items-center justify-between shrink-0">
+              <div className="relative flex items-center bg-black/10 rounded-lg border border-border p-0.5">
                 {(
                   [
                     { key: "workspace", label: "Workspace", Icon: FolderTree },
@@ -724,7 +809,8 @@ export default function ProjectDashboardPage() {
                       key={key}
                       type="button"
                       onClick={() => handleSetRightPanel(key)}
-                      className={`relative px-2.5 py-1.5 rounded-md transition-colors flex items-center gap-1.5 text-xs cursor-pointer whitespace-nowrap ${
+                      className={`relative px-2.5 py-1.5 rounded-md transition-colors flex items-center
+                        gap-1.5 text-xs cursor-pointer whitespace-nowrap ${
                         isActive
                           ? "text-foreground font-medium"
                           : "text-muted-foreground hover:text-foreground"
@@ -733,7 +819,7 @@ export default function ProjectDashboardPage() {
                       {isActive && (
                         <motion.div
                           layoutId="panel-tab-pill"
-                          className="absolute inset-0 bg-background rounded-md shadow-sm"
+                          className="absolute inset-0 bg-card rounded-md shadow-sm"
                           transition={{
                             type: "spring",
                             stiffness: 400,

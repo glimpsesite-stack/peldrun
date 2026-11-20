@@ -19,6 +19,9 @@ interface ProjectLayoutClientProps {
   children: React.ReactNode;
 }
 
+
+const EASE_OUT: [number, number, number, number] = [0.16, 1, 0.3, 1];
+
 const PAGE_LABELS: Record<string, string> = {
   chat: "Conversations",
   tasks: "Tasks",
@@ -27,8 +30,6 @@ const PAGE_LABELS: Record<string, string> = {
   migration: "Migration",
   settings: "Settings",
 };
-
-const EASE_OUT: [number, number, number, number] = [0.16, 1, 0.3, 1];
 
 export function ProjectLayoutClient({
   projectId,
@@ -264,50 +265,55 @@ export function ProjectLayoutClient({
     );
   }
 
+  // Hide breadcrumbs on the main project dashboard page
+  const isDashboardPage = pathname === `/projects/${projectId}`;
+
   return (
     <div className="min-h-screen bg-background ">
-      {/* Breadcrumbs */}
-      <motion.div
-        className="border-b border-border bg-custom px-6 py-3"
-        initial={{ opacity: 0, y: -4 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.3, ease: EASE_OUT }}
-      >
-        <nav className="flex items-center gap-1.5 text-sm">
-          {breadcrumbs.map((item, index) => (
-            <React.Fragment key={index}>
-              {index > 0 && (
-                <ChevronRight
-                  size={13}
-                  className="text-muted-foreground/60 shrink-0"
-                />
-              )}
-              <motion.span
-                initial={{ opacity: 0, x: -4 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{
-                  delay: index * 0.05,
-                  duration: 0.3,
-                  ease: EASE_OUT,
-                }}
-              >
-                {item.href ? (
-                  <Link
-                    href={item.href}
-                    className="text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    {item.label}
-                  </Link>
-                ) : (
-                  <span className="text-foreground font-medium">
-                    {item.label}
-                  </span>
+      {/* Breadcrumbs - Hidden on dashboard page */}
+      {!isDashboardPage && (
+        <motion.div
+          className="border-b border-border bg-custom px-6 py-3"
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3, ease: EASE_OUT }}
+        >
+          <nav className="flex items-center gap-1.5 text-sm">
+            {breadcrumbs.map((item, index) => (
+              <React.Fragment key={index}>
+                {index > 0 && (
+                  <ChevronRight
+                    size={13}
+                    className="text-muted-foreground/60 shrink-0"
+                  />
                 )}
-              </motion.span>
-            </React.Fragment>
-          ))}
-        </nav>
-      </motion.div>
+                <motion.span
+                  initial={{ opacity: 0, x: -4 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{
+                    delay: index * 0.05,
+                    duration: 0.3,
+                    ease: EASE_OUT,
+                  }}
+                >
+                  {item.href ? (
+                    <Link
+                      href={item.href}
+                      className="text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {item.label}
+                    </Link>
+                  ) : (
+                    <span className="text-foreground font-medium">
+                      {item.label}
+                    </span>
+                  )}
+                </motion.span>
+              </React.Fragment>
+            ))}
+          </nav>
+        </motion.div>
+      )}
 
       {/* Page transition */}
       <AnimatePresence mode="wait">

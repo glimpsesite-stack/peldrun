@@ -37,9 +37,7 @@ import { FilesTab } from "@/components/workspace/files-tab";
 import { ArtifactsTab } from "@/components/workspace/artifacts-tab";
 import { LogsTab } from "@/components/workspace/logs-tab";
 import { EditorTab } from "@/components/workspace/editor-tab";
-import { RepositorySelector } from "@/features/source-control/components/repository-selector";
 import { useWorkspaceResolver, WorkspaceTab } from "@/features/workspace/workspace-resolver";
-import { GitRepositoryInfo } from "@/features/workspace/types";
 
 export type ProjectTabId = "preview" | "files" | "artifacts" | "logs" | "editor";
 
@@ -92,7 +90,6 @@ export function ProjectWorkspacePanel({
   const [projectFiles, setProjectFiles] = useState<ProjectWorkspaceFileItem[]>([]);
   const [filesLoading, setFilesLoading] = useState<boolean>(false);
   const [exporting, setExporting] = useState<boolean>(false);
-  const [selectedRepository, setSelectedRepository] = useState<GitRepositoryInfo | null>(null);
 
   const [workspaceState, workspaceActions] = useWorkspaceResolver(projectId, "files");
 
@@ -309,10 +306,7 @@ export function ProjectWorkspacePanel({
     }
   }, [overrideDraft]);
 
-  // CRITICAL FIX: Memoize this callback to prevent child re-renders
-  const handleRepositorySelect = useCallback((repo: GitRepositoryInfo | null) => {
-    setSelectedRepository(repo);
-  }, []);
+
 
   const tabs: { id: ProjectTabId; label: string; icon: React.ReactNode }[] = [
     { id: "preview", label: "Preview", icon: <Monitor size={14} /> },
@@ -332,14 +326,6 @@ export function ProjectWorkspacePanel({
   return (
     <div className="flex flex-col h-full bg-custom border-l border-border font-sans">
       <div className="h-auto border-b border-darkest/50 bg-[#000] backdrop-blur-sm px-4 py-2 shrink-0">
-        <div className="mb-2">
-          <RepositorySelector
-            projectId={projectId}
-            selectedRepositoryId={selectedRepository?.id || null}
-            onSelect={handleRepositorySelect}
-          />
-        </div>
-
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1 overflow-x-auto">
             {tabs.map((tab) => {

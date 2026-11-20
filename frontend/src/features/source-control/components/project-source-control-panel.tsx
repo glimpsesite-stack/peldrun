@@ -18,7 +18,7 @@
  *   polling state and view state across mode switches.
  */
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { sourceControlClient } from "../api/source-control-client";
 import { useSourceControlStore } from "../state/source-control-store";
 import { useOperation } from "../hooks/useOperation";
@@ -32,7 +32,9 @@ import { OperationTimeline } from "./OperationTimeline";
 import { ManualModePanel } from "./manual/ManualModePanel";
 import { GitBrowserPanel } from "./git/GitBrowserPanel";
 import { AuthReconnectBanner } from "./AuthReconnectBanner";
+import { RepositorySelector } from "./repository-selector";
 import { GitPullRequest, AlertCircle, Loader2 } from "lucide-react";
+import { GitRepositoryInfo } from "@/features/workspace/types";
 
 export interface ProjectSourceControlPanelProps {
   projectId?: string;
@@ -59,9 +61,14 @@ export function ProjectSourceControlPanel({
 }: ProjectSourceControlPanelProps = {}) {
   const [mode, setMode] = useState<PanelMode>(defaultMode);
   const [reloadKey, setReloadKey] = useState(0);
+  const [selectedRepository, setSelectedRepository] = useState<GitRepositoryInfo | null>(null);
 
   // Resolve project id: prefer the prop; fall back to URL.
   const resolvedProjectId = propProjectId ?? deriveProjectIdFromUrl();
+
+  const handleRepositorySelect = useCallback((repo: GitRepositoryInfo | null) => {
+    setSelectedRepository(repo);
+  }, []);
 
   // Listen for the "auth reconnected" event fired by the banner
   useEffect(() => {
@@ -116,9 +123,16 @@ export function ProjectSourceControlPanel({
   return (
     <div className="flex flex-col h-full bg-background border-l border-border">
       <AuthReconnectBanner />
-
-      <div className="flex items-center px-4 py-2 border-b border-border bg-custom shrink-0">
-        <div className="flex rounded-md bg-muted p-0.5" role="tablist">
+      <div className="px-4 py-2 border-b border-border bg-custom shrink-0 space-y-2">
+        {resolvedProjectId && (
+          <RepositorySelector
+            projectId={resolvedProjectId}
+            selectedRepositoryId={selectedRepository?.id || null}
+            onSelect={handleRepositorySelect}
+          />
+        )}
+        <div className="flex items-center">
+          <div className="flex rounded-md bg-muted p-0.5" role="tablist">
           <button
             type="button"
             role="tab"
@@ -158,6 +172,7 @@ export function ProjectSourceControlPanel({
           >
             Browse
           </button>
+          </div>
         </div>
       </div>
 

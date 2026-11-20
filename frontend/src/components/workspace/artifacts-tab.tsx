@@ -145,12 +145,13 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
   };
 
   return (
-    <div className="flex flex-col h-full w-full bg-darkest font-sans overflow-hidden">
+    <div className="flex flex-col h-full w-full bg-background font-sans overflow-hidden">
       {/* Header Bar */}
-      <div className="h-10 border-b border-darkest bg-dark backdrop-blur-sm px-4 flex items-center justify-between shrink-0 text-xs">
+      <div className="h-10 border-b border-custom bg-sidebg backdrop-blur-sm px-4 flex items-center
+      justify-between shrink-0 text-xs">
         <div className="flex items-center gap-2 min-w-0">
           <Package className="w-4 h-4 text-peldrun-accent shrink-0" />
-          <span className="font-semibold text-[#ccc]">Media Artifacts</span>
+          <span className="font-semibold text-black">Media Artifacts</span>
           <span className="px-1.5 py-0.2 rounded text-[10px] bg-muted text-muted-foreground font-mono">
             {files.length}
           </span>
@@ -158,28 +159,28 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
 
         <div className="flex items-center gap-2">
           {/* Filter Pills */}
-          <div className="flex items-center gap-1 bg-darkest p-0.5 rounded-md border border-darkest text-[11px]">
+          <div className="flex items-center gap-1 bg-customest p-0.5 rounded-md border border-card text-[11px]">
             <button
               onClick={() => setFilter("all")}
-              className={`px-2 py-0.5 rounded transition ${filter === "all" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "all" ? "bg-custom text-black shadow-xs font-medium" : "text-muted-foreground hover:text-black/60"}`}
             >
               All
             </button>
             <button
               onClick={() => setFilter("images")}
-              className={`px-2 py-0.5 rounded transition ${filter === "images" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "images" ? "bg-custom text-black shadow-xs font-medium" : "text-muted-foreground hover:text-black/60"}`}
             >
               Images
             </button>
             <button
               onClick={() => setFilter("videos")}
-              className={`px-2 py-0.5 rounded transition ${filter === "videos" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "videos" ? "bg-custom text-black shadow-xs font-medium" : "text-muted-foreground hover:text-black/60"}`}
             >
               Videos
             </button>
             <button
               onClick={() => setFilter("docs")}
-              className={`px-2 py-0.5 rounded transition ${filter === "docs" ? "bg-dark text-[#fff] shadow-xs font-medium" : "text-muted-foreground hover:text-[#fff]"}`}
+              className={`px-2 py-0.5 rounded transition ${filter === "docs" ? "bg-custom text-black shadow-xs font-medium" : "text-muted-foreground hover:text-black/60"}`}
             >
               PDFs
             </button>
@@ -200,10 +201,10 @@ export function ArtifactsTab({ jobId, activeJobId, chatId, selectedFile }: Artif
       <div className="flex-1 overflow-y-auto p-4 md:p-6">
         {filteredFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-8 text-muted-foreground">
-            <div className="w-12 h-12 rounded-2xl bg-[#00000052] flex items-center justify-center text-peldrun-accent mb-3 shadow-peldrun-sm">
+            <div className="w-12 h-12 rounded-2xl bg-card flex items-center justify-center text-custom mb-3 shadow-peldrun-sm">
               <Package size={60} />
             </div>
-            <div className="font-semibold text-sm text-[#fff] mb-1">No Media Deliverables in this Session</div>
+            <div className="font-semibold text-sm text-black mb-1">No Media Deliverables in this Session</div>
             <p className="max-w-xs text-xs text-muted-foreground leading-relaxed">
               Generated images (.png, .jpg), videos (.mp4), and PDF reports will populate here. Source code and scripts are available in the Files tab.
             </p>

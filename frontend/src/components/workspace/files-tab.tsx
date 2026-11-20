@@ -283,7 +283,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId, projectId }: F
 
           return (
             <li key={item.path} className="text-xs">
-              <div className="flex items-center justify-between p-1 rounded hover:bg-[#000] group transition">
+              <div className="flex items-center justify-between p-1 rounded hover:bg-custom group transition">
                 <div
                   className="flex items-center gap-1.5 truncate cursor-pointer flex-1"
                   onClick={() => {
@@ -297,16 +297,16 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId, projectId }: F
                   {item.isDir ? (
                     <>
                       {isDirCollapsed ? (
-                        <ChevronRight size={12} className="text-muted-foreground shrink-0" />
+                        <ChevronRight size={12} className="text-black shrink-0" />
                       ) : (
-                        <ChevronDown size={12} className="text-muted-foreground shrink-0" />
+                        <ChevronDown size={12} className="text-black shrink-0" />
                       )}
                       {isDirCollapsed ? (
                         <Folder size={14} className="text-amber-400 shrink-0" />
                       ) : (
                         <FolderOpen size={14} className="text-amber-400 shrink-0" />
                       )}
-                      <span className="font-semibold text-amber-100 truncate">{item.name}</span>
+                      <span className="font-semibold text-black/70 truncate">{item.name}</span>
                     </>
                   ) : (
                     <>
@@ -320,7 +320,7 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId, projectId }: F
                       ) : (
                         <FileText size={14} className="text-gray-400 shrink-0" />
                       )}
-                      <span className="truncate text-[#fff]">{item.name}</span>
+                      <span className="truncate text-black">{item.name}</span>
                       {item.size !== undefined && (
                         <span className="text-[10px] text-[#ccc] ml-1">
                           ({(item.size / 1024).toFixed(1)} KB)
@@ -364,8 +364,8 @@ export function FilesTab({ onSelectFile, onOpenFile, activeJobId, projectId }: F
   };
 
   return (
-    <div className="flex flex-col h-full bg-darkest text-[#fff] font-sans text-xs">
-      <div className="flex items-center justify-between p-3 border-b border-[#000] bg-dark backdrop-blur-sm">
+    <div className="flex flex-col h-full bg-background text-black font-sans text-xs">
+      <div className="flex items-center justify-between p-3 border-b border-custom bg-custom backdrop-blur-sm">
         <div className="flex items-center gap-2">
           <span className="font-semibold text-xs tracking-wider text-[#eee]font-mono">
             WORKSPACE FILES
