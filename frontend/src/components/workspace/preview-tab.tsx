@@ -5,6 +5,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { Code, RefreshCw, ExternalLink, Code2, Sparkles, FileText, Image as ImageIcon, AlignLeft } from "lucide-react";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
 import { Icon } from '@/components/Icon/Icon';
+import { DevicePreview } from "@/components/device-mockups";
 
 export interface PreviewTabProps {
   jobId?: string | null;
@@ -400,15 +401,20 @@ useEffect(() => {
         )}
 
         {isHtml && (
-          <div className="w-full h-full bg-white relative overflow-hidden">
+          <DevicePreview
+            initialDevice="responsive"
+            initialMockup
+            initialLaptopStyle="macbook"
+            className="w-full h-full"
+          >
             <iframe
               key={`${projectId || effectiveJobId}-${workspaceFile}-${refreshKey}`}
               title="Sandbox Preview"
               srcDoc={sandboxedHtml}
               sandbox="allow-scripts allow-modals allow-forms allow-same-origin"
-              className="w-full h-full border-0"
+              className="block w-full h-full border-0 bg-white"
             />
-          </div>
+          </DevicePreview>
         )}
       </div>
     </div>
