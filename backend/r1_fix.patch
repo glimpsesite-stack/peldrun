@@ -1,0 +1,30 @@
+diff --git a/backend/omweb/memory/storage/repository.py b/backend/omweb/memory/storage/repository.py
+index 5605200..62642b3 100644
+--- a/backend/omweb/memory/storage/repository.py
++++ b/backend/omweb/memory/storage/repository.py
+@@ -84,6 +84,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import json
++import re
+ import logging
+ import sqlite3
+ import threading
+@@ -776,7 +777,16 @@ class SqliteMemoryRepository:
+             ),
+         )
+ 
+-        # ----- Empty-query fallback: recency listing + position scores -----
++        # ----- Empty-query handling ---------------------------------
++        # Two DIFFERENT situations produce an empty expression:
++        #   (a) the input has no word characters at all (blank /
++        #       punctuation only)  -> caller wants "recent entries";
++        #   (b) the input has words but EVERY one was a stopword
++        #       ("thank you", "hello")  -> there is NO retrieval
++        #       intent, so the correct answer is ZERO matches.
++        # Conflating them injected unrelated recents on greetings.
++        if not normalized_query and re.search(r"\w", query or ""):
++            return []
+         if not normalized_query:
+             recent = self._list_recent_sync(
+                 scope_clause, scope_params, limit, filters

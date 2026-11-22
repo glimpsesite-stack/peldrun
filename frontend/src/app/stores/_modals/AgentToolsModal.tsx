@@ -284,19 +284,19 @@ export function AgentToolsModal({
     >
       <div className="bg-card rounded-md shadow-2xl w-full max-w-3xl max-h-[92vh] flex flex-col">
         {/* ── Header ────────────────────────────────────────────── */}
-        <div className="px-6 py-4 border-b border-border flex items-center justify-between shrink-0 bg-card-foreground/50">
+        <div className="px-6 py-4 border-b border-border flex items-center justify-between shrink-0 bg-card">
           <div className="flex items-center gap-2 min-w-0">
-            <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
+            <div className="text-primary">
               <Wrench size={15} />
             </div>
             <div className="min-w-0">
               <h2
                 id="agent-tools-title"
-                className="text-base font-bold text-primary-foreground font-mono"
+                className="text-base font-bold text-black font-mono"
               >
                 Agent Tools
               </h2>
-              <p className="text-xs text-primary-foreground/80 mt-0.5 truncate">
+              <p className="text-xs text-black/80 mt-0.5 truncate">
                 {agentName}
               </p>
             </div>
@@ -313,7 +313,7 @@ export function AgentToolsModal({
         </div>
 
         {/* ── Body ──────────────────────────────────────────────── */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 scrollbar-thin bg-card-foreground/10 space-y-5">
+        <div className="flex-1 overflow-y-auto px-6 py-5 scrollbar-thin bg-background space-y-5">
           {loading && (
             <div className="flex items-center justify-center py-12 text-muted-foreground">
               <Loader2 size={20} className="animate-spin mr-2" />
@@ -334,7 +334,7 @@ export function AgentToolsModal({
           {!loading && !error && (
             <>
               {/* Info banner */}
-              <div className="flex items-start gap-2 p-3 rounded-sm border border-border bg-muted/30 text-[11px] text-muted-foreground">
+              <div className="flex items-start gap-2 p-3 rounded-sm border border-border bg-custom text-[11px] text-muted-foreground">
                 <AlertTriangle size={12} className="shrink-0 mt-0.5 text-primary" />
                 <span>
                   Tool overrides apply to the <strong>next task run</strong>.
@@ -371,7 +371,7 @@ export function AgentToolsModal({
                         onClick={() => toggleManifestTool(row.id)}
                         className={`w-full flex items-start gap-3 p-2.5 rounded-sm border text-left transition cursor-pointer ${
                           isActive
-                            ? "bg-primary/5 border-primary/30 hover:bg-primary/10"
+                            ? "bg-card border-lime-500 hover:bg-lime-50 shadow-sm"
                             : "bg-muted/20 border-border hover:bg-muted/40"
                         }`}
                       >

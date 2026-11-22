@@ -132,7 +132,7 @@ export function AgentCard({
     >
       {!isDisabled && coreColor && (
         <div
-          className="absolute border-t-[5px] inset-0 pointer-events-none opacity-[0.08] group-hover:opacity-[0.8] transition-opacity"
+          className="absolute border-t-[5px] inset-0 pointer-events-none opacity-[0] group-hover:opacity-[0.6] transition-opacity"
           style={{ backgroundColor: coreColor, borderColor: coreColor }}
           aria-hidden="true"
         />

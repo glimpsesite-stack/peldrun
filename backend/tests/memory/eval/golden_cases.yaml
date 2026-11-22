@@ -1,0 +1,1034 @@
+# backend/tests/memory/eval/golden_cases.yaml
+# Golden evaluation set for the memory repair plan (phase 0).
+# 163 cases: Arabic-first, then English and Russian.
+#
+# IMPORTANT ENCODING POLICY (agreed with the repo owner):
+#   * All keys, comments, ids and structural values are ASCII/English.
+#   * Non-ASCII (Arabic/Cyrillic) appears ONLY inside quoted DATA strings
+#     (memories / query / new / text). This file is test data, not code.
+#
+# Schema
+# ------
+# Retrieval kinds (run by harness.py today):
+#   positive  : memories + query + expect_idx (indexes that MUST be retrieved)
+#   no_intent : social/greeting query; expect_idx MUST be [] (gate: 0% injection)
+#   unrelated : topic not present in memories; expect_idx MUST be []
+# Write-path kinds (runner lands in phase 3; harness marks them deferred):
+#   update    : memories + new (+ new_type) + expect: supersede | create
+#   duplicate : memories + new + expect: noop
+# Privacy kind (runner lands in phase 1; harness marks it deferred):
+#   secret    : text + expect: redact | keep
+#
+# Optional field:
+#   tags: [semantic-gap]  -> case needs semantic understanding beyond lexical
+#                            matching (broken plurals, cross-language synonyms,
+#                            morphology). Used to split lexical vs embedding
+#                            recall during calibration; never excluded from gates.
+#
+# Coverage notes
+# --------------
+# Arabic positives cover: attached clitics (prefix/suffix), taa-marbuta/ha
+# variants, hamza variants, diacritics and tatweel, stopword-heavy questions,
+# Latin tokens inside Arabic text, and precision distractors (Berlin vs
+# Frankfurt, my-name vs cat-name). Russian covers yo/e folding and case.
+# English covers prefix wildcards (deploy/deployment), possessives, hyphens,
+# case folding and stopword-heavy questions.
+#
+# Review policy: every new case needs a second reviewer; real user cases are
+# added only anonymized and with consent (plan phase 6 feedback loop).
+# Do NOT reorder or renumber ids: baseline reports reference them.
+
+cases:
+
+# --- Arabic positives (40) ---
+  - id: ar-pos-001
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "ما هي قهوتي المفضلة؟"
+    expect_idx: [0]
+  - id: ar-pos-002
+    lang: ar
+    kind: positive
+    memories: ["اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت", "لدي قطة اسمها لولو"]
+    query: "أين أعمل؟"
+    expect_idx: [0]
+  - id: ar-pos-003
+    lang: ar
+    kind: positive
+    memories: ["اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت", {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "في أي مدينة أعمل؟"
+    expect_idx: [0]
+  - id: ar-pos-004
+    lang: ar
+    kind: positive
+    memories: ["لدي قطة اسمها لولو", "اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت"]
+    query: "ما اسم قطتي؟"
+    expect_idx: [0]
+  - id: ar-pos-005
+    lang: ar
+    kind: positive
+    memories: ["لدي قطة اسمها لولو", {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "وش اسم قطتي؟"
+    expect_idx: [0]
+  - id: ar-pos-006
+    lang: ar
+    kind: positive
+    memories: ["أستخدم لغة بايثون في معظم مشاريعي", {text: "قررنا استخدام PostgreSQL لقاعدة بيانات المشروع", type: decision}]
+    query: "ما هي لغة البرمجة التي أستخدمها؟"
+    expect_idx: [0]
+  - id: ar-pos-007
+    lang: ar
+    kind: positive
+    memories: ["أستخدم لغة بايثون في معظم مشاريعي", {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "هل أستخدم بايثون؟"
+    expect_idx: [0]
+  - id: ar-pos-008
+    lang: ar
+    kind: positive
+    memories: [{text: "قررنا استخدام PostgreSQL لقاعدة بيانات المشروع", type: decision}, "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "ما قاعدة البيانات التي اخترناها؟"
+    expect_idx: [0]
+  - id: ar-pos-009
+    lang: ar
+    kind: positive
+    memories: [{text: "قررنا استخدام PostgreSQL لقاعدة بيانات المشروع", type: decision}, "لدي قطة اسمها لولو"]
+    query: "ما هي قاعدة البيانات التي اخترناها؟"
+    expect_idx: [0]
+  - id: ar-pos-010
+    lang: ar
+    kind: positive
+    memories: ["أسكن في برلين", "اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت"]
+    query: "أين أسكن؟"
+    expect_idx: [0]
+  - id: ar-pos-011
+    lang: ar
+    kind: positive
+    memories: ["أسكن في برلين", "اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت"]
+    query: "في أي مدينة أسكن الآن؟"
+    expect_idx: [0]
+  - id: ar-pos-012
+    lang: ar
+    kind: positive
+    memories: [{text: "أفضل العمل ليلا لأن الهدوء يساعدني على التركيز", type: preference}, {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "متى أفضل العمل؟"
+    expect_idx: [0]
+  - id: ar-pos-013
+    lang: ar
+    kind: positive
+    memories: [{text: "أفضل العمل ليلا لأن الهدوء يساعدني على التركيز", type: preference}, "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "لماذا أفضل العمل ليلا؟"
+    expect_idx: [0]
+  - id: ar-pos-014
+    lang: ar
+    kind: positive
+    memories: ["اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت", "لدي قطة اسمها لولو"]
+    query: "ما اسمي؟"
+    expect_idx: [0]
+  - id: ar-pos-015
+    lang: ar
+    kind: positive
+    memories: ["أعمل على مشروع متجر إلكتروني اسمه سوق", "اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت"]
+    query: "ما اسم مشروعي؟"
+    expect_idx: [0]
+  - id: ar-pos-016
+    lang: ar
+    kind: positive
+    memories: ["أعمل على مشروع متجر إلكتروني اسمه سوق", {text: "أفضل العمل ليلا لأن الهدوء يساعدني على التركيز", type: preference}]
+    query: "على أي مشروع أعمل؟"
+    expect_idx: [0]
+  - id: ar-pos-017
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب الوضع الداكن في كل المحررات", type: preference}, {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "هل أفضل الوضع الداكن؟"
+    expect_idx: [0]
+  - id: ar-pos-018
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, {text: "أحب الوضع الداكن في كل المحررات", type: preference}]
+    query: "ما نوع القهوة التي أحبها؟"
+    expect_idx: [0]
+  - id: ar-pos-019
+    lang: ar
+    kind: positive
+    memories: ["لدي قطة اسمها لولو", {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "هل لدي قطة؟"
+    expect_idx: [0]
+  - id: ar-pos-020
+    lang: ar
+    kind: positive
+    memories: ["لدي قطة اسمها لولو", "أعمل على مشروع متجر إلكتروني اسمه سوق"]
+    query: "ما اسم حيواني الأليف؟"
+    expect_idx: [0]
+  - id: ar-pos-021
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "مَا هِيَ قَهْوَتِي المُفَضَّلَة؟"
+    expect_idx: [0]
+  - id: ar-pos-022
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "ما هي قهوتي المفضله؟"
+    expect_idx: [0]
+  - id: ar-pos-023
+    lang: ar
+    kind: positive
+    memories: ["اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت", {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "اين اعمل؟"
+    expect_idx: [0]
+  - id: ar-pos-024
+    lang: ar
+    kind: positive
+    memories: ["لدي قطة اسمها لولو", "اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت"]
+    query: "ما اسم القطه؟"
+    expect_idx: [0]
+  - id: ar-pos-025
+    lang: ar
+    kind: positive
+    memories: ["أستخدم لغة بايثون في معظم مشاريعي", {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "ما هي لغتي المفضلة؟"
+    expect_idx: [0]
+  - id: ar-pos-026
+    lang: ar
+    kind: positive
+    memories: ["مكتبي في وسط مدينة فرانكفورت", "أسكن في برلين"]
+    query: "أين مكتبي؟"
+    expect_idx: [0]
+  - id: ar-pos-027
+    lang: ar
+    kind: positive
+    memories: ["مكتبي في وسط مدينة فرانكفورت", "أسكن في برلين"]
+    query: "في أي مدينة مكتبي؟"
+    expect_idx: [0]
+  - id: ar-pos-028
+    lang: ar
+    kind: positive
+    memories: ["ننشر التطبيق باستخدام Docker Compose على خوادم Hetzner", {text: "قررنا استخدام PostgreSQL لقاعدة بيانات المشروع", type: decision}]
+    query: "أين ننشر التطبيق؟"
+    expect_idx: [0]
+  - id: ar-pos-029
+    lang: ar
+    kind: positive
+    memories: ["ننشر التطبيق باستخدام Docker Compose على خوادم Hetzner", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "ما الخادم الذي نستخدمه للاستضافة؟"
+    expect_idx: [0]
+    tags: [semantic-gap]
+  - id: ar-pos-030
+    lang: ar
+    kind: positive
+    memories: ["ننشر التطبيق باستخدام Docker Compose على خوادم Hetzner", {text: "أفضل العمل ليلا لأن الهدوء يساعدني على التركيز", type: preference}]
+    query: "كيف ننشر التطبيق؟"
+    expect_idx: [0]
+  - id: ar-pos-031
+    lang: ar
+    kind: positive
+    memories: [{text: "أفضل نظام لينكس على أجهزتي", type: preference}, {text: "أحب الوضع الداكن في كل المحررات", type: preference}]
+    query: "ما النظام الذي أفضل؟"
+    expect_idx: [0]
+  - id: ar-pos-032
+    lang: ar
+    kind: positive
+    memories: [{text: "أفضل نظام لينكس على أجهزتي", type: preference}, {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "هل أفضل لينكس؟"
+    expect_idx: [0]
+  - id: ar-pos-033
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب الجري صباحا في الحديقة", type: preference}, {text: "أفضل العمل ليلا لأن الهدوء يساعدني على التركيز", type: preference}]
+    query: "متى أمارس الجري؟"
+    expect_idx: [0]
+  - id: ar-pos-034
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب الجري صباحا في الحديقة", type: preference}, {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "أين أحب الجري؟"
+    expect_idx: [0]
+  - id: ar-pos-035
+    lang: ar
+    kind: positive
+    memories: ["سيارتي زرقاء من نوع تويوتا", "لدي قطة اسمها لولو"]
+    query: "ما نوع سيارتي؟"
+    expect_idx: [0]
+  - id: ar-pos-036
+    lang: ar
+    kind: positive
+    memories: ["سيارتي زرقاء من نوع تويوتا", {text: "أحب الوضع الداكن في كل المحررات", type: preference}]
+    query: "ما لون سيارتي؟"
+    expect_idx: [0]
+  - id: ar-pos-037
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب مدينة إسطنبول كثيرا", type: preference}, "أسكن في برلين"]
+    query: "أي مدينة أحب؟"
+    expect_idx: [0]
+  - id: ar-pos-038
+    lang: ar
+    kind: positive
+    memories: [{text: "أحب مدينة إسطنبول كثيرا", type: preference}, {text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    query: "هل أحب إسطنبول؟"
+    expect_idx: [0]
+  - id: ar-pos-039
+    lang: ar
+    kind: positive
+    memories: ["هوايتي التصوير الفوتوغرافي في رحلاتي", {text: "أحب الجري صباحا في الحديقة", type: preference}]
+    query: "ما هوايتي المفضلة؟"
+    expect_idx: [0]
+  - id: ar-pos-040
+    lang: ar
+    kind: positive
+    memories: ["تاريخ ميلادي في الحادي عشر من مارس", {text: "أحب الجري صباحا في الحديقة", type: preference}]
+    query: "متى عيد ميلادي؟"
+    expect_idx: [0]
+
+# --- English positives (22) ---
+  - id: en-pos-001
+    lang: en
+    kind: positive
+    memories: [{text: "We chose PostgreSQL for the project database", type: decision}, {text: "I prefer dark mode in all editors", type: preference}]
+    query: "which database did we pick"
+    expect_idx: [0]
+  - id: en-pos-002
+    lang: en
+    kind: positive
+    memories: [{text: "We chose PostgreSQL for the project database", type: decision}, "I use Python for most of my projects"]
+    query: "what database are we using"
+    expect_idx: [0]
+  - id: en-pos-003
+    lang: en
+    kind: positive
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, {text: "I drink black coffee without sugar", type: preference}]
+    query: "do I prefer dark or light mode"
+    expect_idx: [0]
+  - id: en-pos-004
+    lang: en
+    kind: positive
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, {text: "My favorite editor is Neovim", type: preference}]
+    query: "what theme do I use in my editor"
+    expect_idx: [0]
+  - id: en-pos-005
+    lang: en
+    kind: positive
+    memories: ["My name is Ahmed and I work as a software engineer in Frankfurt", "I have a cat named Lulu"]
+    query: "what is my name"
+    expect_idx: [0]
+  - id: en-pos-006
+    lang: en
+    kind: positive
+    memories: ["My name is Ahmed and I work as a software engineer in Frankfurt", "I live in Berlin"]
+    query: "where do I work"
+    expect_idx: [0]
+  - id: en-pos-007
+    lang: en
+    kind: positive
+    memories: ["I live in Berlin", "My name is Ahmed and I work as a software engineer in Frankfurt"]
+    query: "which city do I live in"
+    expect_idx: [0]
+  - id: en-pos-008
+    lang: en
+    kind: positive
+    memories: ["I have a cat named Lulu", "My name is Ahmed and I work as a software engineer in Frankfurt"]
+    query: "what is my cat's name"
+    expect_idx: [0]
+  - id: en-pos-009
+    lang: en
+    kind: positive
+    memories: ["I have a cat named Lulu", {text: "I prefer dark mode in all editors", type: preference}]
+    query: "do I have any pets"
+    expect_idx: [0]
+    tags: [semantic-gap]
+  - id: en-pos-010
+    lang: en
+    kind: positive
+    memories: ["My dog is called Rex", "I have a cat named Lulu"]
+    query: "what is my dog called"
+    expect_idx: [0]
+  - id: en-pos-011
+    lang: en
+    kind: positive
+    memories: ["The deployment target is Hetzner with Docker Compose", {text: "We chose PostgreSQL for the project database", type: decision}]
+    query: "where do we deploy"
+    expect_idx: [0]
+  - id: en-pos-012
+    lang: en
+    kind: positive
+    memories: ["The deployment target is Hetzner with Docker Compose", {text: "We chose PostgreSQL for the project database", type: decision}]
+    query: "do we use Hetzner for hosting"
+    expect_idx: [0]
+  - id: en-pos-013
+    lang: en
+    kind: positive
+    memories: ["I use Python for most of my projects", {text: "I prefer dark mode in all editors", type: preference}]
+    query: "do I use Python"
+    expect_idx: [0]
+  - id: en-pos-014
+    lang: en
+    kind: positive
+    memories: ["I am learning Rust this year", "I use Python for most of my projects"]
+    query: "what am I learning this year"
+    expect_idx: [0]
+  - id: en-pos-015
+    lang: en
+    kind: positive
+    memories: [{text: "Our team standup is at 9:30 every Monday", type: episodic}, "My birthday is on March 11th"]
+    query: "when is our standup"
+    expect_idx: [0]
+  - id: en-pos-016
+    lang: en
+    kind: positive
+    memories: [{text: "Run make test before every commit", type: procedural}, "The deployment target is Hetzner with Docker Compose"]
+    query: "what do I run before a commit"
+    expect_idx: [0]
+  - id: en-pos-017
+    lang: en
+    kind: positive
+    memories: [{text: "My favorite editor is Neovim", type: preference}, {text: "I prefer dark mode in all editors", type: preference}]
+    query: "what is my favorite editor"
+    expect_idx: [0]
+  - id: en-pos-018
+    lang: en
+    kind: positive
+    memories: [{text: "The staging server failed with HTTP 502 last Tuesday", type: episodic}, "The deployment target is Hetzner with Docker Compose"]
+    query: "what happened to staging last week"
+    expect_idx: [0]
+  - id: en-pos-019
+    lang: en
+    kind: positive
+    memories: ["I keep my notes in Obsidian", {text: "My favorite editor is Neovim", type: preference}]
+    query: "where do I keep my notes"
+    expect_idx: [0]
+  - id: en-pos-020
+    lang: en
+    kind: positive
+    memories: ["My birthday is on March 11th", {text: "Our team standup is at 9:30 every Monday", type: episodic}]
+    query: "when is my birthday"
+    expect_idx: [0]
+  - id: en-pos-021
+    lang: en
+    kind: positive
+    memories: ["My car is a blue Toyota", {text: "I prefer dark mode in all editors", type: preference}]
+    query: "what color is my car"
+    expect_idx: [0]
+  - id: en-pos-022
+    lang: en
+    kind: positive
+    memories: [{text: "I work best at night because it is quiet", type: preference}, {text: "I like running in the park every morning", type: preference}]
+    query: "when do I work best"
+    expect_idx: [0]
+
+# --- Russian positives (8) ---
+  - id: ru-pos-001
+    lang: ru
+    kind: positive
+    memories: [{text: "Мы выбрали PostgreSQL для базы данных проекта", type: decision}, "Я использую Python в большинстве проектов"]
+    query: "какую базу данных мы выбрали"
+    expect_idx: [0]
+  - id: ru-pos-002
+    lang: ru
+    kind: positive
+    memories: [{text: "Я предпочитаю тёмную тему во всех редакторах", type: preference}, {text: "Я пью чёрный кофе без сахара", type: preference}]
+    query: "я предпочитаю тёмную или светлую тему"
+    expect_idx: [0]
+  - id: ru-pos-003
+    lang: ru
+    kind: positive
+    memories: ["Меня зовут Ахмед, я работаю инженером во Франкфурте", "У меня есть кошка по имени Лулу"]
+    query: "как меня зовут"
+    expect_idx: [0]
+  - id: ru-pos-004
+    lang: ru
+    kind: positive
+    memories: ["Меня зовут Ахмед, я работаю инженером во Франкفورت", "Я живу в Берлине"]
+    query: "где я работаю"
+    expect_idx: [0]
+  - id: ru-pos-005
+    lang: ru
+    kind: positive
+    memories: ["Я живу в Берлине", "Меня зовут Ахмед, я работаю инженером во Франкфурте"]
+    query: "где я живу"
+    expect_idx: [0]
+  - id: ru-pos-006
+    lang: ru
+    kind: positive
+    memories: ["У меня есть кошка по имени Лулу", "Меня зовут Ахмед, я работаю инженером во Франкфурте"]
+    query: "как зовут мою кошку"
+    expect_idx: [0]
+    tags: [semantic-gap]
+  - id: ru-pos-007
+    lang: ru
+    kind: positive
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}, {text: "Я предпочитаю тёмную тему во всех редакторах", type: preference}]
+    query: "какой кофе я пью"
+    expect_idx: [0]
+  - id: ru-pos-008
+    lang: ru
+    kind: positive
+    memories: ["Моя машина синяя Тойота", {text: "Я предпочитаю тёмную тему во всех редакторах", type: preference}]
+    query: "какого цвета моя машина"
+    expect_idx: [0]
+
+# --- no_intent: greetings / thanks / social (30) ---
+  - id: ar-noint-001
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "شكرا"
+    expect_idx: []
+  - id: ar-noint-002
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "شكرا لك"
+    expect_idx: []
+  - id: ar-noint-003
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "شكرا جزيلا"
+    expect_idx: []
+  - id: ar-noint-004
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "مرحبا"
+    expect_idx: []
+  - id: ar-noint-005
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "أهلا"
+    expect_idx: []
+  - id: ar-noint-006
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "كيف حالك"
+    expect_idx: []
+  - id: ar-noint-007
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "كيف حالك اليوم"
+    expect_idx: []
+  - id: ar-noint-008
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "كيف الحال"
+    expect_idx: []
+  - id: ar-noint-009
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "صباح الخير"
+    expect_idx: []
+  - id: ar-noint-010
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "مساء الخير"
+    expect_idx: []
+  - id: ar-noint-011
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "تمام"
+    expect_idx: []
+  - id: ar-noint-012
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "إلى اللقاء"
+    expect_idx: []
+  - id: ar-noint-013
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "مع السلامة"
+    expect_idx: []
+  - id: ar-noint-014
+    lang: ar
+    kind: no_intent
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو"]
+    query: "من فضلك"
+    expect_idx: []
+  - id: en-noint-001
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "thank you"
+    expect_idx: []
+  - id: en-noint-002
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "thanks"
+    expect_idx: []
+  - id: en-noint-003
+    lang: en
+    kind: no_intent
+    memories: ["I have a cat named Lulu"]
+    query: "hello"
+    expect_idx: []
+  - id: en-noint-004
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "hi"
+    expect_idx: []
+  - id: en-noint-005
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "ok"
+    expect_idx: []
+  - id: en-noint-006
+    lang: en
+    kind: no_intent
+    memories: ["I have a cat named Lulu"]
+    query: "okay"
+    expect_idx: []
+  - id: en-noint-007
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "good morning"
+    expect_idx: []
+  - id: en-noint-008
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "good night"
+    expect_idx: []
+  - id: en-noint-009
+    lang: en
+    kind: no_intent
+    memories: ["I have a cat named Lulu"]
+    query: "see you later"
+    expect_idx: []
+  - id: en-noint-010
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "bye"
+    expect_idx: []
+  - id: en-noint-011
+    lang: en
+    kind: no_intent
+    memories: ["I have a cat named Lulu"]
+    query: "how are you"
+    expect_idx: []
+  - id: en-noint-012
+    lang: en
+    kind: no_intent
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    query: "yes"
+    expect_idx: []
+  - id: ru-noint-001
+    lang: ru
+    kind: no_intent
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}]
+    query: "привет"
+    expect_idx: []
+  - id: ru-noint-002
+    lang: ru
+    kind: no_intent
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}]
+    query: "спасибо"
+    expect_idx: []
+  - id: ru-noint-003
+    lang: ru
+    kind: no_intent
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}]
+    query: "как дела"
+    expect_idx: []
+  - id: ru-noint-004
+    lang: ru
+    kind: no_intent
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}]
+    query: "доброе утро"
+    expect_idx: []
+
+# --- unrelated: topic absent from memories (25) ---
+  - id: ar-unrel-001
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "كيف будет الطقس غدا؟"
+    expect_idx: []
+  - id: ar-unrel-002
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "من فاز في مباراة كرة القدم؟"
+    expect_idx: []
+  - id: ar-unrel-003
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "ما سعر سهم أبل اليوم؟"
+    expect_idx: []
+  - id: ar-unrel-004
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "كيف أحصل على تأشيرة شنغن؟"
+    expect_idx: []
+  - id: ar-unrel-005
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "ما وصفة مكرونة بالبشاميل؟"
+    expect_idx: []
+  - id: ar-unrel-006
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "أين أجد دروس غيتار؟"
+    expect_idx: []
+  - id: ar-unrel-007
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "متى موعد طبيب الأسنان؟"
+    expect_idx: []
+  - id: ar-unrel-008
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "ما آخر موعد لتسليم الضرائب؟"
+    expect_idx: []
+  - id: ar-unrel-009
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "كم تستغرق الرحلة إلى طوكيو؟"
+    expect_idx: []
+  - id: ar-unrel-010
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "اقترح لي رواية جديدة"
+    expect_idx: []
+  - id: ar-unrel-011
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "ما سعر الذهب اليوم؟"
+    expect_idx: []
+  - id: ar-unrel-012
+    lang: ar
+    kind: unrelated
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}, "لدي قطة اسمها لولو", "أستخدم لغة بايثون في معظم مشاريعي"]
+    query: "أريد ترجمة مقال عن الفضاء"
+    expect_idx: []
+  - id: en-unrel-001
+    lang: en
+    kind: unrelated
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, "I have a cat named Lulu"]
+    query: "will it rain tomorrow"
+    expect_idx: []
+  - id: en-unrel-002
+    lang: en
+    kind: unrelated
+    memories: ["I use Python for most of my projects", "I have a cat named Lulu"]
+    query: "who won the football match"
+    expect_idx: []
+  - id: en-unrel-003
+    lang: en
+    kind: unrelated
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, {text: "We chose PostgreSQL for the project database", type: decision}]
+    query: "what is the stock price of Apple"
+    expect_idx: []
+  - id: en-unrel-004
+    lang: en
+    kind: unrelated
+    memories: ["I have a cat named Lulu", "I use Python for most of my projects"]
+    query: "how do I apply for a visa"
+    expect_idx: []
+  - id: en-unrel-005
+    lang: en
+    kind: unrelated
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, "I have a cat named Lulu"]
+    query: "give me a recipe for pasta"
+    expect_idx: []
+  - id: en-unrel-006
+    lang: en
+    kind: unrelated
+    memories: ["I use Python for most of my projects", "I have a cat named Lulu"]
+    query: "where can I find guitar lessons"
+    expect_idx: []
+  - id: en-unrel-007
+    lang: en
+    kind: unrelated
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, {text: "We chose PostgreSQL for the project database", type: decision}]
+    query: "when is my dentist appointment"
+    expect_idx: []
+  - id: en-unrel-008
+    lang: en
+    kind: unrelated
+    memories: ["I have a cat named Lulu", "I use Python for most of my projects"]
+    query: "what is the tax filing deadline"
+    expect_idx: []
+  - id: en-unrel-009
+    lang: en
+    kind: unrelated
+    memories: [{text: "I prefer dark mode in all editors", type: preference}, "I have a cat named Lulu"]
+    query: "how long is the flight to Tokyo"
+    expect_idx: []
+  - id: en-unrel-010
+    lang: en
+    kind: unrelated
+    memories: [{text: "We chose PostgreSQL for the project database", type: decision}, "I have a cat named Lulu"]
+    query: "recommend a science fiction novel"
+    expect_idx: []
+  - id: ru-unrel-001
+    lang: ru
+    kind: unrelated
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}, "У меня есть кошка по имени Лулу"]
+    query: "какая погода будет завтра"
+    expect_idx: []
+  - id: ru-unrel-002
+    lang: ru
+    kind: unrelated
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}, "У меня есть кошка по имени Лулу"]
+    query: "кто выиграл футбольный матч"
+    expect_idx: []
+  - id: ru-unrel-003
+    lang: ru
+    kind: unrelated
+    memories: [{text: "Я пью чёрный кофе без сахара", type: preference}, "У меня есть кошка по имени Лулу"]
+    query: "сколько стоит билет на самолёт"
+    expect_idx: []
+
+# --- update: fact changed, expect supersede (controls expect create) (12) ---
+  - id: ar-upd-001
+    lang: ar
+    kind: update
+    memories: [{text: "أسكن في برلين", type: semantic}]
+    new: "انتقلت إلى فرانكفورت"
+    new_type: semantic
+    expect: supersede
+  - id: ar-upd-002
+    lang: ar
+    kind: update
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    new: "لم أعد أحب القهوة"
+    new_type: preference
+    expect: supersede
+  - id: ar-upd-003
+    lang: ar
+    kind: update
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    new: "أصبحت أفضل الشاي الأخضر"
+    new_type: preference
+    expect: supersede
+  - id: ar-upd-004
+    lang: ar
+    kind: update
+    memories: ["أستخدم لغة بايثون في معظم مشاريعي"]
+    new: "انتقلت إلى Rust في مشاريعي الجديدة"
+    new_type: semantic
+    expect: supersede
+  - id: ar-upd-005
+    lang: ar
+    kind: update
+    memories: [{text: "سيارتي زرقاء من نوع تويوتا", type: semantic}]
+    new: "غيرت سيارتي إلى سيارة حمراء"
+    new_type: semantic
+    expect: supersede
+  - id: ar-upd-006
+    lang: ar
+    kind: update
+    memories: [{text: "أعمل مهندس برمجيات في فرانكفورت", type: semantic}]
+    new: "حاليا أعمل في شركة جديدة في برلين"
+    new_type: semantic
+    expect: supersede
+  - id: ar-upd-007
+    lang: ar
+    kind: update
+    memories: [{text: "لدي قطة اسمها لولو", type: semantic}]
+    new: "الآن لدي قطة اسمها سوسو"
+    new_type: semantic
+    expect: supersede
+  - id: ar-upd-008
+    lang: ar
+    kind: update
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    new: "أحب الشاي الأخضر صباحا"
+    new_type: preference
+    expect: create
+  - id: en-upd-001
+    lang: en
+    kind: update
+    memories: [{text: "I live in Berlin", type: semantic}]
+    new: "I moved to Frankfurt"
+    new_type: semantic
+    expect: supersede
+  - id: en-upd-002
+    lang: en
+    kind: update
+    memories: [{text: "I drink black coffee without sugar", type: preference}]
+    new: "I no longer drink coffee"
+    new_type: preference
+    expect: supersede
+  - id: en-upd-003
+    lang: en
+    kind: update
+    memories: [{text: "I use Python for most of my projects", type: semantic}]
+    new: "I switched to Rust for new projects"
+    new_type: semantic
+    expect: supersede
+  - id: en-upd-004
+    lang: en
+    kind: update
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    new: "I like hiking on weekends"
+    new_type: preference
+    expect: create
+
+# --- duplicate: orthographic variants, expect noop (10) ---
+  - id: ar-dup-001
+    lang: ar
+    kind: duplicate
+    memories: [{text: "أحب القهوة السوداء بدون سكر", type: preference}]
+    new: "احب القهوه السوداء بدون سكر"
+    expect: noop
+  - id: ar-dup-002
+    lang: ar
+    kind: duplicate
+    memories: ["اسمي أحمد وأعمل مهندس برمجيات في فرانكفورت"]
+    new: "اسمي احمد واعمل مهندس برمجيات في فرانكفورت"
+    expect: noop
+  - id: ar-dup-003
+    lang: ar
+    kind: duplicate
+    memories: ["لدي قطة اسمها لولو"]
+    new: "لديّ قطة اسمها لولو"
+    expect: noop
+  - id: ar-dup-004
+    lang: ar
+    kind: duplicate
+    memories: ["أستخدم لغة بايثون في معظم مشاريعي"]
+    new: "أستخدم لغة بايثـــون في معظم مشاريعي"
+    expect: noop
+  - id: ar-dup-005
+    lang: ar
+    kind: duplicate
+    memories: ["مكتبي في وسط مدينة فرانكفورت"]
+    new: "مكتبي في وسط مدينه فرانكفورت"
+    expect: noop
+  - id: ar-dup-006
+    lang: ar
+    kind: duplicate
+    memories: [{text: "أحب الجري صباحا في الحديقة", type: preference}]
+    new: "أحب الجري صباحاً في الحديقة"
+    expect: noop
+  - id: en-dup-001
+    lang: en
+    kind: duplicate
+    memories: [{text: "I prefer dark mode in all editors", type: preference}]
+    new: "i prefer dark mode in all editors"
+    expect: noop
+  - id: en-dup-002
+    lang: en
+    kind: duplicate
+    memories: [{text: "We chose PostgreSQL for the project database", type: decision}]
+    new: "We chose PostgreSQL for the project database."
+    expect: noop
+  - id: en-dup-003
+    lang: en
+    kind: duplicate
+    memories: ["I have a cat named Lulu"]
+    new: "I have a cat named Lulu!"
+    expect: noop
+  - id: en-dup-004
+    lang: en
+    kind: duplicate
+    memories: ["The deployment target is Hetzner with Docker Compose"]
+    new: "The deployment target is Hetzner with Docker Compose "
+    expect: noop
+
+# --- secret: redaction targets and false-positive guards (16) ---
+  - id: sec-001
+    lang: ar
+    kind: secret
+    text: "كلمة المرور الخاصة بي هي hunter2"
+    expect: redact
+  - id: sec-002
+    lang: ar
+    kind: secret
+    text: "كلمة السر: Tr0ub4dor&3"
+    expect: redact
+  - id: sec-003
+    lang: ar
+    kind: secret
+    text: "كلمه السر هي abc123"
+    expect: redact
+  - id: sec-004
+    lang: ar
+    kind: secret
+    text: "الباسورد = x9y8z7"
+    expect: redact
+  - id: sec-005
+    lang: ar
+    kind: secret
+    text: "الرقم السري: 458123"
+    expect: redact
+  - id: sec-006
+    lang: en
+    kind: secret
+    text: "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdef"
+    expect: redact
+  - id: sec-007
+    lang: en
+    kind: secret
+    text: "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    expect: redact
+  - id: sec-008
+    lang: en
+    kind: secret
+    text: "AWS key AKIAIOSFODNN7EXAMPLE"
+    expect: redact
+  - id: sec-009
+    lang: en
+    kind: secret
+    text: "postgres://admin:s3cret@db.example.com:5432/app"
+    expect: redact
+  - id: sec-010
+    lang: en
+    kind: secret
+    text: "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+    expect: redact
+  - id: sec-011
+    lang: ar
+    kind: secret
+    text: "رقم بطاقتي 4111 1111 1111 1111"
+    expect: redact
+  - id: sec-012
+    lang: ar
+    kind: secret
+    text: "رقم هاتفي 0501234567"
+    expect: keep
+  - id: sec-013
+    lang: ar
+    kind: secret
+    text: "تاريخ الميلاد 2026-11-21"
+    expect: keep
+  - id: sec-014
+    lang: ar
+    kind: secret
+    text: "أحب كلمة السر في الألعاب"
+    expect: keep
+  - id: sec-015
+    lang: en
+    kind: secret
+    text: "I use skikit-learn and ski-resort-guides daily"
+    expect: keep
+  - id: sec-016
+    lang: en
+    kind: secret
+    text: "https://example.com/path"
+    expect: keep
