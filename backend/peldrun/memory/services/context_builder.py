@@ -89,6 +89,7 @@ never working?" for hours.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Final, List, Optional, Tuple
 
@@ -146,10 +147,12 @@ Fields:
                          ``agent``.
     * ``memory_type`` -- one of ``semantic``/``episodic``/
                           ``procedural``/``preference``/``decision``.
-    * ``content`` -- the raw (NOT normalized) entry content. The
-                     normalized form is used ONLY for FTS indexing,
-                     never for presentation. Users should see what
-                     they (or the agent) originally wrote.
+    * ``content`` -- the entry content after ``sanitize_for_prompt``
+                     (NOT the FTS-normalized form). The normalized
+                     form is used ONLY for FTS indexing, never for
+                     presentation. Users see what they originally
+                     wrote, minus characters that could forge the
+                     block structure (audit S3).
 """
 
 
@@ -186,20 +189,55 @@ def _count_tokens(text: str) -> int:
 # Formatting -- used by this module AND by P1.5
 # ---------------------------------------------------------------------------
 
+# Control, line-separator and bidi-formatting characters that must
+# never reach the prompt inside memory content (audit defect S3).
+# Written with escapes so this source file stays ASCII.
+_CTRL: Final[re.Pattern] = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
+)
+
+#: Hard cap for a single sanitized entry line in the prompt.
+_PROMPT_CONTENT_MAX_CHARS: Final[int] = 500
+
+
+def sanitize_for_prompt(text: str, max_len: int = _PROMPT_CONTENT_MAX_CHARS) -> str:
+    """Neutralize memory content before it is injected into a prompt.
+
+    Memory text is DATA, never instructions. A stored entry may
+    contain newlines, square brackets or bidi controls that would
+    let it forge the surrounding block structure (for example a
+    line reading "[END MEMORY]" followed by "SYSTEM: ..."). This
+    function makes that impossible:
+
+      * control / line-separator / bidi characters -> single space,
+      * every whitespace run (newlines, tabs, ...) -> single space,
+      * square brackets -> parentheses (cannot forge block labels),
+      * truncate to ``max_len`` characters.
+
+    Idempotent: sanitize(sanitize(x)) == sanitize(x). Never raises.
+    """
+    if not text:
+        return ""
+    text = _CTRL.sub(" ", text)
+    text = " ".join(text.split())
+    text = text.replace("[", "(").replace("]", ")")
+    return text[:max_len]
+
 
 def _format_entry(entry: MemoryEntry, idx: int) -> str:
     """Format a single entry line with its position ``idx`` (1-based).
 
-    The content is inserted verbatim; the entry's ``content`` field
-    was already trimmed and capped at construction time (see
-    ``MemoryEntry._validate_content``), so no additional escaping
-    or normalization happens here.
+    The content passes through ``sanitize_for_prompt`` so a stored
+    entry can never forge the block structure (newlines, square
+    brackets and bidi controls are neutralized -- audit S3). The
+    raw ``content`` field itself is never modified; only the
+    prompt representation is sanitized.
     """
     return _ENTRY_LINE_FMT.format(
         idx=idx,
         scope_type=entry.scope_type.value,
         memory_type=entry.memory_type.value,
-        content=entry.content,
+        content=sanitize_for_prompt(entry.content),
     )
 
 
