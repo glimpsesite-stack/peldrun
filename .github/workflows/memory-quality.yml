@@ -1,0 +1,41 @@
+# .github/workflows/memory-quality.yml
+# Phase-0 quality gate: runs the memory test suite (unit + regression +
+# golden quality gates) and the no-regression check against the committed
+# baseline on every change that touches the backend.
+name: memory-quality
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - ".github/workflows/memory-quality.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+
+jobs:
+  memory-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install "pyyaml>=6.0"
+
+      - name: Memory test suite (unit + regression + quality gates)
+        run: python -m pytest tests/memory -q
+
+      - name: No-regression gate vs committed baseline
+        run: >
+          python -m tests.memory.eval.harness
+          --baseline tests/memory/eval/baseline_report.json
