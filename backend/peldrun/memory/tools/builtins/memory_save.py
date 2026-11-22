@@ -106,7 +106,6 @@ from peldrun.memory.domain import (
     MemoryScope,
     MemorySettings,
     MemorySourceType,
-    MemoryStatus,
     MemoryType,
     MemoryUnavailableError,
     MemoryValidationError,

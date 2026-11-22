@@ -91,7 +91,6 @@ from peldrun.memory.domain import (
     MemoryEntry,
     MemoryPort,
     MemorySettings,
-    MemoryStatus,
     MemoryUnavailableError,
     MemoryValidationError,
 )

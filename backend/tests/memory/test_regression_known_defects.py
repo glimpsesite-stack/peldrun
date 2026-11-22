@@ -228,6 +228,18 @@ def test_W3_single_write_entrypoint_exists():
         src = (BACKEND / rel).read_text(encoding="utf-8")
         assert "write_service import" in src, rel
         assert "await execute_decision(" in src, rel
+    # W3 cleanup: the duplicated inline executors must stay deleted.
+    # "_execute_decision(" cannot match "_execute_decision_shared(".
+    for rel, legacy in (
+        ("omweb/memory/manager/write_pipeline.py",
+         "async def _execute_decision("),
+        ("peldrun/memory/tools/builtins/memory_save.py",
+         "async def _execute_decision("),
+        ("omweb/memory/imports/base_adapter.py",
+         "async def _apply_candidates("),
+    ):
+        src = (BACKEND / rel).read_text(encoding="utf-8")
+        assert legacy not in src, f"legacy executor back in {rel}"
 
 
 # ---------------------------------------------------------------------------
@@ -315,14 +327,11 @@ def test_C1_dead_retrieval_trio_removed():
 # C2 -- retrieval settings must reach the live hybrid runtime.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="C2: memory_service never passes "
-                          "min_vector_similarity/mode from settings; phase 4")
 def test_C2_retrieval_settings_reach_hybrid_runtime():
-    src = (BACKEND / "omweb/memory/manager/memory_service.py").read_text(
-        encoding="utf-8")
-    assert "min_vector_similarity=settings" in src
-    assert "mode=settings" in src
+    from tests.memory.test_settings_contract import (
+        assert_hybrid_forwards_settings,
+    )
+    assert_hybrid_forwards_settings()
 
 
 # ---------------------------------------------------------------------------
