@@ -79,7 +79,7 @@ function Section({
   tone?: "default" | "danger";
 }) {
   const base =
-    "bg-card border border-border rounded-2xl p-6 shadow-sm relative overflow-hidden";
+    "bg-card border border-card rounded-md p-6 shadow-md relative overflow-hidden";
   const dangerStyles =
     tone === "danger"
       ? "bg-destructive/[0.03] border-destructive/30"
@@ -351,20 +351,14 @@ export default function ProjectSettingsPage() {
      * Inline style avoids Tailwind arbitrary-value calc quirks.
      */
     <div
-      className="w-full overflow-y-auto"
+      className="w-full overflow-y-auto bg-background"
       style={{ height: "calc(100vh - 57px)" }}
     >
-      <div className="container mx-auto px-4 py-8 max-w-4xl">
-        <motion.div
-          variants={stagger}
-          initial="hidden"
-          animate="visible"
-          className="space-y-6"
-        >
-          {/* ── Header ── */}
-          <motion.div variants={fadeUp} className="mb-2">
+
+       {/* ── Header ── */}
+          <motion.div variants={fadeUp} className="mb-2 w-full p-3 border border-b-border bg-muted !opacity-100">
             <div className="flex items-start justify-between gap-4 flex-wrap">
-              <div className="flex items-start gap-3">
+              <div className="flex items-center gap-3 ">
                 <motion.div
                   whileHover={{ scale: 1.05, rotate: 4 }}
                   transition={{
@@ -372,15 +366,15 @@ export default function ProjectSettingsPage() {
                     stiffness: 320,
                     damping: 22,
                   }}
-                  className="p-2.5 bg-accent/10 rounded-xl shrink-0 mt-0.5"
+                  className="  shrink-0 mt-1.5"
                 >
-                  <Settings size={22} className="text-accent" />
+                  <Settings size={33} className="text-black" />
                 </motion.div>
                 <div>
                   <h1 className="text-2xl font-bold tracking-tight">
                     Project Settings
                   </h1>
-                  <p className="text-sm text-muted-foreground mt-0.5">
+                  <p className="text-xs text-muted-foreground mt-0.5">
                     Configure your project's basic information and
                     workspace.
                   </p>
@@ -441,11 +435,21 @@ export default function ProjectSettingsPage() {
             </div>
           </motion.div>
 
+
+      <div className="container mx-auto px-4 py-8 ">
+        <motion.div
+          variants={stagger}
+          initial="hidden"
+          animate="visible"
+          className="space-y-6"
+        >
+
+
           {/* ── Project Info (read-only) ── */}
           <Section>
             <div className="flex items-center gap-2 mb-5">
               <Info size={16} className="text-accent" />
-              <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-black">
                 Project Information
               </h2>
             </div>
@@ -466,7 +470,7 @@ export default function ProjectSettingsPage() {
                       y: -2,
                       transition: { duration: 0.15, ease: "easeOut" },
                     }}
-                    className="bg-muted/30 border border-border rounded-xl p-3.5 hover:border-accent/30 transition-colors"
+                    className="bg-gigbg border border-muted rounded-sm p-3.5 hover:border-muted/30 transition-colors"
                   >
                     <div className="flex items-center gap-2 mb-2">
                       <div className={`p-1.5 rounded-md ${card.color}`}>
@@ -487,7 +491,7 @@ export default function ProjectSettingsPage() {
           <Section>
             <div className="flex items-center gap-2 mb-5">
               <Sparkles size={16} className="text-accent" />
-              <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-black">
                 Basic Information
               </h2>
             </div>
@@ -502,8 +506,8 @@ export default function ProjectSettingsPage() {
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-background border border-border rounded-lg text-sm
-                             focus:outline-none focus:ring-2 focus:ring-accent/40 focus:border-accent
+                  className="w-full px-3.5 py-2.5 bg-muted border border-muted rounded-md text-sm
+                             focus:outline-none focus:ring-1 focus:ring-card focus:border-rb/10
                              transition-shadow placeholder:text-muted-foreground/60"
                   placeholder="My Awesome Project"
                   required
@@ -522,8 +526,8 @@ export default function ProjectSettingsPage() {
                 <textarea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-background border border-border rounded-lg text-sm
-                             focus:outline-none focus:ring-2 focus:ring-accent/40 focus:border-accent
+                  className="w-full px-3.5 py-2.5 bg-muted border border-muted rounded-md text-sm
+                             focus:outline-none focus:ring-1 focus:ring-card focus:border-rb/10
                              transition-shadow resize-none placeholder:text-muted-foreground/60"
                   placeholder="A brief description of what this project is about…"
                   rows={3}
@@ -540,7 +544,7 @@ export default function ProjectSettingsPage() {
           <Section>
             <div className="flex items-center gap-2 mb-5">
               <HardDrive size={16} className="text-br" />
-              <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-black">
                 Workspace Configuration
               </h2>
             </div>

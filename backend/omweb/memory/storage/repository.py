@@ -115,6 +115,12 @@ from omweb.memory.storage.migrations import (
 from omweb.memory.storage.normalizer import (
     normalize_for_storage,
     normalize_query,
+    build_search_terms,
+    classify_query,
+    QueryIntent,
+    build_variant_query,
+    query_term_sets,
+    coverage_score,
 )
 
 
@@ -584,6 +590,11 @@ class SqliteMemoryRepository:
                     """,
                     self._entry_to_params(entry),
                 )
+                conn.execute(
+                    "UPDATE memories SET search_terms = ? "
+                    "WHERE memory_id = ?",
+                    (build_search_terms(entry.content), entry.memory_id),
+                )
         except sqlite3.IntegrityError as exc:
             if "UNIQUE constraint" in str(exc):
                 raise MemoryValidationError(
@@ -758,6 +769,14 @@ class SqliteMemoryRepository:
         if not scope_params:
             return []
 
+        # ----- Phase 2 (R2/R3): variant + absolute-coverage retrieval -----
+        # Chat/agentic path (match_any) uses the variant index when enabled;
+        # the memory_search tool (strict AND) keeps the legacy path below.
+        if filters.get("match_any") and filters.get("retrieval_v2", True):
+            return self._search_ranked_v2_sync(
+                query, limit, filters, scope_clause, scope_params
+            )
+
         normalized_query = normalize_query(
             query,
             # ``match_any`` is a BEHAVIOUR flag, not a column filter:
@@ -916,6 +935,92 @@ class SqliteMemoryRepository:
             normalized = max(0.0, min(1.0, normalized))
             result.append((entry, normalized))
         return result
+
+    def _search_ranked_v2_sync(
+        self,
+        query: str,
+        limit: int,
+        filters: Dict[str, Any],
+        scope_clause: str,
+        scope_params: List[str],
+    ) -> List[Tuple[MemoryEntry, float]]:
+        """Phase 2: explicit intent + variant FTS + absolute coverage (R2/R3).
+
+        Replaces relative BM25 normalization with weighted query-term
+        coverage and matches Arabic clitics via the search_terms index.
+        The legacy memories_fts path is untouched (retrieval_v2 kill switch).
+        """
+        intent = classify_query(query)
+        if intent is QueryIntent.BLANK:
+            recent = self._list_recent_sync(
+                scope_clause, scope_params, limit, filters
+            )
+            n = len(recent)
+            if n == 0:
+                return []
+            return [(entry, 1.0 - (i / n)) for i, entry in enumerate(recent)]
+        if intent is QueryIntent.NO_INTENT:
+            return []
+
+        match_expr = build_variant_query(query)
+        if not match_expr:
+            return []
+
+        min_coverage = float(filters.get("min_coverage", 0.3))
+        status_clause, status_params = self._build_status_filter(
+            filters.get("status")
+        )
+        optional_clauses, optional_params = self._build_optional_filters(
+            filters
+        )
+        optional_sql = (
+            " AND " + " AND ".join(optional_clauses)
+            if optional_clauses else ""
+        )
+        candidate_limit = max(limit * 4, 20)
+        sql = f"""
+            SELECT m.*, bm25(memories_fts_v2) AS rank
+            FROM memories m
+            JOIN memories_fts_v2 f ON f.rowid = m.memory_pk
+            WHERE memories_fts_v2 MATCH ?
+              AND {scope_clause}
+              AND {status_clause}
+              AND {self._build_expiry_filter()}
+              {optional_sql}
+            ORDER BY rank ASC
+            LIMIT ?
+        """
+        params: List[Any] = (
+            [match_expr] + scope_params + status_params
+            + optional_params + [candidate_limit]
+        )
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "FTS v2 search failed for %r: %s", match_expr[:100], exc
+            )
+            return []
+        except sqlite3.Error as exc:
+            raise MemoryUnavailableError(
+                f"Database error during v2 search: {exc}",
+                context={"query": match_expr[:100]},
+                cause=exc,
+            ) from exc
+
+        qsets = query_term_sets(query)
+        result: List[Tuple[MemoryEntry, float]] = []
+        for row in rows:
+            entry = self._row_to_entry(row)
+            if entry is None:
+                continue
+            entry_terms = set((row["search_terms"] or "").split())
+            score = coverage_score(qsets, entry_terms)
+            if score >= min_coverage:
+                result.append((entry, score))
+        result.sort(key=lambda pair: -pair[1])
+        return result[:limit]
 
     def _list_recent_sync(
         self,
@@ -1123,6 +1228,12 @@ class SqliteMemoryRepository:
                         entry.scope_type.value,
                         entry.scope_id,
                     ),
+                )
+
+                conn.execute(
+                    "UPDATE memories SET search_terms = ? "
+                    "WHERE memory_id = ?",
+                    (build_search_terms(entry.content), entry.memory_id),
                 )
 
                 if cursor.rowcount == 0:

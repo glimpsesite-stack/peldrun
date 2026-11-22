@@ -95,7 +95,7 @@ logger = logging.getLogger("omweb.memory.storage.migrations")
 # ---------------------------------------------------------------------------
 
 
-CURRENT_VERSION: int = 6
+CURRENT_VERSION: int = 7
 """Highest schema version this module knows how to produce.
 
 Bump only when adding a new migration. Every bump must be paired
@@ -961,6 +961,78 @@ def _apply_v6(conn: sqlite3.Connection) -> None:
 #   4. Update ``tests/memory/test_repository.py`` to exercise the
 #      new migration if it changes any user-visible behavior.
 
+def _apply_v7(conn: sqlite3.Connection) -> None:
+    """Phase 2 (R2/R3): search_terms variant index, side by side with v1.
+
+    Additive only: adds memories.search_terms + memories_fts_v2 + three
+    triggers, backfills search_terms for existing rows, rebuilds the new
+    index. The legacy memories_fts and its triggers are UNTOUCHED, so
+    disabling retrieval_v2 instantly restores the old path.
+    normalized_content and content_hash are NOT modified (no dedupe/merge
+    side effects). Idempotent and crash-safe like every migration here.
+    """
+    from omweb.memory.storage.normalizer import build_search_terms
+
+    if not _column_exists(conn, "memories", "search_terms"):
+        conn.execute(
+            "ALTER TABLE memories "
+            "ADD COLUMN search_terms TEXT NOT NULL DEFAULT ''"
+        )
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts_v2 USING fts5(
+            content, normalized_content, search_terms,
+            content='memories', content_rowid='memory_pk',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        """
+    )
+    # Backfill existing rows. No v2 triggers exist yet, so these UPDATEs
+    # do not touch the new index; the rebuild below populates it from the
+    # authoritative memories table. The old memories_au trigger skips
+    # these (content/normalized_content unchanged).
+    rows = conn.execute(
+        "SELECT memory_pk, content FROM memories"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE memories SET search_terms = ? WHERE memory_pk = ?",
+            (build_search_terms(row[1]), row[0]),
+        )
+    conn.commit()
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS memories_v2_ai
+        AFTER INSERT ON memories
+        BEGIN
+            INSERT INTO memories_fts_v2(rowid, content, normalized_content, search_terms)
+            VALUES (new.memory_pk, new.content, new.normalized_content, new.search_terms);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_v2_ad
+        AFTER DELETE ON memories
+        BEGIN
+            INSERT INTO memories_fts_v2(memories_fts_v2, rowid, content, normalized_content, search_terms)
+            VALUES ('delete', old.memory_pk, old.content, old.normalized_content, old.search_terms);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_v2_au
+        AFTER UPDATE ON memories
+        WHEN new.content != old.content
+          OR new.normalized_content != old.normalized_content
+          OR new.search_terms != old.search_terms
+        BEGIN
+            INSERT INTO memories_fts_v2(memories_fts_v2, rowid, content, normalized_content, search_terms)
+            VALUES ('delete', old.memory_pk, old.content, old.normalized_content, old.search_terms);
+            INSERT INTO memories_fts_v2(rowid, content, normalized_content, search_terms)
+            VALUES (new.memory_pk, new.content, new.normalized_content, new.search_terms);
+        END;
+        """
+    )
+    conn.execute(
+        "INSERT INTO memories_fts_v2(memories_fts_v2) VALUES('rebuild')"
+    )
+    conn.commit()
+
+
 _MIGRATIONS: List[Tuple[int, Any]] = [
     (1, _apply_v1),
     (2, _apply_v2),
@@ -968,6 +1040,7 @@ _MIGRATIONS: List[Tuple[int, Any]] = [
     (4, _apply_v4),
     (5, _apply_v5),
     (6, _apply_v6),
+    (7, _apply_v7),
 ]
 
 

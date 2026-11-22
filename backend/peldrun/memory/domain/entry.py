@@ -675,7 +675,11 @@ class MemoryEntry(BaseModel):
         # ``.value`` is explicit: str-Enum members stringify
         # inconsistently across Python versions and Pydantic
         # releases. ``.value`` is the stable, documented accessor.
-        raw = f"{self.scope_type.value}:{self.scope_id}:{source}"
+        # W2: fold taa-marbuta -> ha for the DEDUPE HASH only, so
+        # orthographic variants of the same fact collide. The stored
+        # normalized_content is unchanged (FTS indexing unaffected).
+        folded = source.replace("\u0629", "\u0647")
+        raw = f"{self.scope_type.value}:{self.scope_id}:{folded}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
     def with_normalized_content(self, normalized: str) -> "MemoryEntry":
@@ -702,7 +706,10 @@ class MemoryEntry(BaseModel):
                 f"normalized content exceeds {_MAX_CONTENT_CHARS} chars "
                 f"(got {len(stripped)})"
             )
-        raw = f"{self.scope_type.value}:{self.scope_id}:{stripped}"
+        # W2: hash the taa-marbuta-folded form (dedupe only); the
+        # stored normalized_content keeps its original spelling.
+        folded = stripped.replace("\u0629", "\u0647")
+        raw = f"{self.scope_type.value}:{self.scope_id}:{folded}"
         new_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
         return self.model_copy(
             update={

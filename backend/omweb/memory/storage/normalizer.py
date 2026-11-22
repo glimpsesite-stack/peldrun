@@ -165,6 +165,7 @@ string of zero-width characters. The fallback preserves the
 from __future__ import annotations
 
 import re
+from enum import Enum
 from typing import Dict, Final, Mapping
 
 
@@ -757,7 +758,179 @@ def _build_any_expression(tokens: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 (R2/R3): explicit query intent + Arabic candidate-variant engine.
+# Additive pure functions; normalize_for_storage / normalize_query are
+# UNCHANGED, so content_hash and the existing FTS index are untouched.
+# Arabic literals are written as \uXXXX escapes to keep this file ASCII.
+# ---------------------------------------------------------------------------
+
+class QueryIntent(str, Enum):
+    """Explicit retrieval intent, classified once and consumed everywhere."""
+
+    BLANK = "blank"          # no word chars: caller wants the recency listing
+    NO_INTENT = "no_intent"  # all stopwords / social phrase: zero results
+    LOOKUP = "lookup"        # a real retrieval query
+
+
+_SOCIAL_RX: Final[re.Pattern] = re.compile(
+    r"^(?:\u0643\u064a\u0641\s+\u062d\u0627\u0644\u0643|"
+    r"\u0643\u064a\u0641\s+\u0627\u0644\u062d\u0627\u0644|"
+    r"\u0645\u0627\s+\u0627\u0644\u0627\u062e\u0628\u0627\u0631|"
+    r"\u0635\u0628\u0627\u062d\s+\u0627\u0644\u062e\u064a\u0631|"
+    r"\u0645\u0633\u0627\u0621\s+\u0627\u0644\u062e\u064a\u0631|"
+    r"\u0645\u0646\s+\u0641\u0636\u0644\u0643|"
+    r"how\s+are\s+you|good\s+(?:morning|evening))\W*$"
+)
+
+
+def classify_query(query: str) -> QueryIntent:
+    """Classify retrieval intent (replaces the R1 regex in the repository)."""
+    if not re.search(r"\w", query or ""):
+        return QueryIntent.BLANK
+    if _SOCIAL_RX.match(normalize_for_storage(query)) or not normalize_query(
+        query, match="any"
+    ):
+        return QueryIntent.NO_INTENT
+    return QueryIntent.LOOKUP
+
+
+def fold_for_search(text: str) -> str:
+    """Search-only folding: canonical normalization + taa-marbuta -> ha.
+
+    Deliberately SEPARATE from normalize_for_storage so content_hash and
+    the stored normalized_content are never altered (audit W2 owns that).
+    """
+    return normalize_for_storage(text).replace("\u0629", "\u0647")
+
+
+_AR_SEARCH_PREFIXES: Final[tuple] = (
+    "\u0648\u0627\u0644", "\u0628\u0627\u0644", "\u0643\u0627\u0644",
+    "\u0641\u0627\u0644", "\u0644\u0644", "\u0627\u0644",
+    "\u0648", "\u0641", "\u0628", "\u0643", "\u0644",
+)
+_AR_SEARCH_SUFFIXES: Final[tuple] = (
+    "\u0627\u062a\u0647\u0627", "\u0627\u062a\u0647\u0645",
+    "\u0627\u062a\u0646\u0627", "\u0647\u0627", "\u0647\u0645",
+    "\u0647\u0646", "\u0643\u0645", "\u0643\u0646", "\u0646\u0627",
+    "\u0627\u062a", "\u0648\u0646", "\u064a\u0646", "\u0627\u0646",
+    "\u064a", "\u0643", "\u0647",
+)
+
+
+def arabic_variants(token: str) -> set:
+    """Candidate surface forms: strip one clitic prefix and/or one suffix.
+
+    Keeps >= 3 chars so a one-letter gain never manufactures a match.
+    Restores taa-marbuta after a stripped final ``ta`` so a possessive
+    form folds back to the base noun (see the audit coffee example).
+    """
+    out = {token}
+    forms = {token}
+    for p in _AR_SEARCH_PREFIXES:
+        if token.startswith(p) and len(token) - len(p) >= 3:
+            forms.add(token[len(p):])
+    for f in list(forms):
+        out.add(f)
+        for s in _AR_SEARCH_SUFFIXES:
+            if f.endswith(s) and len(f) - len(s) >= 3:
+                base = f[:-len(s)]
+                out.add(base)
+                if base.endswith("\u062a"):
+                    out.add(base[:-1] + "\u0647")
+    return {v for v in out if len(v) >= 3}
+
+
+def build_search_terms(text: str) -> str:
+    """Union of candidate variants of every folded word (index side)."""
+    terms: set = set()
+    for w in re.findall(r"\w+", fold_for_search(text)):
+        terms |= arabic_variants(w)
+    return " ".join(sorted(terms))
+
+
+def _content_words(text: str) -> list:
+    return [
+        w for w in re.findall(r"\w+", fold_for_search(text))
+        if w not in _QUERY_STOPWORDS and len(w) > 1
+    ]
+
+
+def build_variant_query(text: str) -> str:
+    """OR of prefix-wildcarded variants of each content word (query side)."""
+    terms: list = []
+    seen: set = set()
+    for w in _content_words(text):
+        for v in sorted(arabic_variants(w)):
+            if v not in seen:
+                seen.add(v)
+                terms.append(v + "*")
+    return " OR ".join(terms)
+
+
+_GENERIC_TERMS: Final[frozenset] = frozenset(
+    {
+        "\u0627\u0633\u0645", "\u0627\u062d\u0628", "\u0644\u062f\u064a",
+        "\u0639\u0646\u062f\u064a", "\u0645\u0641\u0636\u0644",
+        "\u0627\u062e\u062a\u0631\u0646", "\u0627\u062e\u062a\u0631",
+        "\u0642\u0631\u0631\u0646",
+        "name", "like", "have", "favorite", "prefer", "pick", "chose",
+    }
+)
+
+
+def _is_generic(word: str) -> bool:
+    f = fold_for_search(word)
+    return any(f.startswith(g) for g in _GENERIC_TERMS) or bool(
+        arabic_variants(f) & _GENERIC_TERMS
+    )
+
+
+def _is_latin(word: str) -> bool:
+    return all(ord(c) < 128 for c in word)
+
+
+def query_term_sets(query: str) -> list:
+    """Return [(word, variant_set, weight)] for each content word."""
+    return [
+        (w, arabic_variants(w), 0.3 if _is_generic(w) else 1.0)
+        for w in _content_words(query)
+    ]
+
+
+def coverage_score(qsets: list, entry_terms: set) -> float:
+    """Absolute weighted query-term coverage in [0, 1] (audit R2).
+
+    A content word is covered when one of its variants is present in the
+    entry's search_terms; Latin words also match by prefix (deploy ->
+    deployment), mirroring the FTS wildcard. Generic words weigh 0.3 so a
+    single incidental generic token cannot carry a weak match to 1.0.
+    """
+    if not qsets:
+        return 0.0
+    total = 0.0
+    hit = 0.0
+    for w, vs, wt in qsets:
+        total += wt
+        covered = bool(vs & entry_terms)
+        if not covered and _is_latin(w):
+            covered = any(
+                et.startswith(w) or w.startswith(et) for et in entry_terms
+            )
+        if covered:
+            hit += wt
+    return hit / total if total else 0.0
+
+
 __all__ = [
     "normalize_for_storage",
     "normalize_query",
+    "QueryIntent",
+    "classify_query",
+    "fold_for_search",
+    "arabic_variants",
+    "build_search_terms",
+    "build_variant_query",
+    "query_term_sets",
+    "coverage_score",
 ]

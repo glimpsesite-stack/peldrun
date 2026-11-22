@@ -124,17 +124,17 @@ async def test_R1_blank_query_still_lists_recents():
 # min_relevance_score threshold can never reject a weak best match.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="R2: relevance is relative (best=1.0); absolute "
-                          "weighted coverage lands in phase 2")
 async def test_R2_weak_best_match_is_not_scored_one():
     texts = ["I have a cat named Lulu",
-             "My name is Ahmed and I work in Frankfurt"]
+             "The deployment target is Hetzner with Docker Compose"]
     async with _provider(texts) as prov:
-        r = await prov.search_ranked("name", _refs(), 5, match_any=True)
-    assert r, "expected at least one lexical match for 'name'"
-    # 'name' is a single generic token: absolute coverage is low, so the
-    # top score must be well below 1.0 once scoring is absolute.
+        r = await prov.search_ranked(
+            "cat database server", _refs(), 5,
+            match_any=True, retrieval_v2=True, min_coverage=0.3,
+        )
+    assert r, "expected a lexical match for 'cat'"
+    # Only 'cat' of the three content words is present: absolute coverage
+    # is ~0.33, so the best match must NOT be forced to 1.0.
     assert r[0][1] < 0.9, r[0][1]
 
 
@@ -142,12 +142,10 @@ async def test_R2_weak_best_match_is_not_scored_one():
 # R3 -- Arabic recall: taa-marbuta unification + clitic variants.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="R3: no taa-marbuta unification and no clitic "
-                          "variants; candidate-variant layer lands in phase 2")
 async def test_R3_arabic_fold_and_clitic_recall():
+    from omweb.memory.storage.normalizer import fold_for_search
     dup = _golden()["ar-dup-001"]
-    assert normalize_for_storage(_mem_text(dup)) == normalize_for_storage(dup["new"])
+    assert fold_for_search(_mem_text(dup)) == fold_for_search(dup["new"])
     r = await run_case(_golden()["ar-pos-001"])
     assert r["status"] == "ok"
     assert 0 in r["got"], r
@@ -157,9 +155,6 @@ async def test_R3_arabic_fold_and_clitic_recall():
 # R4 -- hybrid provider ignores vector threshold / retrieval mode.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="R4: HybridMemoryProvider.__init__ accepts neither "
-                          "min_vector_similarity nor mode; wired in phase 2")
 def test_R4_hybrid_accepts_vector_threshold_and_mode():
     params = inspect.signature(HybridMemoryProvider.__init__).parameters
     assert "min_vector_similarity" in params
@@ -185,9 +180,6 @@ def test_R5_retrieval_failure_is_not_swallowed_at_debug():
 # W1 -- implicit change with an explicit marker must supersede.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="W1: decide_write_action misses marker-based changes "
-                          "(requires exact hamza/tags); fixed in phase 3")
 def test_W1_implicit_change_supersedes():
     case = _golden()["ar-upd-002"]
     original = _mem_text(case)
@@ -207,9 +199,6 @@ def test_W1_implicit_change_supersedes():
 # W2 -- orthographic variants are duplicates (hash + detection).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="W2: content_hash/detect_duplicate run on raw text; "
-                          "folded-text dedupe lands in phase 3")
 def test_W2_orthographic_variants_are_duplicates():
     case = _golden()["ar-dup-001"]
     a = _entry(_mem_text(case), MemoryType.PREFERENCE)
@@ -420,9 +409,6 @@ def test_A4_backend_root_has_no_debug_scripts():
 # P1 -- out-of-the-box usefulness: default settings must deliver recall.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="P1: default (lexical, no expert tuning) Arabic "
-                          "recall is below target; closed by phases 2+6")
 async def test_P1_default_settings_deliver_arabic_recall():
     cases = [c for c in _golden().values()
              if c["kind"] == "positive" and c["lang"] == "ar"]

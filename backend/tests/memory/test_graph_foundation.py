@@ -175,7 +175,7 @@ def test_migration_v6_idempotent(db_path: Path) -> None:
         (this is the crash-recovery guarantee),
       * the three graph tables and their indexes exist.
     """
-    assert CURRENT_VERSION == 6
+    assert CURRENT_VERSION >= 6
 
     conn = sqlite3.connect(str(db_path))
     try:
@@ -183,9 +183,9 @@ def test_migration_v6_idempotent(db_path: Path) -> None:
         second = apply_schema(conn)
         third = apply_schema(conn)
 
-        assert first == 6
-        assert second == 6
-        assert third == 6
+        assert first == CURRENT_VERSION
+        assert second == CURRENT_VERSION
+        assert third == CURRENT_VERSION
 
         tables = {
             row[0]
@@ -221,10 +221,10 @@ def test_migration_v6_idempotent(db_path: Path) -> None:
                 "ORDER BY version"
             ).fetchall()
         ]
-        assert versions == [1, 2, 3, 4, 5, 6]
+        assert versions == list(range(1, CURRENT_VERSION + 1))
 
         status = schema_status(conn)
-        assert status["current_version"] == 6
+        assert status["current_version"] == CURRENT_VERSION
         assert status["up_to_date"] is True
         assert status["graph_entities_count"] == 0
         assert status["graph_relations_count"] == 0
@@ -265,8 +265,8 @@ def test_migration_v6_upgrades_a_v4_database(db_path: Path) -> None:
         conn.execute("DROP TABLE graph_relations")
         conn.execute("DROP TABLE graph_entities")
         conn.commit()
-        assert apply_schema(conn) == 6
-        assert apply_schema(conn) == 6
+        assert apply_schema(conn) == CURRENT_VERSION
+        assert apply_schema(conn) == CURRENT_VERSION
 
         count = conn.execute(
             "SELECT COUNT(*) FROM memories WHERE memory_id='mem_legacy'"

@@ -679,12 +679,16 @@ def detect_conflict(
         if entry.content_hash == candidate.content_hash:
             continue
 
-        # Tag overlap required. If neither entry has tags, we
-        # cannot confirm the conflict is about the same topic,
-        # so we skip. This is conservative by design.
-        if not candidate_tags or not entry.tags:
-            continue
-        if not candidate_tags & set(entry.tags):
+        # W1: require tag overlap only when BOTH entries carry tags.
+        # Untagged facts (explicit saves and the golden set) can still
+        # conflict when type + replacement marker + token overlap agree.
+        # Tagged entries keep the original guard, so existing behavior
+        # is preserved.
+        if (
+            candidate_tags
+            and entry.tags
+            and not (candidate_tags & set(entry.tags))
+        ):
             continue
 
         # Token overlap check -- ensures the conflict is topical,

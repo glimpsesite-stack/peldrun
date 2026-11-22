@@ -236,6 +236,8 @@ class HybridMemoryProvider:
         rrf_k: int = _DEFAULT_RRF_K,
         reranker: Optional[Any] = None,
         graph_search: Optional[Any] = None,
+        min_vector_similarity: float = 0.0,
+        mode: str = "hybrid",
     ) -> None:
         """Construct the hybrid wrapper.
 
@@ -296,6 +298,12 @@ class HybridMemoryProvider:
         self._fts_provider: MemoryProvider = fts_provider
         self._vec_provider: SqliteVecProvider = vec_provider
         self._rrf_k: int = rrf_k
+        # R4/C2: retrieval strategy + vector cosine floor, wired from
+        # MemoryRetrievalSettings by MemoryService. ``mode`` selects
+        # lexical / vector / hybrid / automatic; min_vector_similarity
+        # was hardcoded to 0.0 (audit R4).
+        self._min_vector_similarity: float = float(min_vector_similarity)
+        self._mode: str = mode
         #: Phase 5A: optional LLM-based reranker. ``None`` when
         #: disabled in settings or when no model is configured --
         #: in that case ``search_ranked`` skips the rerank step
@@ -515,6 +523,33 @@ class HybridMemoryProvider:
                 query, scope_refs, limit, **filters
             )
 
+        # R4/C2: retrieval.mode selects the strategy. ``lexical``
+        # bypasses the vector source; ``vector`` bypasses FTS;
+        # ``hybrid``/``automatic`` fuse both (automatic == hybrid here
+        # because this wrapper only exists when the vector side is ready).
+        if self._mode == "lexical":
+            self._last_search_mode = "fts"
+            return await self._fts_provider.search_ranked(
+                query, scope_refs, limit, **filters
+            )
+        if self._mode == "vector":
+            self._last_search_mode = "vector"
+            try:
+                vec_only = await self._vec_provider.search(
+                    query=query, scope_refs=scope_refs, limit=limit,
+                    min_similarity=self._min_vector_similarity,
+                )
+                return list(vec_only)
+            except Exception as exc:
+                logger.warning(
+                    "Hybrid: vector-only search failed; falling back "
+                    "to FTS: %s", exc,
+                )
+                self._last_search_mode = "fts"
+                return await self._fts_provider.search_ranked(
+                    query, scope_refs, limit, **filters
+                )
+
         # Decide whether vector participates.
         use_vec = self._should_use_vector(query, filters)
         if not use_vec:
@@ -543,7 +578,7 @@ class HybridMemoryProvider:
             query=query,
             scope_refs=scope_refs,
             limit=limit,
-            min_similarity=0.0,
+            min_similarity=self._min_vector_similarity,
         )
         graph_coro = self._graph_ranked(query, scope_refs, limit)
 
@@ -984,6 +1019,16 @@ class HybridMemoryProvider:
     def rrf_k(self) -> int:
         """The RRF smoothing constant in use (for diagnostics)."""
         return self._rrf_k
+
+    @property
+    def min_vector_similarity(self) -> float:
+        """The cosine floor applied to the vector source (diagnostics)."""
+        return self._min_vector_similarity
+
+    @property
+    def mode(self) -> str:
+        """The retrieval strategy in use (for diagnostics)."""
+        return self._mode
 
     @property
     def fts_provider(self) -> MemoryProvider:

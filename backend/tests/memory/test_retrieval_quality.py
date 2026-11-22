@@ -94,17 +94,11 @@ def test_no_regression_vs_baseline(golden):
 
 # --- Targets not yet met (phase 2); strict xfail until fixed --------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="R3: Arabic recall below target until clitic "
-                          "variants + search_terms migration land (phase 2)")
 def test_arabic_recall_target(golden):
     summary, _ = golden
     assert summary["recall_at_5_by_lang"]["ar"] >= AR_RECALL_TARGET
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="R2: relative scoring injects noise on positives; "
-                          "absolute weighted coverage lands in phase 2")
 def test_positive_precision_target(golden):
     _, results = golden
     assert _precision(results) >= PRECISION_TARGET

@@ -4370,6 +4370,13 @@ class MemoryService:
                 # graph is not yet built at this point and why the
                 # flag must be re-read on every search.
                 graph_search=_LazyGraphSearch(self),
+                # R4/C2: wire strategy + thresholds from settings so they
+                # have a real effect on the live hybrid path.
+                rrf_k=self._lifecycle.settings.retrieval.rrf_k,
+                min_vector_similarity=(
+                    self._lifecycle.settings.retrieval.min_vector_similarity
+                ),
+                mode=self._lifecycle.settings.retrieval.mode,
             )
 
             # ---- 4. Commit state -------------------------

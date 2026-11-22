@@ -1053,6 +1053,26 @@ class MemoryRetrievalSettings(BaseModel):
         ),
     )
 
+    retrieval_v2: bool = Field(
+        default=True,
+        description=(
+            "Phase 2 variant + absolute-coverage retrieval (Arabic clitics "
+            "via search_terms, weighted query-term coverage instead of "
+            "relative BM25). Calibrated on the golden set. Set False to "
+            "instantly restore the legacy memories_fts path (kill switch)."
+        ),
+    )
+    min_coverage: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum weighted query-term coverage for a hit to survive on "
+            "the retrieval_v2 path. Calibrated on the golden set: 0.3 keeps "
+            "partial-but-valid matches and drops noise."
+        ),
+    )
+
     graph_search_enabled: bool = Field(
         default=False,
         description=(

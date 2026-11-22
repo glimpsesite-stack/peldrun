@@ -634,6 +634,8 @@ async def build_memory_context(
                 # unknown filters (the vector backend, test doubles)
                 # are unaffected; the SQLite FTS path reads it.
                 match_any=match_any,
+                retrieval_v2=settings.retrieval.retrieval_v2,
+                min_coverage=settings.retrieval.min_coverage,
             )
         else:
             entries = await provider.search(
