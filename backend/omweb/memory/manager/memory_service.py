@@ -439,6 +439,13 @@ class MemoryService:
             "AgenticRAGOrchestrator"
         ] = None
 
+        # --- Retrieval failure observability (audit R5) ---
+        # Incremented by the dispatcher when retrieve() raises. The
+        # count and last error are surfaced via retrieval_failure_stats
+        # so a retrieval failure is never silently invisible.
+        self._retrieval_failure_count: int = 0
+        self._last_retrieval_error: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -4875,6 +4882,36 @@ class MemoryService:
                 conn.close()
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------
+    # Retrieval failure observability (audit R5)
+    # ------------------------------------------------------------------
+
+    def record_retrieval_failure(self, exc: Exception) -> None:
+        """Record a retrieval failure for diagnostics (audit R5).
+
+        Called by the dispatcher's retrieval hook when ``retrieve``
+        raises. Never raises itself: observability must not create a
+        new failure path. The counter and last error are exposed via
+        ``retrieval_failure_stats`` for the diagnostics endpoint.
+        """
+        try:
+            self._retrieval_failure_count += 1
+            self._last_retrieval_error = f"{type(exc).__name__}: {exc}"
+        except Exception:  # noqa: BLE001 -- observability is best-effort
+            pass
+
+    @property
+    def retrieval_failure_stats(self) -> dict:
+        """Retrieval failure counter and last error (for diagnostics)."""
+        return {
+            "retrieval_failure_count": getattr(
+                self, "_retrieval_failure_count", 0
+            ),
+            "last_retrieval_error": getattr(
+                self, "_last_retrieval_error", None
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Internal: usage recording

@@ -1888,11 +1888,18 @@ async def run_instrumented(
             )
         memory_context = _retrieved
     except Exception as _mem_err:
-        logger.debug(
-            "[BRIDGE] Memory retrieval skipped for job %s: %s",
+        # R5: a retrieval failure must be visible (WARNING + counter),
+        # never swallowed at DEBUG where it looks like "empty memory".
+        logger.warning(
+            "[BRIDGE] Memory retrieval failed for job %s: %s",
             job_id,
             _mem_err,
+            exc_info=True,
         )
+        try:
+            _mem_service.record_retrieval_failure(_mem_err)
+        except Exception:  # noqa: BLE001 -- observability is best-effort
+            pass
         memory_context = None
 
     context = EngineRunContext(

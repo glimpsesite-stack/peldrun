@@ -596,7 +596,7 @@ _MIN_WILDCARD_TOKEN_CHARS: Final[int] = 2
 #: survives, so a query consisting solely of function words yields an
 #: empty expression -> zero matches -> nothing injected. That is the
 #: correct outcome for "thank you".
-_QUERY_STOPWORDS: Final[frozenset] = frozenset(
+_QUERY_STOPWORDS: frozenset = frozenset(
     {
         # English
         "a", "an", "the", "and", "or", "but", "if", "of", "to", "in",
@@ -616,6 +616,38 @@ _QUERY_STOPWORDS: Final[frozenset] = frozenset(
         "ثم", "قد", "كان", "كانت", "هذا", "هذه", "ذلك", "تلك",
         "التي", "الذي", "يا", "مرحبا", "شكرا", "من فضلك",
     }
+)
+
+# L1/R3: extend Arabic function-word coverage and drop the dead
+# multi-word entry. A phrase containing a space can never equal a
+# single \w+ token, so "min fadlik" was dead weight (audit L1).
+# New entries use \uXXXX escapes to keep this source diff ASCII.
+_AR_EXTRA_STOPWORDS: Final[frozenset] = frozenset(
+    {
+        "\u0645\u0627\u0630\u0627",
+        "\u0643\u064a\u0641",
+        "\u0644\u0645\u0627\u0630\u0627",
+        "\u0627\u064a\u0646",
+        "\u0645\u062a\u0649",
+        "\u0627\u0646",
+        "\u0644\u0643",
+        "\u0644\u064a",
+        "\u0628\u0643",
+        "\u062c\u062f\u0627",
+        "\u0627\u064a\u0636\u0627",
+        "\u0647\u0646\u0627\u0643",
+        "\u0647\u0646\u0627",
+        "\u0639\u0646\u062f",
+        "\u0627\u0630\u0627",
+        "\u0644\u0645",
+        "\u0644\u0646",
+        "\u0644\u064a\u0633",
+        "\u0644\u0643\u0646",
+    }
+)
+_QUERY_STOPWORDS = frozenset(
+    (set(_QUERY_STOPWORDS) | _AR_EXTRA_STOPWORDS)
+    - {"\u0645\u0646 \u0641\u0636\u0644\u0643"}
 )
 
 #: Single-letter Arabic clitics that may precede the definite article

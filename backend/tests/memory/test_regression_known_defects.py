@@ -170,9 +170,6 @@ def test_R4_hybrid_accepts_vector_threshold_and_mode():
 # R5 -- retrieval failure swallowed at DEBUG level in the dispatcher.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="R5: dispatcher logs retrieval failure at debug; "
-                          "warning + failure counter land in phase 1")
 def test_R5_retrieval_failure_is_not_swallowed_at_debug():
     src = (BACKEND / "omweb/agent_bridge_parts/dispatcher.py").read_text(
         encoding="utf-8")
@@ -442,9 +439,6 @@ async def test_P1_default_settings_deliver_arabic_recall():
 # L1 -- dead multi-word stopword entry in the normalizer.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="L1: multi-word entry in _QUERY_STOPWORDS can never "
-                          "match a token; phrase handling lands in phase 1")
 def test_L1_dead_stopword_entry_removed():
     phrase = _golden()["ar-noint-014"]["query"]  # the multi-word social phrase
     assert phrase not in normalizer._QUERY_STOPWORDS
