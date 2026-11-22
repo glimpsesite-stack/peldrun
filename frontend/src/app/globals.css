@@ -67,9 +67,10 @@
     --lightest: 0 0% 57.65%;
 
 
-    --font-sans: 'DM Sans', sans-serif;
+    --font-sans: 'Inter', sans-serif;
     --font-serif: 'Libre Baskerville', serif;
     --font-arabic: 'Cairo', sans-serif;
+    --font-mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
 
   .dark {

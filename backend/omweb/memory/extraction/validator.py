@@ -77,13 +77,13 @@ Design invariants
    with ``reason="source_malformed"``. The orchestrator never
    has to wrap `validate` in a try/except.
 
-4. **`message_role=None` is checked against BOTH sides of a turn.**
-   When the LLM does not report which speaker the snippet came
-   from, the validator accepts the evidence if the snippet
-   matches EITHER the user OR the assistant content of the turn.
-   This is more forgiving than requiring the LLM to always
-   report the role correctly, while still requiring the snippet
-   to be a literal substring of one of the two actual messages.
+4. **Evidence must cite a USER message (audit S2).**
+   An explicit ``message_role="assistant"`` is rejected with
+   reason ``assistant_evidence``: assistant text is context for
+   the model, never a source of facts about the user. A missing
+   role is treated as ``"user"`` and the snippet is resolved
+   against the USER side only, so an assistant-only snippet
+   cannot slip through by omitting the role.
 
 5. **`turn_id` cross-check is OPTIONAL.**
    When the evidence includes a `turn_id` AND the source turn
@@ -257,7 +257,7 @@ class ValidationResult(BaseModel):
             "`ok` is True. Values: 'snippet_too_short', "
             "'snippet_too_long', 'turn_index_out_of_range', "
             "'turn_id_mismatch', 'snippet_not_verbatim', "
-            "'source_malformed'."
+            "'source_malformed', 'assistant_evidence'."
         ),
     )
     detail: str = Field(
@@ -452,6 +452,25 @@ class EvidenceValidator:
                 "snippet_too_long",
                 f"snippet is {len(snippet)} chars; maximum "
                 f"is {_MAX_SNIPPET_CHARS}.",
+            )
+
+        # --- S2: evidence must cite a USER message ------------------
+        # Assistant text is context for the model, never a source of
+        # facts about the user: storing it would persist assistant
+        # hallucinations as user truths (audit S2). A missing role is
+        # treated as "user" and resolved against the USER side only,
+        # so an assistant-only snippet cannot slip through by
+        # omitting the role.
+        role = evidence.message_role or "user"
+        if role != "user":
+            return ValidationResult.reject(
+                "assistant_evidence",
+                "evidence must cite a user message; assistant "
+                "text is context, not a source of user facts.",
+            )
+        if evidence.message_role is None:
+            evidence = evidence.model_copy(
+                update={"message_role": "user"}
             )
 
         # --- Self-poisoning guard ----------------------------------

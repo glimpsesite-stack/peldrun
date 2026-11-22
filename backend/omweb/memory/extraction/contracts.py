@@ -141,10 +141,11 @@ class Evidence(BaseModel):
     message_role: Optional[str] = Field(
         default=None,
         description=(
-            "Which message in the turn the snippet came from: "
-            "'user' or 'assistant'. Optional -- the validator "
-            "accepts snippets from either role, but the UI shows "
-            "the role as context."
+            "Which message in the turn the snippet came from. "
+            "Must be 'user' (audit S2): assistant text is context, "
+            "never a source of user facts. Optional -- a missing "
+            "role is treated as 'user' and resolved against the "
+            "user side only."
         ),
     )
 

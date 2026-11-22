@@ -1,6 +1,6 @@
 ﻿//frontend\src\app\layout.tsx
 import type { Metadata, Viewport } from "next";
-import { DM_Sans, Libre_Baskerville, Cairo } from "next/font/google";
+import { Inter, DM_Sans, Libre_Baskerville, Cairo, JetBrains_Mono } from "next/font/google";
 import { getServerStorageSnapshot } from "@/lib/storage/server";
 import { StorageProvider } from "@/components/providers/storage-provider";
 import { ThemeProvider } from "@/components/layout/theme-provider";
@@ -15,10 +15,17 @@ import Script from "next/script";
 
 import "@/app/globals.css";
 
-const dmSans = DM_Sans({
+const dmSans = Inter({
   subsets: ["latin"],
   variable: "--font-sans",
   display: "swap",
+});
+
+const mono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono",
+  display: "swap",
+
 });
 
 const libreBaskerville = Libre_Baskerville({
@@ -67,7 +74,7 @@ export default async function RootLayout({
       dir={isRtl ? "rtl" : "ltr"}
       data-theme={theme}
       suppressHydrationWarning
-      className={`${isDark ? "dark" : ""} ${dmSans.variable} ${libreBaskerville.variable}${cairo.variable}`}
+      className={`${isDark ? "dark" : ""} ${dmSans.variable} ${libreBaskerville.variable}${cairo.variable}${mono.variable}`}
     >
       <head>
         {/*

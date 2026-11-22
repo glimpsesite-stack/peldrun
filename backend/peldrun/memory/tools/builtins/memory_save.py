@@ -116,6 +116,10 @@ from peldrun.memory.services.policies import (
     WriteAction,
     decide_write_action,
 )
+from peldrun.memory.services.write_service import (
+    WRITE_DEDUPE_SCAN_LIMIT,
+    execute_decision,
+)
 
 
 logger = logging.getLogger("peldrun.memory.tools.memory_save")
@@ -171,8 +175,9 @@ class MemorySaveTool:
         settings
             The current ``MemorySettings`` snapshot. The tool
             reads ``settings.mode`` to enforce DISABLED and
-            READ_ONLY, and ``settings.default_limit`` when
-            scanning existing entries for duplicates.
+            READ_ONLY. The duplicate scan uses the shared
+            ``WRITE_DEDUPE_SCAN_LIMIT`` (audit W3), not
+            ``default_limit``.
 
         Raises
         ------
@@ -379,7 +384,7 @@ class MemorySaveTool:
             existing = await self._port.search(
                 query="",
                 scope_refs=[scope_ref],
-                limit=max(1, int(self._settings.default_limit)),
+                limit=WRITE_DEDUPE_SCAN_LIMIT,
                 # ``status="all"`` is REQUIRED for REACTIVATE to
                 # work. The repository's default filter is
                 # ``status='active'``, which hides ARCHIVED and
@@ -424,7 +429,7 @@ class MemorySaveTool:
         # 6. Execute the decision
         # ------------------------------------------------------------------
         try:
-            return await self._execute_decision(decision, scope_ref)
+            return await self._execute_decision_shared(decision, scope_ref)
         except MemoryUnavailableError as exc:
             logger.error(
                 "MemorySaveTool: backend failure during %s (scope=%s): %s",
@@ -528,6 +533,56 @@ class MemorySaveTool:
     # ------------------------------------------------------------------
     # Decision execution
     # ------------------------------------------------------------------
+
+    async def _execute_decision_shared(
+        self,
+        decision: Any,
+        scope_ref: str,
+    ) -> Dict[str, Any]:
+        """Execute via the shared write path (W3), map to the tool dict.
+
+        The legacy inline ``_execute_decision`` below is retained only
+        until the W3 cleanup step deletes it; every call now goes here.
+        """
+        result = await execute_decision(self._port, decision, scope_ref)
+        if result.action == WriteAction.CREATE:
+            created = result.memory
+            logger.info(
+                "MemorySaveTool created %s in scope %s.",
+                created.memory_id, scope_ref,
+            )
+            return {
+                "status": "created",
+                "memory_id": created.memory_id,
+                "scope": scope_ref,
+                "memory_type": created.memory_type.value,
+            }
+        if result.action == WriteAction.SKIP:
+            return {
+                "status": "skipped",
+                "existing_id": result.target_id,
+                "reason": result.reason,
+            }
+        if result.action == WriteAction.SUPERSEDE:
+            logger.info(
+                "MemorySaveTool superseded %s with %s in scope %s.",
+                result.target_id, result.memory.memory_id, scope_ref,
+            )
+            return {
+                "status": "superseded",
+                "memory_id": result.memory.memory_id,
+                "replaced_id": result.target_id,
+                "reason": result.reason,
+            }
+        logger.info(
+            "MemorySaveTool reactivated %s in scope %s.",
+            result.memory.memory_id, scope_ref,
+        )
+        return {
+            "status": "reactivated",
+            "memory_id": result.memory.memory_id,
+            "reason": result.reason,
+        }
 
     async def _execute_decision(
         self,

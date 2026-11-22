@@ -647,9 +647,10 @@ class TestT13EvidenceVerbatim:
         assert result.decisions[0]["reason"] == "snippet_too_short"
 
     @pytest.mark.asyncio
-    async def test_role_none_checks_both_sides(self) -> None:
-        # "Nice to meet you" is the ASSISTANT side. With role=None,
-        # the validator should match it.
+    async def test_role_none_resolves_user_side_only(self) -> None:
+        # S2: "Nice to meet you" is the ASSISTANT side. A missing
+        # message_role is treated as "user" and resolved against the
+        # USER side only, so an assistant-only snippet is rejected.
         parsed = {
             "candidates": [
                 {
@@ -673,8 +674,10 @@ class TestT13EvidenceVerbatim:
             session=_session(),
             recommended_source="session_json",
         )
-        assert len(result.candidates) == 1
-        assert result.decisions[0]["action"] == "accepted"
+        assert len(result.candidates) == 0
+        assert (
+            result.decisions[0]["reason"] == "snippet_not_verbatim"
+        )
 
 
 # ---------------------------------------------------------------------------

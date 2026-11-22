@@ -83,6 +83,10 @@ audit trail.
   numeric example. Adds a MANDATORY RULES block that explicitly
   enforces language-verbatim and forbids literal copying of the
   example. ~420 tokens.
+- v7: user-only evidence (audit S2). Facts are extracted ONLY from
+  user messages; assistant text is context. The schema enum for
+  evidence.message_role is restricted to ["user"], and the
+  validator rejects assistant citations ('assistant_evidence').
 """
 
 from __future__ import annotations
@@ -150,6 +154,9 @@ MANDATORY RULES (violating any rejects the candidate):
 - VERBATIM: snippet MUST be copied CHARACTER-BY-CHARACTER
   from the source message.
 - DO NOT invent facts. Only extract what is literally stated.
+- USER-ONLY: extract facts ONLY from messages whose role is user.
+  Assistant text is context; NEVER cite it as evidence. Always
+  set evidence.message_role to "user".
 - importance: integer 0-100 (e.g., 75). Do NOT use 0.
 - confidence: number 0.0-1.0 (e.g., 0.9). Do NOT use 0.0.
 - tags: short lowercase keywords.
@@ -243,7 +250,7 @@ EXTRACTION_JSON_SCHEMA: dict = {
                                 },
                                 "message_role": {
                                     "type": "string",
-                                    "enum": ["user", "assistant"],
+                                    "enum": ["user"],
                                 },
                             },
                         },
