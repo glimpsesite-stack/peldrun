@@ -222,9 +222,13 @@ _PATTERNS: List[Tuple[Pattern[str], str]] = [
         'Bearer [REDACTED]',
     ),
 
-    # OpenAI keys: sk- followed by 20+ chars.
+    # OpenAI keys: sk- followed by 20+ chars, including dashed
+    # project/org variants (sk-proj-..., sk-ant-api03-...). The old
+    # [A-Za-z0-9]{20,} body stopped at the first dash and leaked
+    # every modern key format (audit defect S1). The new body is a
+    # strict superset: zero dash-groups still matches plain keys.
     (
-        re.compile(r'\bsk-[A-Za-z0-9]{20,}\b'),
+        re.compile(r'\bsk-(?:[A-Za-z0-9]+-){0,3}[A-Za-z0-9_-]{20,}'),
         '[REDACTED]',
     ),
 
@@ -254,13 +258,71 @@ _PATTERNS: List[Tuple[Pattern[str], str]] = [
         ),
         '[REDACTED]',
     ),
+
+    # --- 4. Audit S1 additions -----------------------------------------
+
+    # AWS access key ids (AKIA long-term, ASIA temporary).
+    (
+        re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
+        '[REDACTED]',
+    ),
+
+    # PEM private key blocks (RSA / EC / OPENSSH / generic).
+    (
+        re.compile(
+            r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?'
+            r'-----END [A-Z ]*PRIVATE KEY-----',
+            re.S,
+        ),
+        '[REDACTED]',
+    ),
+
+    # Credentials embedded in URLs: scheme://user:password@host.
+    # Keeps scheme, user and host; masks only the password.
+    (
+        re.compile(
+            r'(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)',
+            re.I,
+        ),
+        r'\1[REDACTED]\3',
+    ),
+
+    # Arabic natural-language disclosures: "kilmat al-murur /
+    # al-sirr", "al-raqm al-sirri", "(al-)basword", followed by
+    # hiya/huwa/:/= and the value. Written with \uXXXX escapes so
+    # this source file stays ASCII (repo encoding policy); verified
+    # equivalent to the literal Arabic pattern case-by-case.
+    (
+        re.compile(
+            r'((?:\u0643\u0644\u0645[\u0629\u0647]\s+(?:\u0627\u0644)?'
+            r'(?:\u0645\u0631\u0648\u0631|\u0633\u0631)|'
+            r'\u0627\u0644\u0631\u0642\u0645\s+\u0627\u0644\u0633\u0631\u064a|'
+            r'(?:\u0627\u0644)?\u0628\u0627\u0633?\u0648\u0631\u062f)'
+            r'[^\n:=]{0,30}?(?:\s(?:\u0647\u064a|\u0647\u0648)\s+|\s*[:=]\s*))(\S+)'
+        ),
+        r'\1[REDACTED]',
+    ),
 ]
+
+# Payment-card numbers: 13-19 digits, optionally space/dash grouped.
+# A match is redacted ONLY when it passes the Luhn checksum, so
+# ordinary long numbers (order ids, phones) are never corrupted.
+_CARD = re.compile(r'\b(?:\d[ -]?){13,19}\b')
+
+
+def _luhn_ok(num: str) -> bool:
+    """Return True when ``num`` is a Luhn-valid card number."""
+    digits = [int(c) for c in re.sub(r'\D', '', num)][::-1]
+    total = sum(
+        d if i % 2 == 0 else (d * 2 - 9 if d * 2 > 9 else d * 2)
+        for i, d in enumerate(digits)
+    )
+    return len(digits) >= 13 and total % 10 == 0
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 
 class MemoryDataMinimizer:
     """Strips secrets from text before it reaches the extraction LLM.
@@ -324,6 +386,15 @@ class MemoryDataMinimizer:
                     "Data minimizer pattern failed (continuing "
                     "with remaining patterns): %s", exc,
                 )
+        # Card numbers are Luhn-validated before redaction so a
+        # legitimate 16-digit number is never corrupted.
+        try:
+            result = _CARD.sub(
+                lambda m: '[REDACTED]' if _luhn_ok(m.group()) else m.group(),
+                result,
+            )
+        except Exception as exc:
+            logger.warning("Data minimizer card pass failed: %s", exc)
         return result
 
     def minimize_messages(

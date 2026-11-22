@@ -237,9 +237,6 @@ def test_W3_single_write_entrypoint_exists():
 # S1 -- secret redaction: the whole golden secret group must pass.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="S1: minimizer misses sk-proj/sk-ant/AWS/URL/PEM and "
-                          "all Arabic disclosure forms; fixed in phase 1")
 def test_S1_secret_group_fully_redacted():
     minimizer = MemoryDataMinimizer()
     violations = []
