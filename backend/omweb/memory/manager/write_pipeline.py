@@ -100,6 +100,10 @@ from peldrun.memory.services import (
     WriteDecision,
     decide_write_action,
 )
+from peldrun.memory.services.write_service import (
+    WRITE_DEDUPE_SCAN_LIMIT,
+    execute_decision,
+)
 
 
 logger = logging.getLogger("omweb.memory.manager.write_pipeline")
@@ -419,7 +423,7 @@ class MemoryWritePipeline:
                 error=f"decision_failed: {exc}",
             )
 
-        outcome = await self._execute_decision(
+        outcome = await self._execute_decision_shared(
             decision=decision,
             candidate=candidate,
             scope_ref=scope_ref,
@@ -484,7 +488,7 @@ class MemoryWritePipeline:
                 )
                 continue
 
-            outcome = await self._execute_decision(
+            outcome = await self._execute_decision_shared(
                 decision=decision,
                 candidate=candidate,
                 scope_ref=scope_ref,
@@ -631,6 +635,66 @@ class MemoryWritePipeline:
     # ------------------------------------------------------------------
     # Internal: execute decision
     # ------------------------------------------------------------------
+
+    async def _execute_decision_shared(
+        self,
+        *,
+        decision: WriteDecision,
+        candidate: MemoryEntry,
+        scope_ref: str,
+    ) -> WriteOutcome:
+        """Execute via the shared write path (W3), map to WriteOutcome.
+
+        Error translation is IDENTICAL to the legacy inline branches:
+        validation -> ``validation_error: ...``, backend ->
+        ``backend_unavailable: ...``, both preserving the INTENDED
+        action. The legacy ``_execute_decision`` below is now
+        unreachable and is deleted in the W3 cleanup step.
+        """
+        try:
+            result = await execute_decision(self._port, decision, scope_ref)
+            return WriteOutcome(
+                action=result.action,
+                memory=result.memory,
+                target_id=result.target_id,
+                reason=result.reason,
+            )
+        except MemoryValidationError as exc:
+            logger.warning(
+                "WritePipeline: validation failure during %s "
+                "(scope=%s): %s",
+                decision.action.value,
+                scope_ref,
+                exc.message,
+            )
+            return WriteOutcome(
+                action=decision.action,
+                target_id=(
+                    decision.target_entry.memory_id
+                    if decision.target_entry
+                    else None
+                ),
+                reason=decision.reason,
+                error=f"validation_error: {exc.message}",
+            )
+        except MemoryUnavailableError as exc:
+            logger.error(
+                "WritePipeline: backend failure during %s "
+                "(scope=%s): %s",
+                decision.action.value,
+                scope_ref,
+                exc.message,
+            )
+            return WriteOutcome(
+                action=decision.action,
+                target_id=(
+                    decision.target_entry.memory_id
+                    if decision.target_entry
+                    else None
+                ),
+                reason=decision.reason,
+                error=f"backend_unavailable: {exc.message}",
+            )
 
     async def _execute_decision(
         self,

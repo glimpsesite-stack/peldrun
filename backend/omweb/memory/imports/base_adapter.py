@@ -170,6 +170,10 @@ from peldrun.memory.services import (
     WriteAction,
     decide_write_action,
 )
+from peldrun.memory.services.write_service import (
+    WRITE_DEDUPE_SCAN_LIMIT,
+    execute_decision,
+)
 
 
 logger = logging.getLogger("omweb.memory.imports.base_adapter")
@@ -632,7 +636,7 @@ class BaseImportAdapter(MemoryImportAdapter, ABC):
                 parse_warnings[:3],
             )
 
-        return await self._apply_candidates(candidates, scope_ref)
+        return await self._apply_candidates_shared(candidates, scope_ref)
 
     # ------------------------------------------------------------------
     # Shared helpers (protected -- overridable if genuinely needed)
@@ -730,6 +734,110 @@ class BaseImportAdapter(MemoryImportAdapter, ABC):
             to_create=to_create,
             to_skip=to_skip,
             warnings=warnings,
+        )
+
+    async def _apply_candidates_shared(
+        self,
+        candidates: List[MemoryEntry],
+        scope_ref: MemoryScopeRef,
+    ) -> ImportApplyResult:
+        """Write every candidate through the shared write path (W3).
+
+        Identical best-effort semantics, counters, error strings and
+        pool maintenance as the legacy inline implementation; only
+        decision EXECUTION moved to
+        ``peldrun.memory.services.write_service`` so the three write
+        callers cannot diverge. The legacy ``_apply_candidates`` below
+        is unreachable and is deleted in the W3 cleanup step.
+        """
+        created = 0
+        skipped = 0
+        errors: List[str] = []
+        scope_ref_str = str(scope_ref)
+
+        try:
+            existing_pool: List[MemoryEntry] = (
+                await self._fetch_existing_for_dedupe(scope_ref)
+            )
+        except Exception as exc:
+            existing_pool = []
+            errors.append(
+                f"batch dedupe fetch failed "
+                f"({type(exc).__name__}: {exc}); dedupe checks "
+                f"for this batch will be skipped"
+            )
+
+        for idx, candidate in enumerate(candidates):
+            try:
+                decision = decide_write_action(candidate, existing_pool)
+                result = await execute_decision(
+                    self._port, decision, scope_ref_str
+                )
+                if result.action == WriteAction.SKIP:
+                    skipped += 1
+                    logger.debug(
+                        "Import skipped candidate %d (duplicate of %s).",
+                        idx + 1,
+                        result.target_id or "<unknown>",
+                    )
+                    continue
+
+                created += 1
+                target = decision.target_entry
+                if result.memory is None:
+                    continue
+                if (
+                    result.action == WriteAction.SUPERSEDE
+                    and target is not None
+                ):
+                    try:
+                        existing_pool.remove(target)
+                    except ValueError:
+                        pass
+                    existing_pool.append(result.memory)
+                elif (
+                    result.action == WriteAction.REACTIVATE
+                    and target is not None
+                ):
+                    try:
+                        idx_in_pool = existing_pool.index(target)
+                        existing_pool[idx_in_pool] = result.memory
+                    except (ValueError, AttributeError):
+                        existing_pool.append(result.memory)
+                else:
+                    existing_pool.append(result.memory)
+            except MemoryValidationError as exc:
+                errors.append(
+                    f"candidate {idx + 1} "
+                    f"(content={candidate.content[:50]!r}): "
+                    f"validation error: {exc.message}"
+                )
+            except MemoryUnavailableError as exc:
+                errors.append(
+                    f"candidate {idx + 1} "
+                    f"(content={candidate.content[:50]!r}): "
+                    f"backend unavailable: {exc.message}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    f"candidate {idx + 1} "
+                    f"(content={candidate.content[:50]!r}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        logger.info(
+            "Import apply: %d created, %d skipped, %d errors "
+            "(scope=%s, candidates=%d).",
+            created,
+            skipped,
+            len(errors),
+            scope_ref_str,
+            len(candidates),
+        )
+        return ImportApplyResult(
+            created=created,
+            skipped=skipped,
+            errors=errors,
         )
 
     async def _apply_candidates(

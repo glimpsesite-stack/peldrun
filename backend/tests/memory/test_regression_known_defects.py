@@ -211,12 +211,23 @@ def test_W2_orthographic_variants_are_duplicates():
 # W3 -- three write-policy implementations; single entrypoint missing.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="W3: omweb.memory.manager.write_service does not "
-                          "exist; single WriteService lands in phase 3")
 def test_W3_single_write_entrypoint_exists():
     import importlib.util
-    assert importlib.util.find_spec("omweb.memory.manager.write_service") is not None
+    assert importlib.util.find_spec(
+        "peldrun.memory.services.write_service"
+    ) is not None
+    # Every write caller must IMPORT and AWAIT the shared executor.
+    # "await execute_decision(" cannot match the private inline method
+    # "await self._execute_decision(" -- the substring collision that
+    # made the previous version of this test pass vacuously.
+    for rel in (
+        "omweb/memory/manager/write_pipeline.py",
+        "omweb/memory/imports/base_adapter.py",
+        "peldrun/memory/tools/builtins/memory_save.py",
+    ):
+        src = (BACKEND / rel).read_text(encoding="utf-8")
+        assert "write_service import" in src, rel
+        assert "await execute_decision(" in src, rel
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +252,6 @@ def test_S1_secret_group_fully_redacted():
 # S2 -- extraction evidence must come from user messages only.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="S2: schema allows assistant evidence and validator "
-                          "accepts it; user-only restriction lands in phase 3")
 def test_S2_evidence_restricted_to_user_messages():
     from omweb.memory.extraction.prompts import EXTRACTION_JSON_SCHEMA
 
