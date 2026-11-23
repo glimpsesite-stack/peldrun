@@ -46,8 +46,8 @@ Return type contract
 
 ``search()`` returns ``List[Tuple[MemoryEntry, float]]`` -- the
 exact shape ``SqliteMemoryRepository._search_ranked_sync`` returns.
-This is deliberate: the retrieval router (Task 4.9) must be able
-to hand the output of either path to ``MemoryRanker`` (Phase 1-C)
+This is deliberate: the active hybrid provider must be able to
+hand the output of either path to ``MemoryRanker`` (Phase 1-C)
 without branching. ``float`` is a relevance score in ``[0, 1]``
 where ``1.0`` is the best match -- same convention as the lexical
 path's normalized BM25.
@@ -98,10 +98,9 @@ See also
         -- the concrete vector backend
     * ``vector_hydration.py`` (``omweb.memory.storage``, Task 4.5b)
         -- the concrete hydration backend
-    * ``router.py`` (``peldrun.memory.retrieval``, Task 4.9)
-        -- the policy layer that consumes this provider
-    * ``fusion.py`` (``peldrun.memory.retrieval``, Task 4.6)
-        -- combines this provider's output with the lexical
+    * ``hybrid_provider.py`` (``omweb.memory.manager``)
+        -- the active policy layer that consumes this
+           provider and fuses its output with the lexical
            path's output
 """
 
@@ -225,7 +224,7 @@ class SqliteVecProvider:
     is a thin orchestrator that embeds the query, asks the vector
     backend for candidate ids, hydrates them via the hydration
     backend, and returns ``(entry, similarity)`` pairs ready for
-    the retrieval router.
+    the active hybrid provider.
 
     Lifecycle
     ---------

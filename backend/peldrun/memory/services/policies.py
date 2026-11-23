@@ -145,6 +145,10 @@ from peldrun.memory.domain import (
     MemoryStatus,
     MemoryType,
 )
+from peldrun.memory.languages import (
+    REPLACEMENT_MARKERS as _REPLACEMENT_MARKERS,
+    TYPE_HINTS as _TYPE_HINTS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -200,128 +204,23 @@ job (plan 3.3), not this threshold's.
 """
 
 
-# ---------------------------------------------------------------------------
-# Replacement markers -- the ONLY Phase 1 conflict signal
-# ---------------------------------------------------------------------------
-#
-# A candidate containing one of these phrases is EXPLICITLY
-# declaring a change. This is the safest possible conflict signal
-# because the user's own words describe the transition.
-#
-# Anything less explicit ("I think I prefer X now") is treated as
-# a NEW preference rather than a replacement, and both entries
-# are kept. See module docstring for the cost asymmetry that
-# justifies this choice.
-#
-# Multilingual: English + Arabic + Russian, matching the
-# normalizer's coverage.
-_REPLACEMENT_MARKERS: Final[re.Pattern[str]] = re.compile(
-    r"(?:"
-    # English (fold == lowercase)
-    r"no\s+longer|"
-    r"changed\s+to|"
-    r"switched\s+to|"
-    r"updated\s+to|"
-    r"moved\s+to|"
-    r"now\s+use[sd]?|"
-    r"instead\s+of|"
-    r"rather\s+than|"
-    r"replaced\s+(?:\S+\s+)?with|"
-    r"used\s+to|"
-    # Arabic -- matched on the FOLDED content (_fold): hamza/alef
-    # unified, taa-marbuta -> haa, diacritics stripped. Covers the
-    # short-form change markers the golden update set uses.
-    r"لم\s+اعد|"
-    r"لا\s+اعد|"
-    r"لم\s+يعد|"
-    r"لم\s+تعد|"
-    r"بدلا?\s+من|"
-    r"عوضا?\s+عن|"
-    r"اصبحت?|"
-    r"صرت|"
-    r"انتقلت\s+(?:الي|الى)|"
-    r"غيرت|"
-    r"تغير(?:ت)?\s+(?:الي|الى)|"
-    r"تحولت\s+(?:الي|الى)|"
-    r"الان|"
-    r"حاليا|"
-    # Russian
-    r"больше\s+не|"
-    r"изменилось\s+на|"
-    r"переключил[ся]?\s+на|"
-    r"вместо|"
-    r"теперь\s+использую"
-    r")",
-    re.IGNORECASE,
-)
-
 
 # ---------------------------------------------------------------------------
-# Type classification patterns -- shared with the extractor
+# Type classification patterns -- owned by ``peldrun.memory.languages``
 # ---------------------------------------------------------------------------
 #
-# Ordered from most-specific to least-specific. The classifier
-# returns the FIRST match. The ORDER matters: PREFERENCE wins
-# over SEMANTIC (because "I prefer X" is more specific than "X"),
-# and DECISION wins over SEMANTIC for the same reason.
+# The four compiled patterns (one per MemoryType, in priority
+# order PREFERENCE > DECISION > PROCEDURAL > EPISODIC) are
+# produced by the aggregator in ``languages/__init__.py`` from
+# each pack's ``type_hints`` dict. ``classify_memory_type`` below
+# iterates this list in order and returns the FIRST matching
+# type -- the priority ordering is a property of the aggregator,
+# not of any single language file.
 #
-# These are HINTS, not authoritative classifications. The
-# extractor may override based on context (e.g. a decision
-# statement inside an explicit "remember that I decided..." save
-# is definitely a DECISION regardless of what this returns).
-#
-# A test in ``tests/memory/test_policies.py`` (P2) will verify
-# that each pattern reliably matches its intended type without
-# false-positives on the SEMANTIC fallback.
-
-_TYPE_HINTS: Final[List[tuple[re.Pattern[str], MemoryType]]] = [
-    # ---- PREFERENCE -- "user likes/prefers/wants X" ------------
-    (re.compile(
-        r"(?:"
-        r"\bprefers?\b|\blikes?\b|\bwants?\b|\bdislikes?\b|"
-        r"\bhates?\b|\bfavou?rs?\b|\balways\b|\bnever\b|"
-        r"أفضل|يفضل|تفضل|يحب|تحب|يكره|تكره|دائماً|أبداً|"
-        r"предпочитает|любит|не\s+любит|всегда|никогда"
-        r")",
-        re.IGNORECASE,
-    ), MemoryType.PREFERENCE),
-
-    # ---- DECISION -- "we decided/chose X" ----------------------
-    (re.compile(
-        r"(?:"
-        r"\bdecided\b|\bchose\b|\bchosen\b|\bgoing\s+with\b|"
-        r"\bwe\s+will\s+use\b|\bselected\b|\bsettled\s+on\b|"
-        r"قررنا|قرر|اخترنا|اختر|سنستخدم|وقع\s+الاختيار|"
-        r"решили|решил|выбрали|выбрал"
-        r")",
-        re.IGNORECASE,
-    ), MemoryType.DECISION),
-
-    # ---- PROCEDURAL -- commands and step-by-step ---------------
-    (re.compile(
-        r"(?:"
-        r"\brun\s+`|\bexecute\s+`|`\w+\s+[^`]+`|"
-        r"\bstep\s+\d|\bfirst\b.*\bthen\b.*\bfinally\b|"
-        r"شغل|نفذ|الخطوة|أولاً|ثم|أخيراً|"
-        r"запустить|выполнить|шаг\s+\d|сначала|затем"
-        r")",
-        re.IGNORECASE,
-    ), MemoryType.PROCEDURAL),
-
-    # ---- EPISODIC -- dated events, past tense ------------------
-    (re.compile(
-        r"(?:"
-        r"\b(?:yesterday|today|last\s+(?:week|month|year))\b|"
-        r"\b\d{4}-\d{2}-\d{2}\b|"
-        r"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\b|"
-        r"\b(?:happened|occurred|was\s+deployed|failed|succeeded)\b|"
-        r"أمس|اليوم|الأسبوع\s+الماضي|حدث|فشل|نجح|"
-        r"вчера|сегодня|на\s+прошлой\s+неделе|случилось|произошло"
-        r")",
-        re.IGNORECASE,
-    ), MemoryType.EPISODIC),
-]
-
+# Imported at the top of this file as:
+#     from peldrun.memory.languages import (
+#         TYPE_HINTS as _TYPE_HINTS,
+#     )
 
 # ---------------------------------------------------------------------------
 # WriteAction

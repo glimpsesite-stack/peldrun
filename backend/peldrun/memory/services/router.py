@@ -66,9 +66,11 @@ Design invariants
 -----------------
 
 1. Pure domain.
-   No imports beyond ``enum``, ``re``, ``typing``. No
-   ``MemoryContext``, no repository, no provider. The router
-   answers a classification question; it does not touch storage.
+   Imports are limited to the standard library (``enum``,
+   ``dataclasses``, ``typing``) and the ``peldrun.memory.languages``
+   pattern aggregator. No ``MemoryContext``, no repository, no
+   provider. The router answers a classification question; it
+   does not touch storage.
 
 2. Deterministic.
    ``classify_route(q, has_active_project=X)`` returns the SAME
@@ -81,11 +83,13 @@ Design invariants
    ``re.compile()`` inside ``classify_route`` -- the per-call
    cost is O(query length).
 
-4. Bilingual by design.
+4. Multilingual by design.
    The patterns cover Arabic, Russian, and English out of the
    box, matching the normalizer's three-language scope. Adding a
-   language means adding alternatives to the existing pattern
-   constants -- not creating a new code path.
+   new language means adding one file under
+   ``peldrun.memory.languages`` and registering it in that
+   package's ``LANGUAGES`` tuple -- neither this module nor
+   ``classify_route`` needs to change.
 
 5. Traceable decisions.
    ``classify_route`` returns a ``Route`` object with a
@@ -97,10 +101,15 @@ Design invariants
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final
+
+from peldrun.memory.languages import (
+    GREETING_PATTERN as _GREETING_PATTERN,
+    DIRECTED_PATTERN as _DIRECTED_PATTERN,
+    PRECISE_PATTERN as _PRECISE_PATTERN,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -173,58 +182,42 @@ class Route:
 #: if retrieved.
 _MIN_QUERY_LENGTH: Final[int] = 5
 
-#: Greetings and other trivially short openings. Anchored to the
-#: START of the (stripped) query so that "hello, remember when..."
-#: does NOT match here and falls through to the directed check.
-#: Languages covered: English, Arabic, Russian, Arabic-Latin
-#: transliteration ("salam", "assalam").
-_GREETING_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^(?:"
-    r"hi|hello|hey|yo|sup"  # English
-    r"|مرحبا|أهلا|اهلا|السلام\s*عليكم"  # Arabic
-    r"|привет|здравствуй(?:те)?"  # Russian
-    r"|salam|assalam|salaam"  # Latin transliteration
-    r")\b",
-    re.IGNORECASE,
-)
+#: Greetings and other trivially short openings. Anchored at
+#: start-of-string with a trailing ``\b`` by the aggregator in
+#: ``peldrun.memory.languages``. Per-language fragments live in
+#: ``languages/<code>.py`` -- English (``hi``, ``hello``, ...),
+#: Arabic script (``مرحبا``, ...), Russian (``привет``, ...),
+#: and the Arabic-Latin transliterations (``salam``, ...)
+#: contributed by ``languages/arabic.py``.
+#:
+#: Imported at the top of this file as:
+#:     from peldrun.memory.languages import (
+#:         GREETING_PATTERN as _GREETING_PATTERN,
+#:     )
 
-#: Explicit recall requests. Anywhere in the query (not
-#: anchored) -- "before we continue, please remember that X" is a
-#: directed request even though it does not start with a keyword.
-#: The alternatives cover the three languages symmetrically.
-_DIRECTED_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?:"
-    # English — recall/remember verbs
-    r"remember|recall|do\s+you\s+know|did\s+(?:we|I)|"
-    r"what\s+(?:did\s+we|was\s+the|is\s+my|are\s+my|do\s+I)|"
-    r"who\s+am\s+I|who\s+is\s+the\s+user|"
-    r"my\s+(?:name|role|preferences?|background)|"
-    # Arabic — recall verbs + identity questions
-    r"تذكر|تتذكر|هل\s+تذكر|ما\s+القرار|ما\s+قررنا|"
-    r"من\s+أنا|ما\s+اسمي|ماذا\s+تعرف\s+عني|"
-    r"ما\s+دوري|ما\s+خلفيتي|"
-    # Russian — recall verbs + identity
-    r"помнишь|помните|что\s+мы|какое\s+решение|"
-    r"кто\s+я|как\s+меня\s+зовут|что\s+ты\s+обо\s+мне\s+знаешь"
-    r")",
-    re.IGNORECASE,
-)
+#: Explicit recall requests. Searched ANYWHERE in the query
+#: (not anchored) -- "before we continue, please remember that X"
+#: is a directed request even though it does not start with a
+#: keyword. Per-language fragments live in
+#: ``languages/<code>.py``.
+#:
+#: Imported at the top of this file as:
+#:     from peldrun.memory.languages import (
+#:         DIRECTED_PATTERN as _DIRECTED_PATTERN,
+#:     )
 
 #: Project / file / session scope hints. When one of these fires
 #: AND the caller has an active project, the router returns
 #: ``PRECISE`` so the dispatcher can narrow its scope filters.
 #: Without an active project, they are ignored -- a request to
 #: "remember the file we discussed" in a project-less chat is
-#: directed, not precise.
-_PRECISE_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?:"
-    r"in\s+this\s+(?:project|repo|repository|workspace)|"  # English
-    r"the\s+file|this\s+codebase|"
-    r"هذا\s+المشروع|هذه\s+المحفظة|الملف|"  # Arabic
-    r"в\s+этом\s+проекте|в\s+этом\s+файле"  # Russian
-    r")",
-    re.IGNORECASE,
-)
+#: directed, not precise. Per-language fragments live in
+#: ``languages/<code>.py``.
+#:
+#: Imported at the top of this file as:
+#:     from peldrun.memory.languages import (
+#:         PRECISE_PATTERN as _PRECISE_PATTERN,
+#:     )
 
 
 # ---------------------------------------------------------------------------

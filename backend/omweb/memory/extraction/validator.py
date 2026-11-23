@@ -121,6 +121,22 @@ Design invariants
    content to ``session.json["turns"][i]["user"]`` at
    dispatch time. When that lands, remove the fallback here
    AND in the orchestrator in the same commit.
+
+Pattern dependency
+------------------
+
+The self-refusal pattern (``_SELF_REFUSAL_PATTERN``) is
+imported from ``peldrun.memory.languages`` instead of being
+defined inline. This is a legal layer dependency: ``omweb``
+may import from ``peldrun`` (never the reverse). Keeping the
+pattern in the languages aggregator means adding a new
+language never touches this file -- it touches only
+``peldrun/memory/languages/<code>.py``. See that package's
+``__init__.py`` for the full aggregation contract.
+
+The self-poisoning failure mode the pattern guards against
+is documented in the "Self-poisoning guard" section inside
+``validate`` below.
 """
 
 from __future__ import annotations
@@ -132,6 +148,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, ConfigDict, Field
 
 from omweb.memory.extraction.contracts import Evidence
+from peldrun.memory.languages import (
+    SELF_REFUSAL_PATTERN as _SELF_REFUSAL_PATTERN,
+)
 
 
 logger = logging.getLogger("omweb.memory.extraction.validator")
@@ -144,45 +163,29 @@ logger = logging.getLogger("omweb.memory.extraction.validator")
 _MIN_SNIPPET_CHARS: int = 3
 _MAX_SNIPPET_CHARS: int = 200
 
-#: Sentences that assert the ASSISTANT's ignorance about the user.
-#: See the self-poisoning guard in ``validate`` for the failure loop
-#: these prevent.
+#: Self-refusal detector -- owned by ``peldrun.memory.languages``.
 #:
-#: Every alternative is anchored on knowledge-of-the-user phrasing,
-#: never on a bare "I don't know" -- "I don't know Rust" (the user
-#: speaking about a skill) is legitimate memory content.
-_SELF_REFUSAL_PATTERN = re.compile(
-    r"(?:"
-    # English: "I don't have any other personal information about you"
-    r"(?:i\s+)?(?:do\s+not|don'?t)\s+(?:have|know)\s+(?:any\s+)?"
-    r"(?:other\s+|further\s+|more\s+)?"
-    r"(?:personal\s+)?(?:information|info|details|data|knowledge)"
-    r"|"
-    # English: "I have no information about you"
-    r"(?:i\s+)?have\s+no\s+(?:other\s+|further\s+|more\s+)?"
-    r"(?:personal\s+)?(?:information|info|details|knowledge)"
-    r"|"
-    # English: "I don't know you" / "I do not know who you are"
-    r"(?:i\s+)?(?:do\s+not|don'?t)\s+know\s+(?:you|who\s+you\s+are)"
-    r"|"
-    # English: "as an AI ... I cannot ..."
-    r"\bas\s+an?\s+(?:ai|artificial\s+intelligence|language\s+model)\b"
-    r"|"
-    # Arabic: "ليس لدي معلومات" / "لا اعرف" / "لا املك معلومات"
-    r"ل(?:ا|يس)\s+(?:لدي|عندي)\s+(?:اي\s+)?(?:معلومات|بيانات|تفاصيل)"
-    r"|"
-    r"لا\s+(?:اعرف|أعرف)\s+(?:من\s+)?(?:انت|أنت|عنت|عنك)"
-    r")",
-    re.IGNORECASE,
-)
-"""Pre-compiled self-refusal detector.
-
-Case-insensitive; Arabic diacritics are NOT matched here because
-``normalize_for_storage`` has already stripped them by the time a
-snippet reaches the source text. Both ``ا`` alef forms are listed for
-the same reason: the normalizer maps them, but a snippet echoed
-straight from a model reply may not have been through it.
-"""
+#: Matched against RAW snippet text (not the ``_fold`` output);
+#: per-language alternatives live in ``languages/english.py``
+#: (``self_refusal_patterns``) and ``languages/arabic.py``
+#: (``self_refusal_patterns``). ``languages/russian.py``
+#: contributes nothing to this guard today -- see that module's
+#: docstring for the rationale (no characterized Russian corpus
+#: exists yet, and an untested pattern would broaden the
+#: rejection surface without evidence of benefit).
+#:
+#: The aggregated pattern is compiled once at languages-package
+#: import time, is case-insensitive, and is a valid
+#: never-match object when the union is empty. Imported at the
+#: top of this file as:
+#:
+#:     from peldrun.memory.languages import (
+#:         SELF_REFUSAL_PATTERN as _SELF_REFUSAL_PATTERN,
+#:     )
+#:
+#: The "why" of this guard -- the self-fulfilling retrieval
+#: loop it prevents -- is documented in the Self-poisoning
+#: guard comment inside ``validate`` below.
 
 
 # ---------------------------------------------------------------------------

@@ -41,8 +41,8 @@
   "supported_languages": ["en", "ar"],
   "i18n": {
     "ar": {
-      "display_name": "عمليات الملفات",
-      "short_description": "عمليات ملفات آمنة داخل مساحة العمل: قراءة، كتابة، إضافة، عرض، التحقق من الوجود، وحذف."
+      "display_name": "File operations",
+      "short_description": "Secure file operations within the workspace: reading, writing, appending, listing, checking for existence, and deleting."
     }
   },
 
