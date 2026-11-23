@@ -20,7 +20,7 @@ The provider itself is intentionally small: it wires the three
 collaborators together, computes nothing semantically interesting,
 and knows no storage or scope specifics. Everything that requires
 infrastructure lives behind a Protocol; everything that requires
-policy lives in the caller (``MemoryRetrievalRouter``, Task 4.9).
+policy lives in the caller (the active hybrid provider).
 
 Architectural boundary
 ----------------------

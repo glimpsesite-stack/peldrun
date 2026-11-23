@@ -32,6 +32,8 @@ import {
   FileText,
   X,
   Link as LinkIcon,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { MarkdownRenderer } from "@/components/chat/markdown-renderer";
@@ -60,11 +62,33 @@ export default function NotebookPage() {
   const [viewMode, setViewMode] = useState<"list" | "edit" | "preview">("list");
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [previewContent, setPreviewContent] = useState<string>("");
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Load notes on mount
   useEffect(() => {
     loadNotes();
   }, [projectId]);
+
+  // Fullscreen editor: lock body scroll and exit on Escape.
+  useEffect(() => {
+    if (!isFullscreen) return;
+
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsFullscreen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = originalOverflow;
+    };
+  }, [isFullscreen]);
 
   const loadNotes = async () => {
     setIsLoading(true);
@@ -230,9 +254,14 @@ export default function NotebookPage() {
   }
 
   return (
-    <div className="flex h-full ">
+    <div
+      className={`flex h-full ${
+        isFullscreen ? "fixed inset-0 z-50 bg-background" : ""
+      }`}
+    >
       {/* Notes List Sidebar */}
-      <div className="w-80 border-r border-border bg-sidebg flex flex-col">
+      {!isFullscreen && (
+      <div className="w-80 border-r border-border bg-sidebg flex flex-col min-h-0">
         {/* Header */}
         <div className="p-4 border-b border-border">
           <div className="flex items-center justify-between mb-3">
@@ -338,9 +367,10 @@ export default function NotebookPage() {
           {notes.length} note{notes.length !== 1 ? "s" : ""}
         </div>
       </div>
+      )}
 
       {/* Note Content Area */}
-      <div className="flex-1 flex flex-col bg-background">
+      <div className="flex-1 flex flex-col bg-background min-h-0">
         {!selectedNote ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center text-muted-foreground">
@@ -349,7 +379,7 @@ export default function NotebookPage() {
             </div>
           </div>
         ) : viewMode === "edit" ? (
-          <div className="flex-1 flex flex-col overflow-auto ">
+          <div className="flex-1 flex flex-col min-h-0">
             <div className="h-12 border-b border-border bg-muted px-4 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Edit size={14} className="text-muted-foreground" />
@@ -359,7 +389,20 @@ export default function NotebookPage() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => setViewMode("preview")}
+                  onClick={() => setIsFullscreen((value) => !value)}
+                  className="gap-1.5"
+                  title={isFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
+                >
+                  {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                  {isFullscreen ? "Exit" : "Fullscreen"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setIsFullscreen(false);
+                    setViewMode("preview");
+                  }}
                   className="gap-1.5"
                 >
                   <Eye size={14} />
@@ -369,6 +412,7 @@ export default function NotebookPage() {
                   variant="ghost"
                   size="sm"
                   onClick={() => {
+                    setIsFullscreen(false);
                     setSelectedNote(null);
                     setViewMode("list");
                   }}
@@ -377,7 +421,7 @@ export default function NotebookPage() {
                 </Button>
               </div>
             </div>
-            <div className="flex-1 overflow-hidden">
+            <div className="flex-1 min-h-0 overflow-hidden">
               <NotebookEditor
                 key={selectedNote.path}
                 projectId={projectId}
@@ -390,7 +434,7 @@ export default function NotebookPage() {
             </div>
           </div>
         ) : (
-          <div className="flex-1 flex flex-col">
+          <div className="flex-1 flex flex-col min-h-0">
             <div className="h-12 border-b border-border bg-card px-4 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Eye size={14} className="text-muted-foreground" />

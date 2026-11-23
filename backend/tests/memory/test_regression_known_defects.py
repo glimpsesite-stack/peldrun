@@ -314,9 +314,7 @@ async def test_S3_injected_content_cannot_forge_block_structure():
 # C1 -- dead retrieval trio (1,549 lines, no live importer).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True,
-                   reason="C1: dead router/hybrid_search/fusion trio still "
-                          "present; removed in phase 4")
+
 def test_C1_dead_retrieval_trio_removed():
     trio = BACKEND / "peldrun/memory/retrieval"
     for name in ("router.py", "hybrid_search.py", "fusion.py"):

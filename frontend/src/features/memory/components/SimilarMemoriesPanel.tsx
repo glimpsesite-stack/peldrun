@@ -144,9 +144,16 @@ export function SimilarMemoriesPanel({
     return () => clearTimeout(handle);
   }, [query, debounce]);
 
+
   // ---- Fire search ---------------------------------------------
   useEffect(() => {
-    if (debounced.trim().length < SEARCH_MIN_QUERY_LENGTH) return;
+    // Below the minimum length there is nothing meaningful to
+    // preview. Reset the mutation so results from a PREVIOUS
+    // query never linger under a new, too-short draft.
+    if (debounced.trim().length < SEARCH_MIN_QUERY_LENGTH) {
+      searchMutation.reset();
+      return;
+    }
 
     // Build the request body based on the mode the caller chose.
     //
@@ -183,11 +190,15 @@ export function SimilarMemoriesPanel({
       }
     }
 
+
     // No target -> nothing to search against. The parent should
     // gate rendering in this case, but the guard makes the
-    // component safe if used without one.
-    if (!hasTarget) return;
-
+    // component safe if used without one. Reset so stale results
+    // from a previous target never render under the new one.
+    if (!hasTarget) {
+      searchMutation.reset();
+      return;
+    }
     searchMutation.mutate(body);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debounced, scope, chat_id, project_id, user_id, limit]);
@@ -198,15 +209,24 @@ export function SimilarMemoriesPanel({
     return null;
   }
 
+
   const isPending = searchMutation.isPending;
+  // Results belong to the query that produced them. While the
+  // debounced draft differs from the last dispatched query, or a
+  // new search is still in flight, the cached data is STALE --
+  // hide it instead of mislabeling old memories as matches for
+  // what the user is typing right now.
+  const isStale = searchMutation.variables?.query !== debounced;
   const data = searchMutation.data;
-  const results: MemoryEntry[] = data?.results ?? [];
-  const dropped = data?.dropped_for_budget ?? 0;
+  const results: MemoryEntry[] =
+    !isPending && !isStale ? (data?.results ?? []) : [];
+  const dropped =
+    !isPending && !isStale ? (data?.dropped_for_budget ?? 0) : 0;
   // Diagnostic: which retrieval strategy produced `results`.
   // Typed narrowly so the badge cannot silently render an
   // unrecognized mode. `undefined` when the response field is
   // absent (older backend) -- the badge then renders nothing.
-  const searchMode = data?.search_mode;
+  const searchMode = isStale ? undefined : data?.search_mode;
 
   return (
     <div
@@ -245,7 +265,7 @@ export function SimilarMemoriesPanel({
       </div>
 
       {/* Body */}
-      {!isPending && results.length === 0 && (
+      {!isPending && !isStale && results.length === 0 && (
         <p className="text-muted-foreground">{t('entry.similar.empty')}</p>
       )}
 

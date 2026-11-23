@@ -30,6 +30,17 @@ import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary';
 import { MarkdownShortcutPlugin } from '@lexical/react/LexicalMarkdownShortcutPlugin';
 import { LinkPlugin } from '@lexical/react/LexicalLinkPlugin';
 import { ListPlugin } from '@lexical/react/LexicalListPlugin';
+import { TablePlugin } from '@lexical/react/LexicalTablePlugin';
+import {
+  TableNode,
+  TableRowNode,
+  TableCellNode,
+  INSERT_TABLE_COMMAND,
+  $createTableNodeWithDimensions,
+  $isTableNode,
+  $isTableRowNode,
+  $isTableCellNode,
+} from '@lexical/table';
 import { CodeNode, CodeHighlightNode, $createCodeNode } from '@lexical/code';
 import { registerCodeHighlighting } from '@lexical/code-prism';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
@@ -53,22 +64,35 @@ import {
   $convertFromMarkdownString,
   $convertToMarkdownString,
   TRANSFORMERS,
+  type MultilineElementTransformer,
 } from '@lexical/markdown';
 import {
   $getRoot,
   $getSelection,
+  $setSelection,
   $isRangeSelection,
   $createParagraphNode,
   $createTextNode,
+  $insertNodes,
   EditorState,
   LexicalEditor,
+  type LexicalNode,
+  createEditor,
   FORMAT_TEXT_COMMAND,
   UNDO_COMMAND,
   REDO_COMMAND,
   CAN_UNDO_COMMAND,
   CAN_REDO_COMMAND,
+  COPY_COMMAND,
+  PASTE_COMMAND,
+  COMMAND_PRIORITY_HIGH,
   COMMAND_PRIORITY_CRITICAL,
 } from 'lexical';
+
+import {
+  $generateHtmlFromNodes,
+  $generateNodesFromDOM,
+} from '@lexical/html';
 import { mergeRegister } from '@lexical/utils';
 import {
   Bold,
@@ -89,10 +113,14 @@ import {
   Pilcrow,
   Save,
   Check,
+  Table2,
 } from 'lucide-react';
 import { FloatingToolbarPlugin } from '@/components/chat/composer/plugins/floating-toolbar-plugin';
 import { workspaceApi } from './workspace-api';
 import { OCCConflictError } from './types';
+
+
+
 
 // ============================================================================
 // Custom Transformers for Notebook
@@ -114,11 +142,188 @@ const INTERNAL_LINK_TRANSFORMER = {
   },
 };
 
-/**
- * Extended transformers for Notebook
- */
+const MARKDOWN_TABLE_ROW_REGEX = /^\s*\|.*\|\s*$/;
+
+const MARKDOWN_TABLE_DIVIDER_REGEX =
+  /^\s*\|\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|\s*$/;
+
+function parseMarkdownTableRow(line: string): string[] {
+  const trimmed = line.trim();
+  const content = trimmed.slice(1, -1);
+  const cells: string[] = [];
+  let cell = '';
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+
+    if (char === '\\' && content[index + 1] === '|') {
+      cell += '|';
+      index += 1;
+      continue;
+    }
+
+    if (char === '|') {
+      cells.push(cell.trim());
+      cell = '';
+      continue;
+    }
+
+    cell += char;
+  }
+
+  cells.push(cell.trim());
+
+  return cells;
+}
+
+const MARKDOWN_TABLE_TRANSFORMER: MultilineElementTransformer = {
+  dependencies: [TableNode],
+
+  regExpStart: MARKDOWN_TABLE_ROW_REGEX,
+
+  handleImportAfterStartMatch: ({
+    lines,
+    rootNode,
+    startLineIndex,
+  }) => {
+    const dividerIndex = startLineIndex + 1;
+
+    if (
+      dividerIndex >= lines.length ||
+      !MARKDOWN_TABLE_DIVIDER_REGEX.test(lines[dividerIndex])
+    ) {
+      // The start line matches the table row regex, but no valid divider
+      // follows. Signal an explicit non-match instead of returning null,
+      // because Lexical would otherwise fall into its fallback multiline
+      // path and consume every remaining line in the document.
+      return [false, startLineIndex];
+    }
+
+    const rows: string[][] = [
+      parseMarkdownTableRow(lines[startLineIndex]),
+    ];
+
+    let lastLineIndex = dividerIndex;
+
+    for (
+      let lineIndex = dividerIndex + 1;
+      lineIndex < lines.length;
+      lineIndex += 1
+    ) {
+      const line = lines[lineIndex];
+
+      if (
+        !MARKDOWN_TABLE_ROW_REGEX.test(line) ||
+        MARKDOWN_TABLE_DIVIDER_REGEX.test(line)
+      ) {
+        break;
+      }
+
+      rows.push(parseMarkdownTableRow(line));
+      lastLineIndex = lineIndex;
+    }
+
+    const columnCount = Math.max(
+      1,
+      ...rows.map((row) => row.length),
+    );
+
+    const tableNode = $createTableNodeWithDimensions(
+      rows.length,
+      columnCount,
+      {
+        rows: true,
+        columns: false,
+      },
+    );
+
+    tableNode.getChildren().forEach((rowNode, rowIndex) => {
+      if (!$isTableRowNode(rowNode)) {
+        return;
+      }
+
+      rowNode.getChildren().forEach((cellNode, columnIndex) => {
+        if (!$isTableCellNode(cellNode)) {
+          return;
+        }
+
+        cellNode.clear();
+
+        cellNode.append(
+          $createParagraphNode().append(
+            $createTextNode(rows[rowIndex]?.[columnIndex] ?? ''),
+          ),
+        );
+      });
+    });
+
+    rootNode.append(tableNode);
+
+    return [true, lastLineIndex];
+  },
+
+  export: (node, exportChildren) => {
+    if (!$isTableNode(node)) {
+      return null;
+    }
+
+    const rows = node
+      .getChildren()
+      .filter($isTableRowNode)
+      .map((row) => row.getChildren().filter($isTableCellNode));
+
+    if (rows.length === 0) {
+      return null;
+    }
+
+    const columnCount = Math.max(
+      1,
+      ...rows.map((row) => row.length),
+    );
+
+    const renderRow = (cells: TableCellNode[]) => {
+      const values = Array.from(
+        { length: columnCount },
+        (_, index) => {
+          const cell = cells[index];
+
+          if (!cell) {
+            return '';
+          }
+
+          return exportChildren(cell)
+            .replace(/\r?\n/g, ' ')
+            .replace(/\|/g, '\\|')
+            .trim();
+        },
+      );
+
+      return `| ${values.join(' | ')} |`;
+    };
+
+    const header = renderRow(rows[0]);
+
+    const divider = `| ${
+      Array.from(
+        { length: columnCount },
+        () => '---',
+      ).join(' | ')
+    } |`;
+
+    return [
+      header,
+      divider,
+      ...rows.slice(1).map(renderRow),
+    ].join('\n');
+  },
+
+  replace: () => false,
+
+  type: 'multiline-element',
+};
 const NOTEBOOK_TRANSFORMERS = [
   ...TRANSFORMERS,
+  MARKDOWN_TABLE_TRANSFORMER,
   INTERNAL_LINK_TRANSFORMER,
 ];
 
@@ -176,6 +381,11 @@ const editorTheme = {
     variable: 'text-orange-600',
   },
   link: 'text-primary hover:underline cursor-pointer',
+  table: 'border-collapse border border-border w-full my-4 table-auto',
+  tableRow: 'border-b border-border',
+  tableCell: 'border border-border px-3 py-2 min-w-[80px] align-top',
+  tableCellHeader: 'border border-border px-3 py-2 min-w-[80px] font-semibold bg-muted/50 text-left',
+  tableCellSelected: 'bg-primary/10',
   text: {
     bold: 'font-bold',
     italic: 'italic',
@@ -198,7 +408,329 @@ const editorNodes = [
   CodeHighlightNode,
   LinkNode,
   AutoLinkNode,
+  TableNode,
+  TableRowNode,
+  TableCellNode,
 ];
+
+function isNodeInsideTable(node: LexicalNode): boolean {
+  let current: LexicalNode | null = node;
+
+  while (current) {
+    if ($isTableNode(current)) {
+      return true;
+    }
+
+    current = current.getParent();
+  }
+
+  return false;
+}
+
+// ============================================================================
+// Markdown Clipboard Plugin
+// ============================================================================
+
+function createClipboardEditor(): LexicalEditor {
+  return createEditor({
+    namespace: 'NotebookClipboard',
+    nodes: editorNodes,
+    onError: (error) => {
+      console.error('[NotebookClipboard Error]:', error);
+    },
+  });
+}
+
+/**
+ * Convert Markdown into HTML using an isolated Lexical editor.
+ */
+function markdownToHtml(markdown: string): string {
+  const clipboardEditor = createClipboardEditor();
+
+  clipboardEditor.update(
+    () => {
+      $convertFromMarkdownString(
+        markdown,
+        NOTEBOOK_TRANSFORMERS
+      );
+    },
+    { discrete: true }
+  );
+
+  let html = '';
+
+  clipboardEditor.getEditorState().read(() => {
+    html = $generateHtmlFromNodes(clipboardEditor, null);
+  });
+
+  return html;
+}
+
+/**
+ * Convert HTML into Markdown using an isolated Lexical editor.
+ */
+function htmlToMarkdown(html: string): string {
+  const clipboardEditor = createClipboardEditor();
+  const parser = new DOMParser();
+
+  clipboardEditor.update(
+    () => {
+      const root = $getRoot();
+      const dom = parser.parseFromString(html, 'text/html');
+      const nodes = $generateNodesFromDOM(clipboardEditor, dom);
+
+      root.clear();
+      root.append(...nodes);
+    },
+    { discrete: true }
+  );
+
+  let markdown = '';
+
+  clipboardEditor.getEditorState().read(() => {
+    markdown = $convertToMarkdownString(
+      NOTEBOOK_TRANSFORMERS
+    );
+  });
+
+  return markdown;
+}
+
+/**
+ * Detect Markdown syntax without treating ordinary text as Markdown.
+ */
+function isMarkdownContent(text: string): boolean {
+  const patterns = [
+    /^#{1,6}\s+.+/m,
+    /^\s*[-*+]\s+.+/m,
+    /^\s*\d+[.)]\s+.+/m,
+    /^\s*>\s+.+/m,
+    /^\s*```/m,
+    /^\s*~~~\s*/m,
+    /^\s*(---|\*\*\*|___)\s*$/m,
+    /\*\*[^*]+\*\*/,
+    /(?<!\*)\*[^*\n]+\*(?!\*)/,
+    /(?<!_)__[^_]+__(?!_)/,
+    /~~[^~]+~~/,
+    /`[^`\n]+`/,
+    /\[[^\]]+\]\([^)]+\)/,
+    /^\|.+\|$/m,
+  ];
+
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function isMarkdownTableContent(content: string): boolean {
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) {
+    return false;
+  }
+
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    if (
+      MARKDOWN_TABLE_ROW_REGEX.test(lines[index]) &&
+      MARKDOWN_TABLE_DIVIDER_REGEX.test(lines[index + 1])
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+/**
+ * Handle Markdown and HTML clipboard operations.
+ */
+function MarkdownClipboardPlugin() {
+  const [editor] = useLexicalComposerContext();
+
+  useEffect(() => {
+    return mergeRegister(
+      editor.registerCommand(
+        COPY_COMMAND,
+        (event) => {
+          if (
+            !event ||
+            !('clipboardData' in event) ||
+            !event.clipboardData
+          ) {
+            return false;
+          }
+
+          const selection = $getSelection();
+
+          if (
+            !selection ||
+            selection.isCollapsed() ||
+            !$isRangeSelection(selection)
+          ) {
+            return false;
+          }
+
+          // For selections that touch a table, defer to the native
+          // Lexical copy handler. It exports a full table HTML plus an
+          // `application/x-lexical-editor` payload that preserves rich
+          // cell structure for in-editor pasting and produces proper
+          // `<table>` HTML for Word, Excel and browsers.
+          const selectionContainsTable = selection
+            .getNodes()
+            .some(isNodeInsideTable);
+
+          if (selectionContainsTable) {
+            return false;
+          }
+
+          const clipboardData = event.clipboardData;
+          const html = $generateHtmlFromNodes(editor, selection);
+
+          const markdown = html
+            ? htmlToMarkdown(html)
+            : selection.getTextContent();
+
+          clipboardData.setData('text/plain', markdown);
+          if (html) {
+            clipboardData.setData('text/html', html);
+          }
+
+          event.preventDefault();
+
+          return true;
+        },
+        COMMAND_PRIORITY_HIGH,
+      ),
+
+      editor.registerCommand(
+        PASTE_COMMAND,
+        (event) => {
+          if (
+            !event ||
+            !('clipboardData' in event) ||
+            !event.clipboardData
+          ) {
+            return false;
+          }
+
+          const clipboardData = event.clipboardData;
+          const selection = $getSelection();
+
+          if (!selection || !$isRangeSelection(selection)) {
+            return false;
+          }
+
+          const html = clipboardData.getData('text/html');
+          const plainText = clipboardData.getData('text/plain');
+          const lexicalPayload = clipboardData.getData(
+            'application/x-lexical-editor',
+          );
+
+          if (!html && !plainText && !lexicalPayload) {
+            return false;
+          }
+
+          // Prefer the native Lexical handler whenever an
+          // `application/x-lexical-editor` payload is present. This is
+          // the highest-fidelity path for in-editor copy/paste and it
+          // already knows how to restore tables, cells and ranges.
+          if (lexicalPayload && lexicalPayload.trim().length > 0) {
+            return false;
+          }
+
+          // Nested tables inside an existing table cell are not
+          // supported by Lexical's table model, so let the native
+          // handler deal with pastes inside a table cell.
+          const selectionContainsTable = selection
+            .getNodes()
+            .some(isNodeInsideTable);
+
+          if (selectionContainsTable) {
+            return false;
+          }
+
+          const plainTextIsMarkdownTable =
+            isMarkdownTableContent(plainText);
+          const plainTextIsMarkdown = isMarkdownContent(plainText);
+          const htmlHasTable = /<table\b/i.test(html);
+
+          // If there is no HTML and no Markdown-like payload, fall back
+          // to the native plain-text handler.
+          if (
+            !html.trim() &&
+            !plainTextIsMarkdownTable &&
+            !plainTextIsMarkdown
+          ) {
+            return false;
+          }
+
+          event.preventDefault();
+
+          let nodes: LexicalNode[] = [];
+
+          try {
+            // Priority 1: A Markdown table copied as plain text from a
+            // Markdown editor. When the source also provides HTML
+            // without a real `<table>` (for example a fenced code
+            // block), the plain-text Markdown is more authoritative.
+            if (plainTextIsMarkdownTable && !htmlHasTable) {
+              const convertedHtml = markdownToHtml(plainText);
+              if (convertedHtml) {
+                const parser = new DOMParser();
+                const dom = parser.parseFromString(
+                  convertedHtml,
+                  'text/html',
+                );
+                nodes = $generateNodesFromDOM(editor, dom);
+              }
+            }
+            // Priority 2: HTML from Word, Excel, browsers or any
+            // rendered Markdown viewer. `$generateNodesFromDOM` uses
+            // TableNode's DOM importer so the table stays editable.
+            else if (html.trim()) {
+              const parser = new DOMParser();
+              const dom = parser.parseFromString(html, 'text/html');
+              nodes = $generateNodesFromDOM(editor, dom);
+            }
+            // Priority 3: Markdown content available only as plain
+            // text without any accompanying HTML.
+            else if (plainTextIsMarkdown) {
+              const convertedHtml = markdownToHtml(plainText);
+              if (convertedHtml) {
+                const parser = new DOMParser();
+                const dom = parser.parseFromString(
+                  convertedHtml,
+                  'text/html',
+                );
+                nodes = $generateNodesFromDOM(editor, dom);
+              }
+            }
+          } catch (err) {
+            console.error(
+              '[NotebookPaste] failed to parse clipboard content:',
+              err,
+            );
+          }
+
+          if (nodes.length === 0) {
+            selection.insertText(plainText);
+            return true;
+          }
+
+          $insertNodes(nodes);
+
+          return true;
+        },
+        COMMAND_PRIORITY_HIGH,
+      ),
+    );
+  }, [editor]);
+
+  return null;
+}
+
 
 // ============================================================================
 // Fixed Formatting Toolbar Plugin
@@ -214,6 +746,11 @@ function NotebookToolbarPlugin() {
   const [isStrikethrough, setIsStrikethrough] = useState(false);
   const [isCode, setIsCode] = useState(false);
   const [blockType, setBlockType] = useState<string>('paragraph');
+  const [showTableMenu, setShowTableMenu] = useState(false);
+  const [tableRows, setTableRows] = useState('3');
+  const [tableColumns, setTableColumns] = useState('3');
+  const [includeHeaderRow, setIncludeHeaderRow] = useState(true);
+  const tableSelectionRef = React.useRef<ReturnType<typeof $getSelection>>(null);
 
   const updateToolbar = useCallback(() => {
     const selection = $getSelection();
@@ -315,6 +852,49 @@ function NotebookToolbarPlugin() {
     const url = window.prompt('Enter URL (leave empty to remove link):');
     if (url === null) return;
     editor.dispatchCommand(TOGGLE_LINK_COMMAND, url === '' ? null : url);
+  };
+
+  const openTableMenu = () => {
+    editor.getEditorState().read(() => {
+      const selection = $getSelection();
+      tableSelectionRef.current = selection?.clone() ?? null;
+    });
+
+    setShowTableMenu(true);
+  };
+
+  const insertTable = () => {
+    const rows = Number(tableRows);
+    const columns = Number(tableColumns);
+
+    if (
+      !Number.isInteger(rows) ||
+      !Number.isInteger(columns) ||
+      rows < 1 ||
+      rows > 50 ||
+      columns < 1 ||
+      columns > 50
+    ) {
+      window.alert('Rows and columns must be between 1 and 50.');
+      return;
+    }
+
+    const savedSelection = tableSelectionRef.current;
+
+    if (savedSelection) {
+      editor.update(() => {
+        $setSelection(savedSelection.clone());
+      });
+    }
+
+    editor.dispatchCommand(INSERT_TABLE_COMMAND, {
+      rows: String(rows),
+      columns: String(columns),
+      includeHeaders: includeHeaderRow,
+    });
+
+    tableSelectionRef.current = null;
+    setShowTableMenu(false);
   };
 
   const ToolbarButton = ({
@@ -461,6 +1041,75 @@ function NotebookToolbarPlugin() {
       >
         <Link2 size={15} />
       </ToolbarButton>
+      <div className="relative">
+        <ToolbarButton
+          onClick={openTableMenu}
+          title="Insert Table"
+        >
+          <Table2 size={15} />
+          <span className="text-xs font-semibold">Table</span>
+        </ToolbarButton>
+
+        {showTableMenu && (
+          <div className="absolute right-0 top-full z-50 mt-2 w-64 rounded-lg border border-border bg-card p-3 shadow-xl">
+            <div className="grid grid-cols-2 gap-3">
+              <label className="text-xs font-medium text-muted-foreground">
+                Rows
+                <input
+                  type="number"
+                  min="1"
+                  max="50"
+                  step="1"
+                  value={tableRows}
+                  onChange={(event) => setTableRows(event.target.value)}
+                  className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground"
+                />
+              </label>
+
+              <label className="text-xs font-medium text-muted-foreground">
+                Columns
+                <input
+                  type="number"
+                  min="1"
+                  max="50"
+                  step="1"
+                  value={tableColumns}
+                  onChange={(event) => setTableColumns(event.target.value)}
+                  className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground"
+                />
+              </label>
+            </div>
+
+            <label className="mt-3 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={includeHeaderRow}
+                onChange={(event) => setIncludeHeaderRow(event.target.checked)}
+                className="accent-primary"
+              />
+              Include header row
+            </label>
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowTableMenu(false)}
+                className="rounded-md px-3 py-2 text-xs text-muted-foreground hover:bg-muted"
+              >
+                Cancel
+              </button>
+
+              <button
+                type="button"
+                onClick={insertTable}
+                className="rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:opacity-90"
+              >
+                Insert Table
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -774,9 +1423,13 @@ export function NotebookEditor({
           </div>
           <HistoryPlugin />
           <OnChangePlugin onChange={handleChange} />
+
+          {!readOnly && <MarkdownClipboardPlugin />}
+
           <MarkdownShortcutPlugin transformers={NOTEBOOK_TRANSFORMERS} />
           <LinkPlugin />
           <ListPlugin />
+          <TablePlugin />
           <CodeHighlightPluginWrapper />
           <SlashCommandsPlugin />
         </LexicalComposer>

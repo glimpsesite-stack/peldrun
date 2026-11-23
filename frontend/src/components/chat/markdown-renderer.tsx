@@ -68,13 +68,30 @@ function normalizeMathDelimiters(source: string): string {
 
 /**
  * Ensures that a GFM table is preceded by a blank line.
+ *
+ * The raw regex can over-match when a pipe-delimited sequence appears
+ * inside a fenced code block (for example a Python bitwise OR followed
+ * by a Markdown-looking comment), so the source is split around fenced
+ * blocks first and only the prose segments are normalized. Odd indices
+ * hold the fenced code segments and are left untouched.
  */
 function normalizeMarkdownTables(source: string): string {
   if (!source) return source;
-  return source.replace(
-    /([^\n])\n(\s*\|[^\n]+\|\s*\n\s*\|[\s\-:|]+\|)/g,
-    "$1\n\n$2"
-  );
+
+  const segments = source.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g);
+
+  return segments
+    .map((segment, index) => {
+      if (index % 2 === 1) {
+        return segment;
+      }
+
+      return segment.replace(
+        /([^\n])\n(\s*\|[^\n]+\|\s*\n\s*\|[\s\-:|]+\|)/g,
+        "$1\n\n$2"
+      );
+    })
+    .join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -282,15 +299,45 @@ function MarkdownRendererInner({
             );
           },
 
-          th({ children }: any) {
+          tbody({ children }: any) {
+            // The first row of the body should not draw a top border,
+            // otherwise it would double up with the thead's bottom
+            // border and produce a visually heavy divider.
             return (
-              <th className="px-3.5 py-2 text-sm font-semibold">{children}</th>
+              <tbody className="[&>tr:first-child>td]:border-t-0">
+                {children}
+              </tbody>
             );
           },
 
-          td({ children }: any) {
+          tr({ children }: any) {
             return (
-              <td className="px-3.5 py-2 border-t border-border/50 text-black/90 text-sm">
+              <tr className="transition-colors hover:bg-muted/30">
+                {children}
+              </tr>
+            );
+          },
+
+          th({ children, align, style }: any) {
+            // remark-gfm forwards the GFM column alignment (:---, :---:,
+            // ---:) through the `align` prop. Fall back to the inline
+            // style when the renderer shape changes between versions.
+            return (
+              <th
+                className="px-3.5 py-2 text-sm font-semibold align-top"
+                style={{ textAlign: align ?? style?.textAlign }}
+              >
+                {children}
+              </th>
+            );
+          },
+
+          td({ children, align, style }: any) {
+            return (
+              <td
+                className="px-3.5 py-2 border-t border-border/50 text-black/90 text-sm align-top"
+                style={{ textAlign: align ?? style?.textAlign }}
+              >
                 {children}
               </td>
             );

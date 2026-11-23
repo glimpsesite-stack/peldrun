@@ -844,27 +844,26 @@ class MemoryRetrievalSettings(BaseModel):
 
     ``hybrid``
         Runs both lexical and vector, then fuses the results
-        via ``reciprocal_rank_fusion`` (when ``rrf_k`` is
-        set) or ``weighted_fusion`` (when ``vector_alpha``
-        drives the mix). The recommended mode when both
-        preconditions hold.
+        using rank-based fusion (when ``rrf_k`` is set) or
+        weighted fusion (when ``vector_alpha`` drives the mix).
+        The recommended mode when both preconditions hold.
 
     ``automatic``
         Short queries (fewer than 3 words) use lexical;
         longer queries use hybrid. A pragmatic default for
         deployments where vector calls are expensive and the
         query distribution is mixed. The threshold is
-        implemented in ``MemoryRetrievalRouter``, not here.
+        implemented in the active hybrid provider, not here.
 
     Tuning fields
     -------------
     ``vector_alpha``
         Weight of the vector side in fusion. ``0.0`` = pure
         lexical, ``1.0`` = pure vector, ``0.5`` = balanced.
-        Translated to ``weighted_fusion(alpha=1 - vector_alpha)``
-        by the router (note: ``weighted_fusion``'s ``alpha``
-        is the weight of the LEXICAL side, so the translation
-        keeps the naming intuitive for operators).
+        Translated to an internal weighted fusion parameter
+        (note: the internal fusion alpha is the weight of the
+        LEXICAL side, so the translation keeps the naming
+        intuitive for operators).
 
     ``min_lexical_score`` / ``min_vector_similarity``
         Per-source thresholds applied before fusion. Values
@@ -875,9 +874,9 @@ class MemoryRetrievalSettings(BaseModel):
     ``rrf_k``
         RRF smoothing constant. Default 60 (Cormack 2009).
         Only consulted when ``mode="hybrid"`` AND
-        ``vector_alpha`` is at its default of 0.5 (the router
-        interprets non-default ``vector_alpha`` as "user wants
-        weighted fusion").
+        ``vector_alpha`` is at its default of 0.5 (the hybrid
+        provider interprets non-default ``vector_alpha`` as
+        "user wants weighted fusion").
 
     ``rerank_enabled``
         Phase 5 stub. When True, the router will call
@@ -906,10 +905,9 @@ class MemoryRetrievalSettings(BaseModel):
             "Weight of the vector side in hybrid fusion. "
             "0.0 = pure lexical, 1.0 = pure vector, 0.5 = "
             "balanced. Only consulted when mode is 'hybrid' "
-            "or 'automatic'. The router translates this to "
-            "``weighted_fusion(alpha=1 - vector_alpha)`` so "
-            "the operator-facing name matches the intuitive "
-            "meaning."
+            "or 'automatic'. The hybrid provider translates "
+            "this to the internal fusion weight so the "
+            "operator-facing name matches the intuitive meaning."
         ),
     )
     min_lexical_score: float = Field(
