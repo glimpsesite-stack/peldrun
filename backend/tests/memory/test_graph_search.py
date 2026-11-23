@@ -418,8 +418,20 @@ async def test_three_way_rrf_fusion() -> None:
         fts_provider=fts,
         vec_provider=vec,
         graph_search=graph,
+        # Identity calibration isolates fusion mechanics from the
+        # PROVISIONAL per-model cosine bounds: fake cosines pass
+        # through unchanged, so score assertions below stay exact
+        # even after real floor/ceil calibration lands.
+        vec_score_floor=0.0,
+        vec_score_ceil=1.0,
     )
-    results = await hybrid.search_ranked("q", ["project:p1"], limit=10)
+    # G1: the hybrid gates on QueryIntent before any source runs.
+    # A bare "q" is NO_INTENT (single-char token drops out of the
+    # normalizer), which correctly routes to FTS-only. Fusion tests
+    # must use a real LOOKUP query.
+    results = await hybrid.search_ranked(
+        "peldrun memory", ["project:p1"], limit=10
+    )
 
     ids = [entry.memory_id for entry, _score in results]
     assert set(ids) == {
@@ -430,8 +442,13 @@ async def test_three_way_rrf_fusion() -> None:
     }
     # The entry found by ALL three sources ranks first.
     assert ids[0] == "mem_shared"
-    # Normalized to [0, 1].
-    assert results[0][1] == pytest.approx(1.0)
+    # G2: relevance is ABSOLUTE (max over sources), never the RRF
+    # score and never normalized against the best candidate.
+    by_id = {entry.memory_id: score for entry, score in results}
+    assert by_id["mem_shared"] == pytest.approx(1.0)   # graph link score
+    assert by_id["mem_fts"] == pytest.approx(0.8)      # lexical stays 0.8
+    assert by_id["mem_vec"] == pytest.approx(0.85)     # identity-calibrated
+    assert by_id["mem_graph"] == pytest.approx(0.5)
     assert all(0.0 <= score <= 1.0 for _entry_, score in results)
     # The graph source was consulted with the live scope set.
     assert graph.calls == 1
@@ -447,7 +464,11 @@ async def test_graph_only_results_report_graph_mode() -> None:
         vec_provider=_FakeVecProvider([]),
         graph_search=_FakeGraphSearch([(graph_only, 1.0)]),
     )
-    results = await hybrid.search_ranked("q", ["project:p1"], limit=5)
+    # G1: a LOOKUP query is required to reach the fusion path ("q"
+    # is NO_INTENT and would delegate to FTS-only).
+    results = await hybrid.search_ranked(
+        "peldrun memory", ["project:p1"], limit=5
+    )
     assert [entry.memory_id for entry, _ in results] == ["mem_graph"]
     assert hybrid.last_search_mode == "graph"
 
@@ -463,7 +484,10 @@ async def test_graph_failure_degrades_to_two_way_fusion() -> None:
             error=RuntimeError("graph exploded")
         ),
     )
-    results = await hybrid.search_ranked("q", ["project:p1"], limit=5)
+    # G1: LOOKUP query so all three sources actually run.
+    results = await hybrid.search_ranked(
+        "peldrun memory", ["project:p1"], limit=5
+    )
     assert {entry.memory_id for entry, _ in results} == {
         "mem_fts",
         "mem_vec",
@@ -526,7 +550,10 @@ async def test_graph_search_disabled_no_extra_calls() -> None:
     )
     assert hybrid.graph_search is None
 
-    results = await hybrid.search_ranked("q", ["project:p1"], limit=5)
+    # G1: LOOKUP query so the two-way path actually runs.
+    results = await hybrid.search_ranked(
+        "peldrun memory", ["project:p1"], limit=5
+    )
     assert {entry.memory_id for entry, _ in results} == {
         "mem_fts",
         "mem_vec",

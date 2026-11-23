@@ -13,31 +13,32 @@ through this pipeline so that:
     * SUPERSEDE / REACTIVATE archival semantics are IDENTICAL
       across all sources.
 
-Relationship to ``memory_save`` tool
-------------------------------------
+Relationship to the shared write executor (W3)
+----------------------------------------------
 
-``memory_save`` (P1.5) has its own INLINE implementation of the
-same policy. That duplication is deliberate for P1: when
-``memory_save`` was written, it was the ONLY caller. Now that we
-have (or will soon have):
+Every write caller -- this pipeline, the ``memory_save`` tool,
+and the import adapter (``base_adapter``) -- executes its
+``WriteDecision`` through ONE shared entrypoint:
+``peldrun.memory.services.write_service.execute_decision``.
+The duplicated inline executors that previously lived in each
+caller were removed in the W3 cleanup, and a regression test
+(``test_W3_single_write_entrypoint_exists``) fails if any of
+them reappears.
 
-    * extractor output (P1.4) -- candidates from conversation
-      that need the same dedupe/supersede decisions,
-    * import apply (P1.6) -- candidates from packages that need
-      the same archival semantics,
-    * future extraction outbox (P2) -- batch candidates from
-      scheduled runs,
+This pipeline remains the REUSABLE orchestration layer on top
+of that executor. It owns the concerns a bare executor does
+not:
 
-...a single shared pipeline eliminates the risk that a new
-caller forgets one piece of the policy (e.g. forgets to fetch
-``status="all"`` so REACTIVATE never fires).
+    * mode enforcement (``settings.mode.can_write``),
+    * candidate/scope verification before any work,
+    * fetching the existing pool ONCE per call with
+      ``status="all"`` so REACTIVATE can fire,
+    * batch semantics (siblings dedupe against prior creations),
+    * per-entry error isolation in ``save_many``,
+    * background graph indexing scheduling (Phase 6).
 
-The migration of ``memory_save`` to use this pipeline is
-scheduled for P2. Until then, both paths produce IDENTICAL
-outcomes by construction -- they call the same
-``decide_write_action`` and the same provider primitives in the
-same order. New callers MUST use this pipeline; existing
-``memory_save`` is the ONLY tolerated exception.
+New callers MUST go through this pipeline; no caller may
+re-implement archival semantics inline.
 
 Design invariants
 -----------------
@@ -74,10 +75,10 @@ Design invariants
 Cross-reference
 ---------------
 
-* ``memory_save`` (P1.5) -- legacy inline implementation.
-* ``base_adapter._apply_candidates`` (P1.6) -- parallel
-  batch-write logic used by the import subsystem. Produces the
-  same outcomes via the same primitives.
+* ``peldrun.memory.services.write_service.execute_decision``
+  -- the single W3 execution path for every ``WriteDecision``.
+* ``memory_save`` (P1.5) -- migrated to the shared executor.
+* ``base_adapter`` (P1.6) -- migrated to the shared executor.
 """
 
 from __future__ import annotations
@@ -218,20 +219,20 @@ def _schedule_graph_indexing(
 
 
 
-_DEFAULT_SCAN_LIMIT: int = 500
+_DEFAULT_SCAN_LIMIT: int = WRITE_DEDUPE_SCAN_LIMIT
 """Bounded fetch size for the existing-entries pool.
 
-Matches the import adapter's dedupe scan cap (see
-``base_adapter._DEDUPE_SCAN_LIMIT``). For most scopes this
-fetches every entry; for larger scopes it fetches the top-500
-by recency/importance -- enough to detect a re-save or an
-explicit supersede.
+Aliases the single source of truth in
+``peldrun.memory.services.write_service`` (500). Every write
+caller -- pipeline, ``memory_save``, import adapter -- scans the
+same capped pool. The historical divergence (``memory_save``
+scanning only ``settings.default_limit`` = 5) was the W3 defect
+that let a re-save of an older fact slip through as new.
 
-``memory_save`` uses ``settings.default_limit`` (default 5) for
-its pool, which is CHEAPER but less accurate. The pipeline uses
-500 because it serves BATCH operations where spending an extra
-~100ms to check 500 existing entries per batch is trivial
-compared to the cost of creating 100 duplicates.
+For most scopes this fetches every entry; for larger scopes it
+fetches the top-500 by recency/importance. Neighbor-based
+candidate retrieval (plan G8) replaces the recency ordering in
+a later step; the cap itself stays shared.
 """
 
 
@@ -647,8 +648,8 @@ class MemoryWritePipeline:
         Error translation is IDENTICAL to the legacy inline branches:
         validation -> ``validation_error: ...``, backend ->
         ``backend_unavailable: ...``, both preserving the INTENDED
-        action. The legacy ``_execute_decision`` below is now
-        unreachable and is deleted in the W3 cleanup step.
+        action. The legacy inline executor was removed in the
+        W3 cleanup; this is the pipeline's ONLY execution path.
         """
         try:
             result = await execute_decision(self._port, decision, scope_ref)
@@ -658,130 +659,6 @@ class MemoryWritePipeline:
                 target_id=result.target_id,
                 reason=result.reason,
             )
-        except MemoryValidationError as exc:
-            logger.warning(
-                "WritePipeline: validation failure during %s "
-                "(scope=%s): %s",
-                decision.action.value,
-                scope_ref,
-                exc.message,
-            )
-            return WriteOutcome(
-                action=decision.action,
-                target_id=(
-                    decision.target_entry.memory_id
-                    if decision.target_entry
-                    else None
-                ),
-                reason=decision.reason,
-                error=f"validation_error: {exc.message}",
-            )
-        except MemoryUnavailableError as exc:
-            logger.error(
-                "WritePipeline: backend failure during %s "
-                "(scope=%s): %s",
-                decision.action.value,
-                scope_ref,
-                exc.message,
-            )
-            return WriteOutcome(
-                action=decision.action,
-                target_id=(
-                    decision.target_entry.memory_id
-                    if decision.target_entry
-                    else None
-                ),
-                reason=decision.reason,
-                error=f"backend_unavailable: {exc.message}",
-            )
-
-    async def _execute_decision(
-        self,
-        *,
-        decision: WriteDecision,
-        candidate: MemoryEntry,
-        scope_ref: str,
-    ) -> WriteOutcome:
-        """Execute one ``WriteDecision`` against the port.
-
-        Exceptions from the port (``MemoryValidationError`` from a
-        UNIQUE-constraint race, ``MemoryUnavailableError`` from a
-        disk failure) propagate to the caller, which translates
-        them into ``WriteOutcome.error``.
-        """
-        try:
-            if decision.action == WriteAction.CREATE:
-                created = await self._port.create(candidate)
-                return WriteOutcome(
-                    action=WriteAction.CREATE,
-                    memory=created,
-                    reason=decision.reason,
-                )
-
-            if decision.action == WriteAction.SKIP:
-                target = decision.target_entry
-                return WriteOutcome(
-                    action=WriteAction.SKIP,
-                    memory=target,
-                    target_id=target.memory_id if target else None,
-                    reason=decision.reason,
-                )
-
-            if decision.action == WriteAction.SUPERSEDE:
-                target = decision.target_entry
-                if target is None:
-                    # Defensive -- should never happen.
-                    created = await self._port.create(candidate)
-                    return WriteOutcome(
-                        action=WriteAction.CREATE,
-                        memory=created,
-                        reason="supersede_without_target_fallback_create",
-                    )
-                # Archive FIRST, then create.
-                await self._port.delete(target.memory_id, scope_ref)
-                created = await self._port.create(candidate)
-                return WriteOutcome(
-                    action=WriteAction.SUPERSEDE,
-                    memory=created,
-                    target_id=target.memory_id,
-                    reason=decision.reason,
-                )
-
-            if decision.action == WriteAction.REACTIVATE:
-                target = decision.target_entry
-                if target is None:
-                    created = await self._port.create(candidate)
-                    return WriteOutcome(
-                        action=WriteAction.CREATE,
-                        memory=created,
-                        reason="reactivate_without_target_fallback_create",
-                    )
-                revived = target.model_copy(
-                    update={
-                        "status": MemoryStatus.ACTIVE,
-                        "content": candidate.content,
-                        "normalized_content": candidate.normalized_content,
-                        "content_hash": candidate.content_hash,
-                        "importance": candidate.importance,
-                        "tags": candidate.tags,
-                        "provenance": candidate.provenance,
-                    }
-                )
-                updated = await self._port.update(revived)
-                return WriteOutcome(
-                    action=WriteAction.REACTIVATE,
-                    memory=updated,
-                    target_id=target.memory_id,
-                    reason=decision.reason,
-                )
-
-            # Unreachable -- all four WriteAction members handled.
-            return WriteOutcome(
-                action=decision.action,
-                reason=f"unknown_action:{decision.action}",
-                error=f"unsupported action: {decision.action}",
-            )
-
         except MemoryValidationError as exc:
             logger.warning(
                 "WritePipeline: validation failure during %s "

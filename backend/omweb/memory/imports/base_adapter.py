@@ -101,20 +101,23 @@ For every candidate, ``_build_preview`` runs a store query to
 find entries in the target scope that MIGHT be duplicates,
 then delegates classification to ``decide_write_action``:
 
-    existing = await port.search(candidate.content, [scope_ref], limit=5)
+    existing = await port.search("", [scope_ref], limit=WRITE_DEDUPE_SCAN_LIMIT, status="all")
     decision = decide_write_action(candidate, existing)
 
-The search query is the candidate's CONTENT. This is the same
-approach ``MemorySaveTool`` uses at save time, so preview and
-save agree on which entries are considered similar. High-
-relevance search results are the likely duplicates; low-relevance
-results are likely unrelated and ``decide_write_action`` ignores
-them after the hash/Jaccard checks.
+The search uses an EMPTY query (the repository's recency/importance
+listing), NOT the candidate's content. A content query would FTS-AND
+the candidate's tokens and silently miss the very entry a supersede
+should replace (the old fact lacks the new tokens). This matches
+``MemorySaveTool``'s identical choice, so preview and save agree on
+which entries are considered similar. ``decide_write_action`` then
+classifies via exact hash, near-duplicate Jaccard, and conflict markers.
 
-The search limit of 5 comes from ``MemorySettings.default_limit``
-(matching the retrieval pipeline). A larger limit would catch
-more near-duplicates at the cost of more work per candidate; the
-default is well-tuned for the common case.
+The scan cap is the shared ``WRITE_DEDUPE_SCAN_LIMIT`` (500) -- the
+single source of truth for EVERY write path (audit W3). Scanning only
+``default_limit`` (5) was the W3 defect: a re-save of an older fact
+looked new because the duplicate sat outside the five most recent
+entries. ``status="all"`` is required so ARCHIVED/SUPERSEDED rows are
+visible to REACTIVATE.
 
 Transactional vs best-effort apply
 ----------------------------------
@@ -145,8 +148,8 @@ for the whole batch to be rejected because of one bad line.
 
 If a future requirement demands true transactional semantics,
 the correct path is to add a ``transaction()`` context manager
-to ``MemoryPort`` and wrap ``_apply_candidates`` in it. That
-port-level change is deliberately not made in P1.
+to ``MemoryPort`` and wrap ``_apply_candidates_shared`` in it.
+That port-level change is deliberately not made in P1.
 """
 
 from __future__ import annotations
@@ -364,24 +367,24 @@ class BaseImportAdapter(MemoryImportAdapter, ABC):
         self._port: MemoryPort = port
         self._settings: MemorySettings = settings
 
-    #: Bounded fetch size for dedupe analysis. Larger than the
-    #: retrieval pipeline's ``default_limit`` (5) because imports
-    #: are ONE-SHOT operations: spending an extra ~100ms to check
-    #: against 500 existing entries instead of 5 is a clear win
-    #: against the cost of creating 100 duplicates.
+    #: Bounded fetch size for dedupe analysis. Aliases the single
+    #: source of truth in ``peldrun.memory.services.write_service``
+    #: (``WRITE_DEDUPE_SCAN_LIMIT`` = 500) so EVERY write caller --
+    #: pipeline, ``memory_save``, import adapter -- scans the same
+    #: capped pool (audit W3). The historical divergence (the save
+    #: tool scanning only ``default_limit`` = 5) let a re-save of an
+    #: older fact slip through as new.
     #:
     #: The ceiling is not arbitrary:
     #:   * 500 covers most real-world project scopes completely,
     #:   * for very large scopes it degrades gracefully to "check
-    #:     against top 500 by importance/recency" (still far better
-    #:     than the save-tool's top-5-only behavior),
+    #:     against top 500 by importance/recency",
     #:   * the memory cost of 500 ``MemoryEntry`` objects (~1KB
     #:     each) is ~500KB per import, well within budget.
     #:
-    #: P2 will add an indexed lookup path once the memory subsystem
-    #: has a proper dedupe index -- until then, this is the
-    #: pragmatic Phase 1 compromise.
-    _DEDUPE_SCAN_LIMIT: int = 500
+    #: Neighbor-based candidate retrieval (plan G8) replaces the
+    #: recency ordering in a later step; the cap itself stays shared.
+    _DEDUPE_SCAN_LIMIT: int = WRITE_DEDUPE_SCAN_LIMIT
 
     # ------------------------------------------------------------------
     # Dedupe lookup helper
@@ -747,8 +750,8 @@ class BaseImportAdapter(MemoryImportAdapter, ABC):
         pool maintenance as the legacy inline implementation; only
         decision EXECUTION moved to
         ``peldrun.memory.services.write_service`` so the three write
-        callers cannot diverge. The legacy ``_apply_candidates`` below
-        is unreachable and is deleted in the W3 cleanup step.
+        callers cannot diverge. The legacy inline executor was removed
+        in the W3 cleanup; this is the adapter's ONLY execution path.
         """
         created = 0
         skipped = 0
@@ -840,190 +843,7 @@ class BaseImportAdapter(MemoryImportAdapter, ABC):
             errors=errors,
         )
 
-    async def _apply_candidates(
-        self,
-        candidates: List[MemoryEntry],
-        scope_ref: MemoryScopeRef,
-    ) -> ImportApplyResult:
-        """Write every candidate to the store, best-effort.
 
-        For each candidate:
-
-          1. Re-query the store (the state may have changed since
-             preview),
-          2. Call ``decide_write_action`` to get a fresh decision,
-          3. Execute the decision (CREATE / SKIP / SUPERSEDE /
-             REACTIVATE),
-          4. On error: log and continue with the next candidate.
-
-        Errors are collected in ``ImportApplyResult.errors`` with
-        a ``candidate N (content=...): <exception>`` format so a
-        user who investigates can identify which entries failed.
-        """
-        created = 0
-        skipped = 0
-        errors: List[str] = []
-
-        scope_ref_str = str(scope_ref)
-
-        # Fetch existing entries ONCE for the batch. Same rationale
-        # as ``_build_preview``: O(1) queries vs O(N), and each
-        # successful create is appended to the pool so subsequent
-        # candidates are correctly deduped against their siblings.
-        try:
-            existing_pool: List[MemoryEntry] = (
-                await self._fetch_existing_for_dedupe(scope_ref)
-            )
-        except Exception as exc:
-            existing_pool = []
-            errors.append(
-                f"batch dedupe fetch failed "
-                f"({type(exc).__name__}: {exc}); dedupe checks "
-                f"for this batch will be skipped"
-            )
-
-        for idx, candidate in enumerate(candidates):
-            try:
-                decision = decide_write_action(candidate, existing_pool)
-
-                if decision.action == WriteAction.SKIP:
-                    skipped += 1
-                    logger.debug(
-                        "Import skipped candidate %d (duplicate of %s).",
-                        idx + 1,
-                        (
-                            decision.target_entry.memory_id
-                            if decision.target_entry
-                            else "<unknown>"
-                        ),
-                    )
-                    continue
-
-                if decision.action == WriteAction.CREATE:
-                    created_entry = await self._port.create(candidate)
-                    created += 1
-                    # Append so subsequent candidates within the
-                    # batch are correctly deduped against this new
-                    # entry (matches the preview's simulation).
-                    existing_pool.append(created_entry)
-                    continue
-
-                if decision.action == WriteAction.SUPERSEDE:
-                    # Archive the old entry BEFORE creating the
-                    # new one. Ordering rationale: if create fails,
-                    # the old entry is already archived (both
-                    # states visible). If archive fails, we do
-                    # NOT create -- the old entry stays active,
-                    # and the caller can retry.
-                    if decision.target_entry is not None:
-                        await self._port.delete(
-                            decision.target_entry.memory_id,
-                            scope_ref_str,
-                        )
-                        # Remove the archived target from the pool
-                        # so subsequent candidates don't dedupe
-                        # against an entry that is no longer active.
-                        try:
-                            existing_pool.remove(decision.target_entry)
-                        except ValueError:
-                            pass
-                    created_entry = await self._port.create(candidate)
-                    created += 1
-                    existing_pool.append(created_entry)
-                    continue
-
-                if decision.action == WriteAction.REACTIVATE:
-                    if decision.target_entry is None:
-                        # Should never happen -- REACTIVATE always
-                        # carries a target. Defensive fallback to
-                        # a plain CREATE so the entry is not lost.
-                        await self._port.create(candidate)
-                        created += 1
-                        continue
-                    # Revive the target with the candidate's content,
-                    # preserving its memory_id and created_at.
-                    revived = decision.target_entry.model_copy(
-                        update={
-                            "content": candidate.content,
-                            "normalized_content": candidate.normalized_content,
-                            "content_hash": candidate.content_hash,
-                            "importance": candidate.importance,
-                            "tags": candidate.tags,
-                            "status": MemoryEntry.model_fields[
-                                "status"
-                            ].default,
-                            "provenance": candidate.provenance,
-                        }
-                    )
-                    updated_entry = await self._port.update(revived)
-                    created += 1
-                    # Update the pool in place: replace the old
-                    # (archived/superseded) target with the newly-
-                    # revived entry.
-                    try:
-                        idx_in_pool = existing_pool.index(decision.target_entry)
-                        existing_pool[idx_in_pool] = updated_entry
-                    except (ValueError, AttributeError):
-                        existing_pool.append(updated_entry)
-                    continue
-
-                # Unreachable -- WriteAction has exactly 4 members.
-                # Defensive: treat as a create so the entry is not
-                # silently dropped on a future enum extension.
-                logger.warning(
-                    "Import: unknown WriteAction %r for candidate %d; "
-                    "falling back to CREATE.",
-                    decision.action,
-                    idx + 1,
-                )
-                await self._port.create(candidate)
-                created += 1
-
-            except MemoryValidationError as exc:
-                # Validation error at write time (should be rare --
-                # the candidate was already validated during
-                # _parse_to_candidates, so a fresh validation error
-                # implies a UNIQUE constraint race with a concurrent
-                # writer).
-                errors.append(
-                    f"candidate {idx + 1} "
-                    f"(content={candidate.content[:50]!r}): "
-                    f"validation error: {exc.message}"
-                )
-            except MemoryUnavailableError as exc:
-                # Backend genuinely unavailable -- log and continue
-                # (the next candidate might succeed once the
-                # transient issue clears, or the caller will see a
-                # batch of errors and retry the whole import).
-                errors.append(
-                    f"candidate {idx + 1} "
-                    f"(content={candidate.content[:50]!r}): "
-                    f"backend unavailable: {exc.message}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                # Any other failure -- include the exception type
-                # so the caller can classify it (e.g. OSError).
-                errors.append(
-                    f"candidate {idx + 1} "
-                    f"(content={candidate.content[:50]!r}): "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-        logger.info(
-            "Import apply: %d created, %d skipped, %d errors "
-            "(scope=%s, candidates=%d).",
-            created,
-            skipped,
-            len(errors),
-            scope_ref_str,
-            len(candidates),
-        )
-
-        return ImportApplyResult(
-            created=created,
-            skipped=skipped,
-            errors=errors,
-        )
 
 
 # ---------------------------------------------------------------------------

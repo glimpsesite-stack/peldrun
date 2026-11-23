@@ -1,0 +1,2065 @@
+{
+  "schema_version": 1,
+  "settings": {
+    "min_relevance_score": 0.3,
+    "default_limit": 5,
+    "max_tokens": 1024
+  },
+  "summary": {
+    "cases_total": 163,
+    "cases_ok": 147,
+    "cases_deferred": 16,
+    "cases_error": 0,
+    "recall_at_5": 0.9285714285714286,
+    "recall_at_5_by_lang": {
+      "ar": 0.925,
+      "en": 0.9545454545454546,
+      "ru": 0.875
+    },
+    "false_injection_no_intent": 0.0,
+    "false_injection_unrelated": 0.0,
+    "duplicate_creation_rate": 0.0,
+    "update_accuracy": 0.16666666666666666,
+    "p95_latency_ms": 2.8251000003365334,
+    "errors": []
+  },
+  "results": [
+    {
+      "id": "ar-pos-001",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 3.0198999993444886,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-002",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.059899999949266,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-003",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.409099999567843,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-004",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.5272000002587447,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-005",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.384100000199396,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-006",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.8251000003365334,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-007",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.54769999992277,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-008",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 3.034299999853829,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-009",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 3.0608999986725394,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-010",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 1.999699999942095,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-011",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [],
+      "latency_ms": 2.4957999994512647,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-012",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.4028999996517086,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-013",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.5253000003431225,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-014",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0,
+        1
+      ],
+      "latency_ms": 2.194200000303681,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-015",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.3725999999442138,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-016",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.6429999998072162,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-017",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.6758000003610505,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-018",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.8519000006781425,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-019",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.137600000423845,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-020",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [],
+      "latency_ms": 2.684699999008444,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-021",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.674499999557156,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-022",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.6668999998946674,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-023",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 1.942599999892991,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-024",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.46799999877112,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-025",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.6520000010350486,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-026",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.036400001088623,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-027",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.476100000421866,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-028",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.2712999998475425,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-029",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [],
+      "latency_ms": 2.33470000057423,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-030",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.407800000582938,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-031",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.3201000003609806,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-032",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.276999999594409,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-033",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.4754000005486887,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-034",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.397100000962382,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-035",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.2580000004381873,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-036",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.2849999986647163,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-037",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.388799999607727,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-038",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.385800000411109,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-039",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.607799999168492,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-pos-040",
+      "lang": "ar",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.3492000000260305,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-001",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.1665000003849855,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-002",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.1385000000009313,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-003",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.6366000001871726,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-004",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0,
+        1
+      ],
+      "latency_ms": 2.498300000297604,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-005",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0,
+        1
+      ],
+      "latency_ms": 2.1278000003803754,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-006",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.0065999997314066,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-007",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.3200999985419912,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-008",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.340099999855738,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-009",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [],
+      "latency_ms": 2.133500000127242,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-010",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.127699999618926,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-011",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 1.9946000011259457,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-012",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.319799999895622,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-013",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.239499999632244,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-014",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.1667000000888947,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-015",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.465099998516962,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-016",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.2844999984954484,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-017",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0,
+        1
+      ],
+      "latency_ms": 2.318599999853177,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-018",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.4033000008785166,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-019",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.0803000006708317,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-020",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 1.9862999997712905,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-021",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.1797999997943407,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-pos-022",
+      "lang": "en",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.128699999957462,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-001",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.626600000439794,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-002",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.8014999988954514,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-003",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0,
+        1
+      ],
+      "latency_ms": 2.5461000004725065,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-004",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.314499999556574,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-005",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.1886999984417344,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-006",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [],
+      "latency_ms": 2.4040000007516937,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-007",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.343099999052356,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-pos-008",
+      "lang": "ru",
+      "kind": "positive",
+      "expect": [
+        0
+      ],
+      "got": [
+        0
+      ],
+      "latency_ms": 2.5431000012758886,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-001",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.556200000573881,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-002",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.559800000701216,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-003",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.5572000011161435,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-004",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.543199999810895,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-005",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.7143000004580244,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-006",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5899000007048016,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-007",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.8019999988609925,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-008",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5412999998952728,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-009",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5516000001080101,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-010",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5932000003667781,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-011",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.6035999997257022,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-012",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.7436999987694435,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-013",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.7256999999517575,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-noint-014",
+      "lang": "ar",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5209999999351567,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-001",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5278999997244682,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-002",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5669000001944369,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-003",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5870000004506437,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-004",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.6018999993102625,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-005",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5894000005355338,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-006",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5879999989701901,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-007",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.638999999864609,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-008",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.15329999991809,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-009",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.8277999988640659,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-010",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.6402000001107808,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-011",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.6145999996078899,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-noint-012",
+      "lang": "en",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.5810999991808785,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-noint-001",
+      "lang": "ru",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.6550999989703996,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-noint-002",
+      "lang": "ru",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.692199999524746,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-noint-003",
+      "lang": "ru",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.818299999285955,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-noint-004",
+      "lang": "ru",
+      "kind": "no_intent",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.085499998429441,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-001",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.7408999994804617,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-002",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.4068999991868623,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-003",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.260599998407997,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-004",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.258599999549915,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-005",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.3421000005328096,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-006",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.056299999821931,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-007",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.283099998749094,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-008",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.399699998932192,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-009",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 3.334299999551149,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-010",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.6759000011225,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-011",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.6085000008606585,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-unrel-012",
+      "lang": "ar",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.2681999998894753,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-001",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.734299999952782,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-002",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.929599999130005,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-003",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.9248999997216742,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-004",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.831200001106481,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-005",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.9458999995549675,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-006",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.1527000008063624,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-007",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.9577999992179684,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-008",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.941499998793006,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-009",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.9303999997646315,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "en-unrel-010",
+      "lang": "en",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 1.9611000006989343,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-unrel-001",
+      "lang": "ru",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.265199998873868,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-unrel-002",
+      "lang": "ru",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 5.841599999257596,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ru-unrel-003",
+      "lang": "ru",
+      "kind": "unrelated",
+      "expect": [],
+      "got": [],
+      "latency_ms": 2.426900000500609,
+      "status": "ok",
+      "error": null
+    },
+    {
+      "id": "ar-upd-001",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.625399998782086,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-002",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.200499999366002,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-003",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.151599999910104,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-004",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.367400000570342,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-005",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.717499999766005,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-006",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.9801000002626097,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-007",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.8996000002953224,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-upd-008",
+      "lang": "ar",
+      "kind": "update",
+      "expect": [
+        "create"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.235599999243277,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "en-upd-001",
+      "lang": "en",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.423900001507718,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "en-upd-002",
+      "lang": "en",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.1096000002435176,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "en-upd-003",
+      "lang": "en",
+      "kind": "update",
+      "expect": [
+        "supersede"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.789399999732268,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "en-upd-004",
+      "lang": "en",
+      "kind": "update",
+      "expect": [
+        "create"
+      ],
+      "got": [
+        "create"
+      ],
+      "latency_ms": 3.0404999997699633,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 2
+    },
+    {
+      "id": "ar-dup-001",
+      "lang": "ar",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.0427999986859504,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "ar-dup-002",
+      "lang": "ar",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.0559000002103858,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "ar-dup-003",
+      "lang": "ar",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.022200000079465,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "ar-dup-004",
+      "lang": "ar",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.0323999995307531,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "ar-dup-005",
+      "lang": "ar",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.022200000079465,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "ar-dup-006",
+      "lang": "ar",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.175600000351551,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "en-dup-001",
+      "lang": "en",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.1561999999685213,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "en-dup-002",
+      "lang": "en",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.1170999987371033,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "en-dup-003",
+      "lang": "en",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.0111999999935506,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "en-dup-004",
+      "lang": "en",
+      "kind": "duplicate",
+      "expect": [
+        "skip"
+      ],
+      "got": [
+        "skip"
+      ],
+      "latency_ms": 1.0493000008864328,
+      "status": "ok",
+      "error": null,
+      "active_before": 1,
+      "active_after": 1
+    },
+    {
+      "id": "sec-001",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-002",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-003",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-004",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-005",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-006",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-007",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-008",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-009",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-010",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-011",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-012",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-013",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-014",
+      "lang": "ar",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-015",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    },
+    {
+      "id": "sec-016",
+      "lang": "en",
+      "kind": "secret",
+      "expect": [],
+      "got": [],
+      "latency_ms": 0.0,
+      "status": "deferred",
+      "error": "guarded by test_S1_secret_group_fully_redacted"
+    }
+  ]
+}

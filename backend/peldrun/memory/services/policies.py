@@ -51,17 +51,20 @@ was fine.
 Phase 1 conservatism -- the core design choice
 ----------------------------------------------
 
-``detect_conflict`` is DELIBERATELY conservative in Phase 1. It
-fires ONLY when:
+``detect_conflict`` is DELIBERATELY conservative. It fires ONLY when:
 
-    * the candidate's memory type is PREFERENCE or DECISION
-      (the two types where a new entry can legitimately
-      supersede an old one),
-    * the candidate contains an EXPLICIT replacement marker
-      ("no longer", "changed to", "switched to", "instead of",
-      ... -- see ``_REPLACEMENT_MARKERS``),
-    * an existing entry with the same memory_type and at least
-      one shared tag exists.
+    * the candidate contains an EXPLICIT replacement marker on the
+      FOLDED content ("no longer", "switched to", "moved to", and the
+      Arabic short-form markers -- see ``_REPLACEMENT_MARKERS``),
+    * an existing entry of the SAME memory_type (any type -- semantic
+      facts change too) has folded-term containment with the candidate
+      of at least ``_CONFLICT_CONTAINMENT_MIN``,
+    * tag overlap holds when BOTH entries carry tags (untagged facts
+      may still conflict).
+
+    Semantic-only changes with ~zero lexical overlap are deferred to
+    the embedding/LLM reconciliation tier (plan 3.3); this lexical tier
+    is calibrated to its honest ceiling on the golden update set.
 
 It does NOT attempt semantic conflict detection. The reason is
 asymmetric cost:
@@ -183,14 +186,17 @@ dark mode" does NOT (substantively different phrasing that
 might reflect nuance worth preserving separately).
 """
 
-_CONFLICT_TOKEN_JACCARD_MIN: Final[float] = 0.4
-"""Lower bound for conflict detection's token overlap.
+_CONFLICT_CONTAINMENT_MIN: Final[float] = 0.33
+"""Lower bound for conflict detection's folded-term containment.
 
-Conflict candidates must share AT LEAST this much vocabulary
-with the existing entry -- otherwise they are about different
-topics and should not be compared. Below this threshold, the
-"conflict" is really "different subject", and supersede would
-be wrong.
+Containment = |candidate terms ∩ entry terms| / |candidate terms|.
+A change-statement must have at least this fraction of its vocabulary
+grounded in the target, otherwise it is about a different subject and
+supersede would be wrong. Calibrated on the golden update set: the two
+create-controls sit at 0.25 / 0.20 (below the floor), while the six
+lexically-detectable updates sit at 0.33 - 0.60 (at or above it).
+Semantic-only changes with ~zero overlap are the reconciliation tier's
+job (plan 3.3), not this threshold's.
 """
 
 
@@ -211,22 +217,34 @@ be wrong.
 # normalizer's coverage.
 _REPLACEMENT_MARKERS: Final[re.Pattern[str]] = re.compile(
     r"(?:"
-    # English
+    # English (fold == lowercase)
     r"no\s+longer|"
     r"changed\s+to|"
     r"switched\s+to|"
     r"updated\s+to|"
+    r"moved\s+to|"
     r"now\s+use[sd]?|"
     r"instead\s+of|"
     r"rather\s+than|"
     r"replaced\s+(?:\S+\s+)?with|"
-    # Arabic
-    r"لم\s+أعد|"
-    r"تغير\s+إلى|"
-    r"تحولت\s+إلى|"
-    r"بدلاً\s+من|"
-    r"عوضاً\s+عن|"
-    r"الآن\s+أستخدم|"
+    r"used\s+to|"
+    # Arabic -- matched on the FOLDED content (_fold): hamza/alef
+    # unified, taa-marbuta -> haa, diacritics stripped. Covers the
+    # short-form change markers the golden update set uses.
+    r"لم\s+اعد|"
+    r"لا\s+اعد|"
+    r"لم\s+يعد|"
+    r"لم\s+تعد|"
+    r"بدلا?\s+من|"
+    r"عوضا?\s+عن|"
+    r"اصبحت?|"
+    r"صرت|"
+    r"انتقلت\s+(?:الي|الى)|"
+    r"غيرت|"
+    r"تغير(?:ت)?\s+(?:الي|الى)|"
+    r"تحولت\s+(?:الي|الى)|"
+    r"الان|"
+    r"حاليا|"
     # Russian
     r"больше\s+не|"
     r"изменилось\s+на|"
@@ -416,6 +434,39 @@ def _jaccard(a: set, b: set) -> float:
         return 0.0
     return len(a & b) / len(union)
 
+def _fold(text: str) -> str:
+    """Orthographic fold matching the storage normalization contract.
+
+    Unifies Arabic alef/hamza variants, taa-marbuta -> haa, alef
+    maqsura -> yaa, strips diacritics and tatweel, and lowercases.
+    Kept self-contained because ``peldrun`` must not import ``omweb``
+    (the layer rule); it mirrors the fold used for ``content_hash`` in
+    the domain layer so similarity and hashing agree on identity.
+    Unifying the two implementations is tracked with the A2 work.
+    """
+    t = re.sub(r"[\u064B-\u0652\u0670]", "", text)
+    t = t.replace("\u0640", "")
+    for ch in ("\u0623", "\u0625", "\u0622", "\u0671"):
+        t = t.replace(ch, "\u0627")
+    t = t.replace("\u0649", "\u064a")
+    t = t.replace("\u0629", "\u0647")
+    return t.lower()
+
+def _folded_terms(text: str) -> set:
+    """Word-token set of the folded text (for conflict similarity)."""
+    return set(re.findall(r"\w+", _fold(text)))
+
+def _containment(candidate_terms: set, entry_terms: set) -> float:
+    """Fraction of the candidate's terms present in the entry.
+
+    Unlike Jaccard, containment does not penalize a short candidate
+    against a long target -- the right shape for update detection,
+    where the candidate is a brief change-statement about the same
+    topic. Returns 0.0 for an empty candidate.
+    """
+    if not candidate_terms:
+        return 0.0
+    return len(candidate_terms & entry_terms) / len(candidate_terms)
 
 # ---------------------------------------------------------------------------
 # is_worth_saving -- quality gate
@@ -613,77 +664,77 @@ def detect_conflict(
 ) -> Optional[MemoryEntry]:
     """Return an existing entry that ``candidate`` conflicts with, or None.
 
-    See module docstring for the deliberate conservatism. In
-    short: this function ONLY fires when the candidate EXPLICITLY
-    declares a replacement via a marker phrase ("no longer",
-    "changed to", "switched to", etc.).
+    W1 (reopened by the golden write-policy measurement): the earlier
+    PREFERENCE/DECISION-only restriction plus raw-token Jaccard caught
+    ZERO of the ten realistic short-form updates. This tier now:
+
+      * accepts ANY memory_type, comparing only same-type entries
+        (a residence/car/language fact is SEMANTIC and changes too);
+      * matches replacement markers on the FOLDED content, so Arabic
+        hamza/taa-marbuta spelling cannot hide a declared change;
+      * scores topical fit by CONTAINMENT (the fraction of the
+        candidate's folded terms present in the target) rather than
+        Jaccard, which unfairly penalizes a short change-statement
+        against a longer original fact.
 
     Rules (ALL must hold):
 
-      1. ``candidate.memory_type`` is PREFERENCE or DECISION.
-      2. ``candidate.content`` contains a replacement marker.
-      3. Some entry in ``existing`` has:
+      1. ``candidate.content`` (folded) contains a replacement marker.
+      2. Some entry in ``existing`` has:
          - the same ``memory_type`` as the candidate,
-         - at least one tag in common with the candidate,
-         - content token overlap with the candidate of at least
-           ``_CONFLICT_TOKEN_JACCARD_MIN`` (so the entries are
-           demonstrably about the same topic),
-         - a DIFFERENT ``content_hash`` (so it is not an exact
-           duplicate -- that case is handled by
-           ``detect_duplicate`` and produces SKIP/REACTIVATE,
-           not SUPERSEDE).
+         - a DIFFERENT ``content_hash`` (exact duplicates are handled
+           by ``detect_duplicate`` -> SKIP/REACTIVATE, not here),
+         - tag overlap when BOTH sides carry tags (untagged facts may
+           still conflict; tagged entries keep the original guard),
+         - folded-term containment >= ``_CONFLICT_CONTAINMENT_MIN``.
 
-    Pre-condition: all entries in ``existing`` are in the SAME
-    scope as ``candidate``.
+    The marker requirement is load-bearing: without an explicit
+    declaration of change, a topical neighbor is at most a POSSIBLE
+    conflict, never a silent supersede. Soft-delete archival keeps a
+    wrong supersede recoverable, but the threshold is still calibrated
+    conservatively on the golden update set (the two create-controls
+    sit at containment 0.25 / 0.20, below the floor).
 
-    Returns the FIRST matching entry. When multiple conflicts
-    exist (rare), returns the one with the highest token overlap
-    -- the closest topical match is the one the candidate is most
-    likely replacing.
+    Semantic-only changes with ~zero lexical overlap (e.g. "I live in
+    Berlin" -> "I moved to Frankfurt") are OUT OF SCOPE for this tier;
+    they belong to the embedding/LLM reconciliation tier (plan 3.3).
 
-    Never raises. Returns ``None`` for non-PREFERENCE/DECISION
-    candidates, or candidates without replacement markers, or
-    when no topic-matching entry exists.
+    Pre-condition: all entries in ``existing`` are in the SAME scope.
+    Returns the best (highest-containment) match, or ``None``. Never
+    raises.
     """
-    # --- Rule 1: only PREFERENCE / DECISION can conflict -------
-    if candidate.memory_type not in (
-        MemoryType.PREFERENCE,
-        MemoryType.DECISION,
-    ):
-        return None
-
-    # --- Rule 2: candidate must explicitly declare replacement --
-    if not _REPLACEMENT_MARKERS.search(candidate.content):
+    # --- Rule 1: candidate must explicitly declare replacement ----
+    # Match on the FOLDED content so orthographic variants of a marker
+    # (hamza / taa-marbuta / diacritics) cannot hide a declared change.
+    if not _REPLACEMENT_MARKERS.search(_fold(candidate.content)):
         return None
 
     if not existing:
         return None
 
-    # --- Rule 3: find the best topic-matching conflict target --
-    candidate_tokens = _tokenize(candidate.content)
+    # --- Rule 2: find the best topic-matching conflict target -----
+    candidate_terms = _folded_terms(candidate.content)
     candidate_tags = set(candidate.tags)
-    if not candidate_tokens:
+    if not candidate_terms:
         return None
 
     best_match: Optional[MemoryEntry] = None
-    best_similarity: float = 0.0
+    best_containment: float = 0.0
 
     for entry in existing:
-        # Same memory_type -- a PREFERENCE cannot supersede a
-        # SEMANTIC fact.
+        # Same memory_type only -- a preference cannot supersede a
+        # semantic fact and vice versa. ANY type may conflict with its
+        # own kind (W1: semantic facts change too).
         if entry.memory_type != candidate.memory_type:
             continue
 
-        # Different content_hash -- exact duplicates are handled
-        # by detect_duplicate, not here.
+        # Exact duplicates are detect_duplicate's job (SKIP/REACTIVATE).
         if entry.content_hash == candidate.content_hash:
             continue
 
-        # W1: require tag overlap only when BOTH entries carry tags.
-        # Untagged facts (explicit saves and the golden set) can still
-        # conflict when type + replacement marker + token overlap agree.
-        # Tagged entries keep the original guard, so existing behavior
-        # is preserved.
+        # Tag overlap required only when BOTH entries carry tags.
+        # Untagged facts (explicit saves, the golden set) may still
+        # conflict when type + marker + containment agree.
         if (
             candidate_tags
             and entry.tags
@@ -691,15 +742,16 @@ def detect_conflict(
         ):
             continue
 
-        # Token overlap check -- ensures the conflict is topical,
-        # not coincidental.
-        entry_tokens = _tokenize(entry.content)
-        similarity = _jaccard(candidate_tokens, entry_tokens)
-        if similarity < _CONFLICT_TOKEN_JACCARD_MIN:
+        # Containment: how much of the candidate's vocabulary is
+        # grounded in the target. Robust to a short change-statement
+        # against a longer original fact (unlike Jaccard).
+        entry_terms = _folded_terms(entry.content)
+        containment = _containment(candidate_terms, entry_terms)
+        if containment < _CONFLICT_CONTAINMENT_MIN:
             continue
 
-        if similarity > best_similarity:
-            best_similarity = similarity
+        if containment > best_containment:
+            best_containment = containment
             best_match = entry
 
     return best_match

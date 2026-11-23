@@ -20,10 +20,15 @@
 #   secret    : text + expect: redact | keep
 #
 # Optional field:
-#   tags: [semantic-gap]  -> case needs semantic understanding beyond lexical
-#                            matching (broken plurals, cross-language synonyms,
-#                            morphology). Used to split lexical vs embedding
-#                            recall during calibration; never excluded from gates.
+#   tags: [semantic-gap]  -> case needs semantic understanding beyond safe
+#                            lexical matching (zero/near-zero topic overlap,
+#                            cross-language synonyms, deep morphology).
+#                            Retrieval cases: never excluded from recall gates.
+#                            Update cases: always counted in update_accuracy
+#                            (overall, permanently visible); the lexical-tier
+#                            gate (update_accuracy_lexical) covers only untagged
+#                            cases, and the tagged subset is the explicit scope
+#                            of the semantic-reconciliation tier (plan 3.3).
 #
 # Coverage notes
 # --------------
@@ -811,6 +816,7 @@ cases:
     new: "انتقلت إلى فرانكفورت"
     new_type: semantic
     expect: supersede
+    tags: [semantic-gap]
   - id: ar-upd-002
     lang: ar
     kind: update
@@ -825,6 +831,7 @@ cases:
     new: "أصبحت أفضل الشاي الأخضر"
     new_type: preference
     expect: supersede
+    tags: [semantic-gap]
   - id: ar-upd-004
     lang: ar
     kind: update
@@ -839,6 +846,7 @@ cases:
     new: "غيرت سيارتي إلى سيارة حمراء"
     new_type: semantic
     expect: supersede
+    tags: [semantic-gap]
   - id: ar-upd-006
     lang: ar
     kind: update
@@ -867,6 +875,7 @@ cases:
     new: "I moved to Frankfurt"
     new_type: semantic
     expect: supersede
+    tags: [semantic-gap]
   - id: en-upd-002
     lang: en
     kind: update

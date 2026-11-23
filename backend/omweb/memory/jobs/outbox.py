@@ -587,6 +587,112 @@ class MemoryOutbox:
             job_id, next_retry_at,
         )
 
+    async def defer(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        until: float,
+    ) -> None:
+        """Postpone a job WITHOUT counting a failed attempt (audit C4).
+
+        Used by the worker when the daily cost cap would be exceeded.
+        The distinction from ``retry()`` is load-bearing:
+
+          * ``retry()``  increments ``attempts`` -- a real failure.
+          * ``defer()``  leaves ``attempts`` UNCHANGED -- no work was
+            attempted, the budget simply was not available yet.
+
+        Incrementing here would silently kill jobs through
+        ``max_attempts`` after a few capped days, turning a budget
+        pause into permanent data loss.
+
+        Also releases the lease so ``recover_stale_leases`` does not
+        treat the paused job as a dead worker, and NEVER touches the
+        chat cursor (plan 19.3: only ``complete()`` advances it).
+
+        Parameters
+        ----------
+        job_id
+            The job to postpone. Must be non-terminal.
+        reason
+            Stable machine-readable code stored in ``error_code``
+            (e.g. ``"DAILY_COST_CAP"``). Cleared by ``requeue()``.
+        until
+            Epoch seconds at which the job becomes claimable again
+            (typically the next UTC midnight). Must be finite and
+            positive.
+
+        Raises
+        ------
+        JobNotFoundError
+            Unknown ``job_id``.
+        ValueError
+            Empty ``reason``, non-finite/non-positive ``until``, a
+            terminal job state, or a state change mid-operation.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("defer reason must be a non-empty string")
+        if not (0.0 < float(until) < float("inf")):
+            raise ValueError(
+                f"defer until must be a finite positive epoch time, "
+                f"got {until!r}"
+            )
+        async with self._lock:
+            await asyncio.to_thread(
+                self._defer_sync, job_id, reason.strip(), float(until)
+            )
+
+    def _defer_sync(
+        self, job_id: str, reason: str, until: float
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            row = conn.execute(
+                "SELECT status FROM memory_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(job_id)
+            current_status = row["status"]
+            if current_status not in (
+                "pending", "retry_pending", "running",
+            ):
+                raise ValueError(
+                    f"Cannot defer job {job_id!r}: current status is "
+                    f"{current_status!r}; only non-terminal jobs can "
+                    f"be deferred."
+                )
+            # WHERE repeats the status filter as a race guard, exactly
+            # like cancel_if_active: a concurrent transition surfaces
+            # as the same ValueError instead of a silent overwrite.
+            cur = conn.execute(
+                """
+                UPDATE memory_jobs
+                SET status = 'retry_pending',
+                    next_retry_at = ?,
+                    error_code = ?,
+                    error_message = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL
+                WHERE job_id = ?
+                  AND status IN (
+                      'pending', 'retry_pending', 'running'
+                  )
+                """,
+                (until, reason, f"Deferred: {reason}", job_id),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(
+                    f"Cannot defer job {job_id!r}: it changed state "
+                    f"during the operation; refresh and retry."
+                )
+        logger.info(
+            "Deferred memory job %s until %.0f (%s); attempts "
+            "unchanged, cursor untouched.",
+            job_id, until, reason,
+        )
+
     # ------------------------------------------------------------------
     # Manual requeue (UI retry of a failed / cancelled job)
     # ------------------------------------------------------------------
@@ -1315,6 +1421,64 @@ class MemoryOutbox:
             (status.value,),
         ).fetchone()
         return int(row[0]) if row else 0
+
+    async def sum_cost_nano_usd(self, *, since: float) -> int:
+        """Total recorded AI spend at or after ``since`` (epoch seconds).
+
+        Backs the daily cost cap (audit C4). Sums BOTH spend ledgers on
+        this database: extraction jobs (``memory_jobs``) and embedding
+        jobs (``memory_embedding_jobs``) -- the cap is an AI budget, not
+        an extraction-only budget.
+
+        Attribution is by ``completed_at``: a job that finishes today
+        spends today's budget, whenever it was enqueued.
+
+        Known limitation (documented, not silently ignored): only
+        COMPLETED attempts carry ``cost_nano_usd``; a failed call that
+        still billed tokens is not recorded by ``fail()``. The cap
+        therefore governs recorded spend. Closing that gap requires
+        recording cost on failure too -- a separate change.
+
+        Pre-v4 databases have no embedding table; the sum then covers
+        extraction only. Table presence is checked explicitly rather
+        than swallowing ``OperationalError``, so a real schema drift
+        still surfaces loudly.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sum_cost_nano_usd_sync, since
+            )
+
+    def _sum_cost_nano_usd_sync(self, since: float) -> int:
+        conn = self._require_conn()
+        cutoff = float(since)
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(cost_nano_usd), 0) AS total
+            FROM memory_jobs
+            WHERE completed_at IS NOT NULL
+              AND completed_at >= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        total = int(row["total"]) if row is not None else 0
+
+        has_embedding_table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'memory_embedding_jobs'"
+        ).fetchone()
+        if has_embedding_table is not None:
+            erow = conn.execute(
+                """
+                SELECT COALESCE(SUM(cost_nano_usd), 0) AS total
+                FROM memory_embedding_jobs
+                WHERE completed_at IS NOT NULL
+                  AND completed_at >= ?
+                """,
+                (cutoff,),
+            ).fetchone()
+            total += int(erow["total"]) if erow is not None else 0
+        return total
 
     async def get_cursor(self, chat_id: str) -> int:
         """Return the last_processed_turn_index for a chat (0 if none).

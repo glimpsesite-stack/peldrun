@@ -120,13 +120,15 @@ Design invariants
    or we would tear down state that other subsystems still
    depend on.
 
-3. **RRF scores are normalized to [0, 1].**
+3. **RRF decides ORDER; relevance stays ABSOLUTE.**
    The ranker downstream expects relevance in ``[0, 1]`` so
    ``min_relevance_score`` has a stable meaning across both
-   FTS and hybrid modes. Raw RRF scores are tiny (≈ 0.03 for a
-   rank-1 entry) and would fail every threshold. Normalizing
-   by the max score in the merged set maps the best match to
-   1.0 and preserves relative ordering.
+   FTS and hybrid modes. RRF scores are rank-only and are used
+   exclusively for ordering. The attached relevance is the max
+   of the absolute lexical coverage and the calibrated vector
+   cosine -- never the RRF score, never normalized against the
+   best candidate (audit R2). A weak best match stays weak and
+   can be rejected by the threshold.
 
 4. **No mutable state after construction.**
    Concurrent ``search_ranked`` calls are safe -- the class
@@ -152,8 +154,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
+from omweb.memory.storage.normalizer import QueryIntent, classify_query
 from peldrun.memory.domain import MemoryEntry, MemoryProvider
 from peldrun.memory.retrieval.vector_search import SqliteVecProvider
 
@@ -206,6 +210,35 @@ The FTS provider honors all three, so delegating to it keeps
 the caller's contract intact.
 """
 
+# ---------------------------------------------------------------------------
+# Absolute-score calibration (audit R2, hybrid site)
+# ---------------------------------------------------------------------------
+
+_PROVISIONAL_VEC_SCORE_FLOOR: float = 0.35
+_PROVISIONAL_VEC_SCORE_CEIL: float = 0.85
+"""PROVISIONAL cosine calibration bounds -- NOT yet measured.
+
+The repair plan (section 2.4) requires ``floor`` / ``ceil`` to be
+measured PER EMBEDDING MODEL on the golden set and stored in a model
+profile, because cosine ranges differ across models (some assign
+0.4-0.6 to unrelated pairs). Until that calibration lands, these
+defaults are a documented starting point for cosine-style models
+(e.g. bge-m3): similarities at or below ``floor`` carry no evidence
+(0.0), similarities at or above ``ceil`` are full evidence (1.0).
+``MemoryService`` should override them from the model profile or
+settings once available; the constructor accepts both values.
+"""
+
+
+def _clamp01(value: float) -> float:
+    """Clamp a score into the closed [0, 1] interval; NaN maps to 0.0."""
+    value = float(value)
+    if math.isnan(value) or value <= 0.0:
+        return 0.0
+    if value >= 1.0:
+        return 1.0
+    return value
+
 
 # ---------------------------------------------------------------------------
 # HybridMemoryProvider
@@ -238,6 +271,8 @@ class HybridMemoryProvider:
         graph_search: Optional[Any] = None,
         min_vector_similarity: float = 0.0,
         mode: str = "hybrid",
+        vec_score_floor: float = _PROVISIONAL_VEC_SCORE_FLOOR,
+        vec_score_ceil: float = _PROVISIONAL_VEC_SCORE_CEIL,
     ) -> None:
         """Construct the hybrid wrapper.
 
@@ -304,6 +339,23 @@ class HybridMemoryProvider:
         # was hardcoded to 0.0 (audit R4).
         self._min_vector_similarity: float = float(min_vector_similarity)
         self._mode: str = mode
+
+        # G2 (audit R2): cosine calibration bounds for the absolute
+        # relevance scale. ``floor`` maps to 0.0 (no evidence), ``ceil``
+        # maps to 1.0 (full evidence). Defaults are PROVISIONAL pending
+        # per-model measurement on the golden set (plan section 2.4).
+        if (
+            not math.isfinite(vec_score_floor)
+            or not math.isfinite(vec_score_ceil)
+            or vec_score_floor >= vec_score_ceil
+        ):
+            raise ValueError(
+                "vec_score_floor must be finite and strictly below "
+                f"vec_score_ceil, got floor={vec_score_floor!r}, "
+                f"ceil={vec_score_ceil!r}"
+            )
+        self._vec_score_floor: float = float(vec_score_floor)
+        self._vec_score_ceil: float = float(vec_score_ceil)
         #: Phase 5A: optional LLM-based reranker. ``None`` when
         #: disabled in settings or when no model is configured --
         #: in that case ``search_ranked`` skips the rerank step
@@ -490,9 +542,11 @@ class HybridMemoryProvider:
     ) -> List[Tuple[MemoryEntry, float]]:
         """Hybrid search returning ``(entry, relevance)`` pairs.
 
-        ``relevance`` is normalized to ``[0, 1]`` and reflects
-        RRF fusion -- see the module docstring for the formula
-        and the normalization rationale.
+        ``relevance`` is an ABSOLUTE score in ``[0, 1]``: RRF decides
+        the ordering only, while the attached value is the max of the
+        absolute lexical coverage and the calibrated vector cosine
+        (audit R2). It is never normalized against the best candidate,
+        so ``min_relevance_score`` can reject a weak best match.
 
         When the vector path is inapplicable (see
         ``_VEC_INCOMPATIBLE_FILTERS``) or fails, this method
@@ -523,6 +577,22 @@ class HybridMemoryProvider:
                 query, scope_refs, limit, **filters
             )
 
+        # G1 (audit R1, hybrid site): classify the query intent ONCE,
+        # before ANY source runs. Non-LOOKUP queries must never reach
+        # the vector backend, the graph, or the reranker:
+        #   * NO_INTENT ("thank you", social phrases) -> the FTS
+        #     provider returns zero matches (repository R1 contract).
+        #   * BLANK ("" / whitespace / punctuation) -> the FTS provider
+        #     returns the recency listing; the write pipeline's dedupe
+        #     pool (WritePipeline._fetch_existing_pool) relies on it.
+        # Delegating both cases to FTS preserves those contracts and
+        # skips the embedding HTTP call entirely (latency + cost win).
+        if classify_query(query) is not QueryIntent.LOOKUP:
+            self._last_search_mode = "fts"
+            return await self._fts_provider.search_ranked(
+                query, scope_refs, limit, **filters
+            )
+
         # R4/C2: retrieval.mode selects the strategy. ``lexical``
         # bypasses the vector source; ``vector`` bypasses FTS;
         # ``hybrid``/``automatic`` fuse both (automatic == hybrid here
@@ -539,7 +609,13 @@ class HybridMemoryProvider:
                     query=query, scope_refs=scope_refs, limit=limit,
                     min_similarity=self._min_vector_similarity,
                 )
-                return list(vec_only)
+                # G2: calibrate raw cosine onto the absolute [0, 1]
+                # scale so min_relevance_score stays meaningful in
+                # vector-only mode too.
+                return [
+                    (entry, self._calibrate_vector_score(score))
+                    for entry, score in vec_only
+                ]
             except Exception as exc:
                 logger.warning(
                     "Hybrid: vector-only search failed; falling back "
@@ -653,7 +729,12 @@ class HybridMemoryProvider:
             return fts_result
         if not fts_result and vec_result:
             self._last_search_mode = "vector"
-            return vec_result
+            # G2: the vector-only fallback must emit calibrated
+            # absolute scores, never raw cosine (audit R2).
+            return [
+                (entry, self._calibrate_vector_score(score))
+                for entry, score in vec_result
+            ]
         if not fts_result and not vec_result:
             # Both sides empty (either they had nothing, or
             # both raised and were reset to []). Report "fts"
@@ -777,71 +858,83 @@ class HybridMemoryProvider:
 
         return True
 
+    def _calibrate_vector_score(self, cosine: float) -> float:
+        """Map a raw cosine similarity onto the absolute [0, 1] scale.
+
+        Formula (plan section 2.4)::
+
+            calibrated = clamp((cos - floor) / (ceil - floor), 0, 1)
+
+        ``floor`` / ``ceil`` are per-model calibration bounds. The
+        constructor defaults are PROVISIONAL until measured on the
+        golden set; some models assign 0.4-0.6 cosine to unrelated
+        pairs, so raw cosine must never be used as relevance directly.
+        """
+        span = self._vec_score_ceil - self._vec_score_floor
+        return _clamp01((float(cosine) - self._vec_score_floor) / span)
+
     def _rrf_merge(
         self,
         fts_ranked: List[Tuple[MemoryEntry, float]],
         vec_ranked: List[Tuple[MemoryEntry, float]],
         limit: int,
     ) -> List[Tuple[MemoryEntry, float]]:
-        """Fuse two ranked lists using Reciprocal Rank Fusion.
+        """Fuse two ranked lists: RRF for ORDER, absolute scores for VALUE.
 
-        See the module docstring for the formula. The two input
-        lists MAY share entries; shared entries accumulate
-        contributions from both.
+        Ordering
+        --------
+        Reciprocal Rank Fusion accumulates ``1 / (k + rank)`` per
+        source (see module docstring). Shared entries accumulate a
+        consensus bonus. Ties break by ``memory_id`` ascending so two
+        identical searches return identical orderings (golden tests).
 
-        Normalization
-        -------------
-        Raw RRF scores are tiny (≈ 0.033 for rank 1 with k=60)
-        and not comparable to ``min_relevance_score`` (a
-        ``[0, 1]`` threshold in the memory settings). We
-        therefore normalize the top score to 1.0 -- a monotonic
-        transform that preserves ordering and gives the ranker a
-        usable threshold scale.
+        Relevance value (audit R2, hybrid site)
+        ---------------------------------------
+        The attached relevance is NEVER the RRF score and is NEVER
+        normalized against the best candidate. It is the maximum of:
 
-        Zero-max edge case
-        ------------------
-        If every score is exactly 0 (which cannot happen with
-        well-formed input -- rank 1 in either list yields a
-        positive contribution -- but which we guard anyway),
-        fall back to 1.0 for every entry so nothing gets
-        filtered out by the ranker. This is the correct
-        degradation: "the fusion produced something, the
-        downstream is free to accept it".
+          * the lexical score -- absolute weighted coverage in [0, 1]
+            per the repository R2 contract, defensively clamped;
+          * the vector cosine mapped through ``_calibrate_vector_score``.
+
+        This keeps ``min_relevance_score`` meaningful: a weak best
+        match stays weak and the downstream ranker can reject it.
         """
-        scores: Dict[str, float] = {}
+        rrf: Dict[str, float] = {}
         entries: Dict[str, MemoryEntry] = {}
+        relevance: Dict[str, float] = {}
         k = self._rrf_k
 
-        for rank, (entry, _sim) in enumerate(fts_ranked, start=1):
+        for rank, (entry, score) in enumerate(fts_ranked, start=1):
+            if entry is None or not entry.memory_id:
+                continue
             mid = entry.memory_id
-            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+            rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (k + rank)
             entries[mid] = entry
+            relevance[mid] = max(
+                relevance.get(mid, 0.0), _clamp01(score)
+            )
 
-        for rank, (entry, _sim) in enumerate(vec_ranked, start=1):
+        for rank, (entry, cosine) in enumerate(vec_ranked, start=1):
+            if entry is None or not entry.memory_id:
+                continue
             mid = entry.memory_id
-            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+            rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (k + rank)
             if mid not in entries:
                 entries[mid] = entry
+            relevance[mid] = max(
+                relevance.get(mid, 0.0),
+                self._calibrate_vector_score(cosine),
+            )
 
-        if not scores:
+        if not rrf:
             return []
 
-        # Sort all candidates by RRF score descending, cap to limit.
         ordered_ids = sorted(
-            scores.keys(),
-            key=lambda mid: scores[mid],
-            reverse=True,
+            rrf.keys(),
+            key=lambda mid: (-rrf[mid], mid),
         )[:limit]
-
-        # Normalize to [0, 1] -- see the docstring above.
-        max_score = scores[ordered_ids[0]]
-        if max_score <= 0.0:
-            return [(entries[mid], 1.0) for mid in ordered_ids]
-
-        return [
-            (entries[mid], scores[mid] / max_score)
-            for mid in ordered_ids
-        ]
+        return [(entries[mid], relevance[mid]) for mid in ordered_ids]
 
     # ------------------------------------------------------------------
     # Graph source (Phase 6B)
@@ -914,9 +1007,22 @@ class HybridMemoryProvider:
         scales (BM25, cosine, and distance-derived), so only their
         ORDER can be meaningfully combined.
         """
+        # G2: map every source onto the absolute [0, 1] scale BEFORE
+        # fusion. ``_rrf_merge_many`` expects pre-calibrated scores and
+        # never normalizes them itself.
+        #   * FTS    -> absolute lexical coverage (repository R2), clamped.
+        #   * Vector -> cosine calibrated through the model floor/ceil.
+        #   * Graph  -> distance-derived score; PROVISIONALLY clamped to
+        #     [0, 1] pending a measured mapping (plan section 16 lists
+        #     the graph layer as not yet evaluated).
+        fts_abs = [(e, _clamp01(s)) for e, s in fts_result]
+        vec_abs = [
+            (e, self._calibrate_vector_score(s)) for e, s in vec_result
+        ]
+        graph_abs = [(e, _clamp01(s)) for e, s in graph_hits]
         ranked_lists = [
             ranked
-            for ranked in (fts_result, vec_result, graph_hits)
+            for ranked in (fts_abs, vec_abs, graph_abs)
             if ranked
         ]
         fused = self._rrf_merge_many(ranked_lists, limit)
@@ -944,50 +1050,44 @@ class HybridMemoryProvider:
         ranked_lists: List[List[Tuple[MemoryEntry, float]]],
         limit: int,
     ) -> List[Tuple[MemoryEntry, float]]:
-        """Fuse N ranked lists with RRF, normalized to ``[0, 1]``.
+        """Fuse N ranked lists: RRF for ORDER, absolute scores for VALUE.
 
-        Generalizes :meth:`_rrf_merge` to any number of sources so
-        the 2-way (Phase 4) and 3-way (Phase 6) paths share one
-        formula. Entries present in several lists accumulate a
-        contribution from each -- the "consensus bonus" RRF relies
-        on, which is exactly what should happen when FTS, vector,
-        AND the graph all surface the same memory.
+        Generalizes :meth:`_rrf_merge` to any number of sources so the
+        2-way and 3-way (graph) paths share one formula. Entries present
+        in several lists accumulate a consensus bonus from each.
 
-        Ties break by ``memory_id`` ascending so two identical
-        searches return identical orderings (required for
-        reproducible retrieval and for golden tests).
+        Contract: every input score MUST already be an absolute [0, 1]
+        relevance (the caller calibrates each source before fusion).
+        The attached relevance is the MAX incoming score -- never the
+        RRF score, never normalized against the best candidate (audit
+        R2). Ties break by ``memory_id`` ascending for reproducible
+        orderings.
         """
-        scores: Dict[str, float] = {}
+        rrf: Dict[str, float] = {}
         entries: Dict[str, MemoryEntry] = {}
+        relevance: Dict[str, float] = {}
         k = self._rrf_k
 
         for ranked in ranked_lists:
-            for rank, (entry, _sim) in enumerate(ranked, start=1):
+            for rank, (entry, score) in enumerate(ranked, start=1):
                 if entry is None or not entry.memory_id:
                     continue
                 mid = entry.memory_id
-                scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+                rrf[mid] = rrf.get(mid, 0.0) + 1.0 / (k + rank)
                 if mid not in entries:
                     entries[mid] = entry
+                relevance[mid] = max(
+                    relevance.get(mid, 0.0), _clamp01(score)
+                )
 
-        if not scores:
+        if not rrf:
             return []
 
         ordered_ids = sorted(
-            scores.keys(),
-            key=lambda mid: (-scores[mid], mid),
+            rrf.keys(),
+            key=lambda mid: (-rrf[mid], mid),
         )[:limit]
-        if not ordered_ids:
-            return []
-
-        max_score = scores[ordered_ids[0]]
-        if max_score <= 0.0:
-            return [(entries[mid], 1.0) for mid in ordered_ids]
-
-        return [
-            (entries[mid], scores[mid] / max_score)
-            for mid in ordered_ids
-        ]
+        return [(entries[mid], relevance[mid]) for mid in ordered_ids]
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1029,6 +1129,16 @@ class HybridMemoryProvider:
     def mode(self) -> str:
         """The retrieval strategy in use (for diagnostics)."""
         return self._mode
+
+    @property
+    def vec_score_floor(self) -> float:
+        """Cosine calibration floor in use (settings contract)."""
+        return self._vec_score_floor
+
+    @property
+    def vec_score_ceil(self) -> float:
+        """Cosine calibration ceiling in use (settings contract)."""
+        return self._vec_score_ceil
 
     @property
     def fts_provider(self) -> MemoryProvider:

@@ -37,12 +37,13 @@ Design invariants
    agent runtime treats tool exceptions as run-fatal; the memory
    subsystem is an ENHANCEMENT and must never abort a run.
 
-5. **Write policy applied inline.**
+5. **Write policy executed through the shared path (W3).**
    The tool uses ``decide_write_action`` (P1.4) to determine
-   CREATE / SKIP / SUPERSEDE / REACTIVATE. This is the SAME
-   policy the future ``WritePipeline`` (P1.7) will use -- the
-   two implementations share the decision function so their
-   behavior cannot diverge.
+   CREATE / SKIP / SUPERSEDE / REACTIVATE, then executes the
+   decision through ``write_service.execute_decision`` -- the
+   SAME single entrypoint used by ``MemoryWritePipeline`` and
+   the import adapter, so the three write callers cannot
+   diverge.
 
 6. **Scope resolution is explicit-or-context.**
    Callers either pass ``scope_type`` + ``scope_id`` directly
@@ -371,14 +372,13 @@ class MemorySaveTool:
         # to detect duplicates (a re-save of a recent entry) and
         # conflicts (a replacement marker against a recent fact).
         #
-        # ``default_limit`` is used as the scan cap. The default
-        # (5) is small but the plan's policy functions were
-        # designed for this -- they check exact hash, then
-        # near-duplicate Jaccard, then conflict markers. A larger
-        # scan cap would improve conflict detection on very
-        # active scopes, but the write path would pay the cost
-        # on every save. The trade-off is documented and can be
-        # tuned via ``default_limit`` in settings.
+        # The scan cap is the shared ``WRITE_DEDUPE_SCAN_LIMIT``
+        # (500) -- the single source of truth for EVERY write path
+        # (audit W3). Scanning only ``default_limit`` (5) was the
+        # W3 defect: a re-save of an older fact looked new because
+        # the duplicate sat outside the five most recent entries.
+        # The policy checks exact hash, then near-duplicate
+        # Jaccard, then conflict markers against this pool.
         try:
             existing = await self._port.search(
                 query="",
@@ -540,8 +540,8 @@ class MemorySaveTool:
     ) -> Dict[str, Any]:
         """Execute via the shared write path (W3), map to the tool dict.
 
-        The legacy inline ``_execute_decision`` below is retained only
-        until the W3 cleanup step deletes it; every call now goes here.
+        The legacy inline executor was removed in the W3 cleanup;
+        this is the tool's ONLY execution path.
         """
         result = await execute_decision(self._port, decision, scope_ref)
         if result.action == WriteAction.CREATE:
@@ -581,175 +581,6 @@ class MemorySaveTool:
             "status": "reactivated",
             "memory_id": result.memory.memory_id,
             "reason": result.reason,
-        }
-
-    async def _execute_decision(
-        self,
-        decision: Any,  # WriteDecision (avoid import-time circular risk)
-        scope_ref: str,
-    ) -> Dict[str, Any]:
-        """Apply the ``WriteDecision`` to the backend.
-
-        Dispatches on ``decision.action`` and returns the
-        structured result for each branch. Exceptions from the
-        port propagate to ``execute``'s caller, which translates
-        them into structured errors.
-
-        Parameters
-        ----------
-        decision
-            The ``WriteDecision`` returned by
-            ``decide_write_action``. Typed as ``Any`` to avoid
-            importing ``WriteDecision`` at module scope -- the
-            import is only needed for the ``isinstance`` check
-            below, which is defensive and can be skipped.
-        scope_ref
-            The canonical scope reference string, used for the
-            ``delete`` call in the SUPERSEDE branch.
-        """
-        # CREATE -- straightforward new entry.
-        if decision.action == WriteAction.CREATE:
-            created = await self._port.create(decision.candidate)
-            logger.info(
-                "MemorySaveTool created %s in scope %s "
-                "(type=%s, importance=%d).",
-                created.memory_id,
-                scope_ref,
-                created.memory_type.value,
-                created.importance,
-            )
-            return {
-                "status": "created",
-                "memory_id": created.memory_id,
-                "scope": scope_ref,
-                "memory_type": created.memory_type.value,
-            }
-
-        # SKIP -- the exact/near duplicate already exists as ACTIVE.
-        if decision.action == WriteAction.SKIP:
-            target = decision.target_entry
-            logger.debug(
-                "MemorySaveTool skipped duplicate %s in scope %s.",
-                target.memory_id if target else "<unknown>",
-                scope_ref,
-            )
-            return {
-                "status": "skipped",
-                "existing_id": target.memory_id if target else None,
-                "reason": decision.reason,
-            }
-
-        # SUPERSEDE -- archive the old entry, create the new one.
-        #
-        # Order matters: archive FIRST, then create. If the
-        # create fails (UNIQUE constraint race, disk full), the
-        # old entry is already archived and the caller sees an
-        # error -- but the new entry is not partially written.
-        # The reverse order would leave BOTH entries active if
-        # the archive failed after a successful create, which is
-        # worse (double-retrieval of contradictory facts).
-        if decision.action == WriteAction.SUPERSEDE:
-            target = decision.target_entry
-            if target is None:
-                # Should never happen -- SUPERSEDE always carries
-                # a target. Defensive: fall back to a plain CREATE
-                # rather than crash.
-                logger.warning(
-                    "MemorySaveTool: SUPERSEDE decision without "
-                    "target_entry; falling back to CREATE."
-                )
-                created = await self._port.create(decision.candidate)
-                return {
-                    "status": "created",
-                    "memory_id": created.memory_id,
-                    "scope": scope_ref,
-                    "memory_type": created.memory_type.value,
-                }
-
-            # Archive the old entry. ``delete`` is soft-delete
-            # (status=archived) for the SQLite provider. A
-            # provider that hard-deletes would break the audit
-            # trail -- the plan's write policy assumes soft
-            # delete, so a future provider MUST match that.
-            await self._port.delete(target.memory_id, scope_ref)
-
-            # Create the replacement.
-            created = await self._port.create(decision.candidate)
-            logger.info(
-                "MemorySaveTool superseded %s with %s in scope %s.",
-                target.memory_id,
-                created.memory_id,
-                scope_ref,
-            )
-            return {
-                "status": "superseded",
-                "memory_id": created.memory_id,
-                "replaced_id": target.memory_id,
-                "reason": decision.reason,
-            }
-
-        # REACTIVATE -- the target is archived or superseded and
-        # the user is re-asserting. Update the existing row in
-        # place (preserving memory_id, created_at) rather than
-        # deleting and creating a new one. This keeps the entry's
-        # history contiguous in the audit log.
-        if decision.action == WriteAction.REACTIVATE:
-            target = decision.target_entry
-            if target is None:
-                logger.warning(
-                    "MemorySaveTool: REACTIVATE decision without "
-                    "target_entry; falling back to CREATE."
-                )
-                created = await self._port.create(decision.candidate)
-                return {
-                    "status": "created",
-                    "memory_id": created.memory_id,
-                    "scope": scope_ref,
-                    "memory_type": created.memory_type.value,
-                }
-
-            # Build the revived entry: same memory_id / created_at,
-            # but with the candidate's content, metadata, and an
-            # ACTIVE status. The ``model_copy`` preserves every
-            # field we do not explicitly override, including
-            # ``provenance`` from the original save. We DO update
-            # ``provenance.source_chat_id`` to reflect this
-            # reactivation -- the audit log should show "this was
-            # revived in chat X" not just "created in chat Y".
-            revived = target.model_copy(
-                update={
-                    "status": MemoryStatus.ACTIVE,
-                    "content": decision.candidate.content,
-                    "normalized_content": decision.candidate.normalized_content,
-                    "content_hash": decision.candidate.content_hash,
-                    "importance": decision.candidate.importance,
-                    "tags": decision.candidate.tags,
-                    "provenance": decision.candidate.provenance,
-                }
-            )
-            updated = await self._port.update(revived)
-            logger.info(
-                "MemorySaveTool reactivated %s in scope %s.",
-                updated.memory_id,
-                scope_ref,
-            )
-            return {
-                "status": "reactivated",
-                "memory_id": updated.memory_id,
-                "reason": decision.reason,
-            }
-
-        # Unreachable -- WriteAction has exactly four members and
-        # all four are handled above. Defensive fallback so a
-        # future fifth action does not silently return None.
-        logger.error(
-            "MemorySaveTool: unknown WriteAction %r; cannot execute.",
-            decision.action,
-        )
-        return {
-            "status": "error",
-            "error": f"Unknown write action: {decision.action!r}",
-            "code": "internal_error",
         }
 
 
