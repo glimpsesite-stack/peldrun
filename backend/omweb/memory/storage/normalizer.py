@@ -80,20 +80,24 @@ Design invariants
    the entry-creation contract.
 
 5. **Composable language steps.**
-   Arabic, Russian, and English normalization are separate
-   functions (``_normalize_arabic``, ``_normalize_russian``).
-   Adding a fourth language (e.g. Turkish dotless i) is a new
-   function plus one line in ``_normalize_for_storage_impl`` --
-   no changes to the callers or the pipeline structure.
+   Each language lives in its own file under ``languages/`` as a
+   ``LanguageProfile`` (``arabic.py``, ``russian.py``,
+   ``english.py``). The pipeline in ``_normalize_for_storage_impl``
+   iterates over the discovered ``PROFILES`` tuple -- adding a
+   fourth language (e.g. Turkish) is a new
+   ``languages/turkish.py`` file exposing a ``PROFILE`` instance.
+   No change to ``normalizer.py`` is required.
 
-6. **Pure stdlib.**
-   Imports only ``re`` and ``typing``. No external
-   normalization libraries (``unicodedata2``, ``PyICU``,
-   ``camel-tools``). This keeps the storage layer lightweight
-   and deployable without system dependencies, at the cost of
-   not handling exotic scripts (Hebrew niqqud, Devanagari
-   matras) -- acceptable because those scripts are not target
-   languages for the current phase.
+6. **Pure stdlib (plus local subpackage).**
+   Imports only ``re``, ``typing``, ``enum``, and the sibling
+   ``.languages`` package. The latter itself imports only stdlib
+   (``re``, ``typing``, ``abc``, ``importlib``, ``pkgutil``). No
+   external normalization libraries (``unicodedata2``,
+   ``PyICU``, ``camel-tools``). This keeps the storage layer
+   lightweight and deployable without system dependencies, at
+   the cost of not handling exotic scripts (Hebrew niqqud,
+   Devanagari matras) -- acceptable because those scripts are
+   not target languages for the current phase.
 
 Normalization specification (per language)
 ------------------------------------------
@@ -166,164 +170,19 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Dict, Final, Mapping
+from typing import Final
 
-
-# ---------------------------------------------------------------------------
-# Arabic
-# ---------------------------------------------------------------------------
-
-
-#: Combining marks that must be stripped from Arabic text before
-#: indexing. The ranges below cover:
-#:
-#:   U+064B-U+065F  -- tanwin + harakat + shadda + sukun + hamza above
-#:   U+0670         -- superscript alef (dagger alef)
-#:   U+06D6-U+06DC  -- Quranic annotation marks (small high signs)
-#:   U+06DF-U+06E4  -- Quranic annotation marks (small wavy signs)
-#:   U+06E7-U+06E8  -- Quranic annotation marks (small high yeh/noon)
-#:   U+06EA-U+06ED  -- Quranic annotation marks (empty centre dots)
-#:
-#: Everything in these ranges is a NON-LETTER, NON-SEMANTIC mark
-#: that carries pronunciation or recitation guidance. Removing
-#: them is always safe for search purposes.
-_ARABIC_DIACRITICS: Final[re.Pattern[str]] = re.compile(
-    r"[\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]"
-)
-
-#: Tatweel (kashida) is a horizontal line used ONLY for
-#: justification in Arabic typography. It has zero semantic
-#: content; removing it lets "مــحمد" and "محمد" match.
-_ARABIC_TATWEEL: Final[re.Pattern[str]] = re.compile(r"\u0640")
-
-#: Alef variants. Every form below is the same letter "alef"
-#: with a different hamza / wasla decoration. Arabic input
-#: methods produce different variants for the same sound, and
-#: users are not consistent about which they type.
-#:
-#: U+0622 -> U+0627  (آ  alef with madda)
-#: U+0623 -> U+0627  (أ  alef with hamza above)
-#: U+0625 -> U+0627  (إ  alef with hamza below)
-#: U+0671 -> U+0627  (ٱ  alef with wasla)
-_ARABIC_ALEF_MAP: Final[Mapping[int, int]] = str.maketrans(
-    {
-        "\u0622": "\u0627",
-        "\u0623": "\u0627",
-        "\u0625": "\u0627",
-        "\u0671": "\u0627",
-    }
-)
-
-#: Alef maqsura -> yaa. Both represent the same phoneme
-#: /aː/ at the end of a word; Egyptian / dialect speakers use
-#: the two interchangeably when typing.
-_ARABIC_YAA_MAP: Final[Mapping[int, int]] = str.maketrans(
-    {
-        "\u0649": "\u064A",
-    }
-)
-
-#: Hamza carriers -> the plain letter. On waw and yaa, the hamza
-#: is decorative; the letter itself is what carries the
-#: phonemic value.
-_ARABIC_HAMZA_MAP: Final[Mapping[int, int]] = str.maketrans(
-    {
-        "\u0624": "\u0648",  # ؤ -> و
-        "\u0626": "\u064A",  # ئ -> ي
-    }
+from .languages import (
+    PROFILES,
+    by_code,
+    normalize_common,
 )
 
 
-def _normalize_arabic(text: str) -> str:
-    """Apply Arabic-specific normalization steps.
-
-    Idempotent: applying twice yields the same result as applying
-    once, because every step removes or replaces characters with
-    targets that are not themselves sources of any step.
-
-    Empty input passes through unchanged.
-    """
-    if not text:
-        return text
-    text = _ARABIC_TATWEEL.sub("", text)
-    text = _ARABIC_DIACRITICS.sub("", text)
-    text = text.translate(_ARABIC_ALEF_MAP)
-    text = text.translate(_ARABIC_YAA_MAP)
-    text = text.translate(_ARABIC_HAMZA_MAP)
-    return text
-
-
 # ---------------------------------------------------------------------------
-# Russian / Cyrillic
+# Pipeline implementation
 # ---------------------------------------------------------------------------
 
-
-#: ``ё`` -> ``е``. Handles both cases explicitly:
-#:
-#:   U+0401 (Ё uppercase) -> U+0415 (Е uppercase)
-#:   U+0451 (ё lowercase) -> U+0435 (е lowercase)
-#:
-#: We map both cases (rather than only the lowercase form)
-#: because the common pipeline applies ``.lower()`` AFTER the
-#: Russian step. Mapping uppercase to uppercase keeps the
-#: pipeline order-independent and easier to reason about.
-_RUSSIAN_MAP: Final[Mapping[int, int]] = str.maketrans(
-    {
-        "\u0401": "\u0415",  # Ё -> Е
-        "\u0451": "\u0435",  # ё -> е
-    }
-)
-
-
-def _normalize_russian(text: str) -> str:
-    """Apply Russian-specific normalization steps.
-
-    Idempotent: ``ё`` and ``Ё`` map to ``е`` and ``Е``, which are
-    not themselves sources of any mapping. Empty input passes
-    through unchanged.
-    """
-    if not text:
-        return text
-    return text.translate(_RUSSIAN_MAP)
-
-
-# ---------------------------------------------------------------------------
-# Language-agnostic pipeline
-# ---------------------------------------------------------------------------
-
-
-#: Invisible / formatting characters that often sneak into text
-#: from copy-paste operations and cause search mismatches with no
-#: visible cause. Removing all of them is universally safe --
-#: they carry zero semantic content in any target language.
-#:
-#:   U+00AD  soft hyphen (invisible in most editors)
-#:   U+200B  zero-width space
-#:   U+200C  zero-width non-joiner
-#:   U+200D  zero-width joiner
-#:   U+200E  left-to-right mark
-#:   U+200F  right-to-left mark
-#:   U+202A  left-to-right embedding
-#:   U+202B  right-to-left embedding
-#:   U+202C  pop directional formatting
-#:   U+202D  left-to-right override
-#:   U+202E  right-to-left override
-#:   U+2060  word joiner
-#:   U+FEFF  zero-width no-break space / BOM
-_INVISIBLE_CHARS: Final[re.Pattern[str]] = re.compile(
-    r"[\u00AD\u200B-\u200F\u202A-\u202E\u2060\uFEFF]"
-)
-
-#: Non-breaking space. Common in Arabic (justified text) and
-#: Russian (typography conventions). Folded to regular space so
-#: that FTS5's whitespace tokenization sees it consistently.
-_NBSP: Final[str] = "\u00A0"
-
-#: Any run of whitespace. Collapsed to a single space. The
-#: pattern uses ``\s`` which in Python 3 (Unicode mode) matches
-#: every whitespace character including tabs, newlines, form
-#: feeds, vertical tabs, and Unicode space separators.
-_WHITESPACE_RUN: Final[re.Pattern[str]] = re.compile(r"\s+")
 
 #: Word-character pattern for query tokenization. ``\w`` in
 #: Python 3 Unicode mode matches Latin letters, Cyrillic,
@@ -332,53 +191,43 @@ _WHITESPACE_RUN: Final[re.Pattern[str]] = re.compile(r"\s+")
 #: tokenizer would produce as tokens. No apostrophes, quotes,
 #: or operator characters can leak through, so the result is
 #: safe to pass directly to ``MATCH``.
+#:
+#: Kept here (rather than moved to ``languages/common.py``):
+#: this pattern is consumed directly by ``normalize_query`` below,
+#: which is the only caller and is defined in this same module.
+#: Moving it would force a circular import back from
+#: ``languages.common`` into the storage layer for a value that
+#: is not language-specific and has no user-facing invariant.
 _WORD_TOKEN: Final[re.Pattern[str]] = re.compile(r"\w+")
 
 
-def _normalize_common(text: str) -> str:
-    """Apply language-agnostic normalization steps.
-
-    Order matters within this function:
-
-      1. Remove invisible characters -- BEFORE casefolding, so
-         that ``.lower()`` sees exactly the visible characters.
-      2. Replace NBSP -- BEFORE whitespace collapsing, otherwise
-         the NBSP would not be recognized as a collapsible space.
-      3. Casefold -- AFTER language-specific steps in the caller,
-         so that, e.g., uppercase Cyrillic ``Ё`` has already been
-         mapped to ``Е`` by ``_normalize_russian`` before this
-         function lowercases it.
-      4. Collapse whitespace -- AFTER casefolding, so that any
-         whitespace introduced by casefolding (rare but
-         theoretically possible for some scripts) is caught.
-      5. Strip leading / trailing whitespace -- AFTER collapsing,
-         because collapsing can leave a leading or trailing
-         space in edge cases.
-
-    Empty input passes through unchanged.
-    """
-    if not text:
-        return text
-    text = _INVISIBLE_CHARS.sub("", text)
-    text = text.replace(_NBSP, " ")
-    text = text.lower()
-    text = _WHITESPACE_RUN.sub(" ", text)
-    return text.strip()
-
-
 def _normalize_for_storage_impl(text: str) -> str:
-    """Private implementation of the storage-normalization pipeline.
+    """Run every discovered language profile, then the shared tail.
 
-    Splitting the "check input is non-empty, run pipeline, apply
-    fallback" from the "run the pipeline" is deliberate -- it
-    makes each piece trivial to test and reason about in
-    isolation, and makes the fallback logic easy to verify in
-    unit tests.
+    Iteration order is ``PROFILES``'s discovery order (``priority``
+    then ``code`` -- see ``languages/__init__.py``). The
+    language-specific ``normalize()`` methods run BEFORE the
+    casefold step delegated to ``languages.common.normalize_common``,
+    which is what preserves the original pre-refactor ordering
+    guarantee: uppercase Cyrillic ``Ё`` is first mapped to ``Е`` by
+    the Russian profile, then lowercased consistently with other
+    Cyrillic by the common step.
+
+    Adding a fourth language is now a new file under
+    ``languages/`` -- this function does not change. See
+    ``languages/_base.py`` for the discovery contract and
+    priority bands.
+
+    Idempotent by composition: each profile's ``normalize`` is
+    idempotent (argued in its own docstring) and
+    ``normalize_common`` is idempotent (argued in its own
+    docstring), and the composition of idempotent functions that
+    operate on disjoint aspects of the input is itself idempotent.
     """
-    result = _normalize_arabic(text)
-    result = _normalize_russian(result)
-    result = _normalize_common(result)
-    return result
+    result = text
+    for profile in PROFILES:
+        result = profile.normalize(result)
+    return normalize_common(result)
 
 
 # ---------------------------------------------------------------------------
@@ -548,174 +397,76 @@ def normalize_query(text: str, *, match: str = "all") -> str:
     return _build_any_expression(tokens)
 
 
-#: Arabic article / preposition+article prefixes used to emit extra
-#: query-token variants in ``match="any"`` mode.
-#:
-#: Why this exists: FTS5's ``unicode61`` tokenizer does not segment
-#: Arabic clitics, so ``بالقهوه`` is ONE token, completely different
-#: from the stored ``القهوه``. Without variants, an Arabic question
-#: containing an attached preposition matches nothing at all even
-#: though the fact is stored.
-#:
-#: Deliberately limited to article and preposition+article forms.
-#: Bare single-letter clitics (ب، ل، ك، ف، و) are NOT stripped: that
-#: would turn ``كود`` into ``ود`` and manufacture false matches for a
-#: one-letter gain. The original token is always emitted too, so
-#: recall can only grow.
-_ARABIC_QUERY_PREFIXES: Final[tuple[str, ...]] = (
-    "بال",
-    "كال",
-    "فال",
-    "وال",
-    "لل",
-    "ال",
-)
+# ---------------------------------------------------------------------------
+# Query construction
+# ---------------------------------------------------------------------------
+
 
 #: Minimum token length for a wildcard variant to be emitted.
-#: One-character tokens ("i", "a", "و") would expand to ``i*`` / ``a*``
-#: and match almost every document, drowning BM25 in noise.
+#: One-character tokens ("i", "a", Arabic "wa") would expand to
+#: ``i*`` / ``a*`` and match almost every document, drowning BM25
+#: in noise.
 _MIN_WILDCARD_TOKEN_CHARS: Final[int] = 2
 
-#: Function words that must NOT become OR terms in ``match="any"`` mode.
+
+#: Function words that must NOT become OR terms in ``match="any"``
+#: mode. Assembled from every discovered language profile's
+#: ``stopwords()`` hook.
 #:
-#: Why: OR-ing every token means a single common word drags in the
-#: whole memory store. Measured on a real 13-memory database:
+#: The rationale that used to accompany the hard-coded English +
+#: Arabic list now lives on the profiles themselves -- see
+#: ``languages/english.py`` and ``languages/arabic.py`` for the
+#: full explanation and the measured noise examples.
 #:
-#:   "ok i will see you next time"  -> 5/13 memories matched
-#:   "do you know me"               -> 0  (but "you"/"me"/"do" alone
-#:                                          match whenever any memory
-#:                                          contains "you")
+#: Why dynamic: adding a language (Turkish, Persian, Urdu) must
+#: not require editing this file. The set is the union of every
+#: profile's stopwords, so a new ``languages/<lang>.py`` with a
+#: ``stopwords()`` override automatically participates.
 #:
-#: The first query is a farewell, not a memory request. Matching 5
-#: memories on the strength of "i" and "you" is not recall, it is
-#: noise that then gets injected into the prompt as if it were
-#: relevant -- the "memories have nothing to do with the context"
-#: complaint.
-#:
-#: Kept deliberately small: only words that carry no retrieval signal.
-#: A token is dropped ONLY when at least one other non-stopword token
-#: survives, so a query consisting solely of function words yields an
-#: empty expression -> zero matches -> nothing injected. That is the
-#: correct outcome for "thank you".
-_QUERY_STOPWORDS: frozenset = frozenset(
-    {
-        # English
-        "a", "an", "the", "and", "or", "but", "if", "of", "to", "in",
-        "on", "at", "for", "with", "from", "by", "as", "is", "are",
-        "was", "were", "be", "been", "am", "do", "does", "did", "will",
-        "would", "can", "could", "should", "shall", "may", "might",
-        "i", "me", "my", "mine", "you", "your", "yours", "he", "she",
-        "it", "we", "us", "they", "them", "this", "that", "these",
-        "those", "there", "here", "what", "who", "whom", "which",
-        "when", "where", "why", "how", "yes", "ok", "okay", "hi",
-        "hello", "hey", "thanks", "thank", "please", "so", "not",
-        "no", "just", "very", "too", "also", "about", "any", "all",
-        "some", "more", "most", "such", "than", "then", "now",
-        # Arabic
-        "في", "من", "الى", "على", "عن", "مع", "هو", "هي", "هم",
-        "انا", "انت", "نحن", "ما", "هل", "لا", "نعم", "و", "او",
-        "ثم", "قد", "كان", "كانت", "هذا", "هذه", "ذلك", "تلك",
-        "التي", "الذي", "يا", "مرحبا", "شكرا", "من فضلك",
-    }
+#: Why ``Final``: the set must not be rebound at runtime. A
+#: monkeypatched stopword set would silently change which queries
+#: return zero results -- a bug that is very hard to trace.
+_QUERY_STOPWORDS: Final[frozenset[str]] = frozenset().union(
+    *(profile.stopwords() for profile in PROFILES)
 )
 
-# L1/R3: extend Arabic function-word coverage and drop the dead
-# multi-word entry. A phrase containing a space can never equal a
-# single \w+ token, so "min fadlik" was dead weight (audit L1).
-# New entries use \uXXXX escapes to keep this source diff ASCII.
-_AR_EXTRA_STOPWORDS: Final[frozenset] = frozenset(
-    {
-        "\u0645\u0627\u0630\u0627",
-        "\u0643\u064a\u0641",
-        "\u0644\u0645\u0627\u0630\u0627",
-        "\u0627\u064a\u0646",
-        "\u0645\u062a\u0649",
-        "\u0627\u0646",
-        "\u0644\u0643",
-        "\u0644\u064a",
-        "\u0628\u0643",
-        "\u062c\u062f\u0627",
-        "\u0627\u064a\u0636\u0627",
-        "\u0647\u0646\u0627\u0643",
-        "\u0647\u0646\u0627",
-        "\u0639\u0646\u062f",
-        "\u0627\u0630\u0627",
-        "\u0644\u0645",
-        "\u0644\u0646",
-        "\u0644\u064a\u0633",
-        "\u0644\u0643\u0646",
-    }
-)
-_QUERY_STOPWORDS = frozenset(
-    (set(_QUERY_STOPWORDS) | _AR_EXTRA_STOPWORDS)
-    - {"\u0645\u0646 \u0641\u0636\u0644\u0643"}
-)
 
-#: Single-letter Arabic clitics that may precede the definite article
-#: (ب + ال = بال, ك + ال = كال, ...). Used ONLY to recognise and strip
-#: the clitic when the article follows it -- never as a standalone
-#: strip, which would turn ``كود`` into ``ود``.
-_SINGLE_CLITICS: Final[tuple[str, ...]] = ("ب", "ك", "ف", "و", "ل")
-
-_ARABIC_DEFINITE_ARTICLE: Final[str] = "ال"
-
-
-def _arabic_variants(token: str) -> List[str]:
+def _arabic_variants(token: str) -> list[str]:
     """Return the token plus its Arabic prefix-stripped variants.
 
-    ``بالقهوه`` yields THREE forms, and the middle one is the whole
-    point::
+    Thin wrapper around ``ArabicProfile.query_variants`` -- the
+    algorithm itself lives in ``languages/arabic.py``. This
+    wrapper exists for two reasons:
 
-        بالقهوه   (as typed)
-        القهوه    (clitic ب stripped, article kept)  <-- matches storage
-        قهوه      (article stripped too)
+    1. **Original-token-first contract.** ``query_variants``
+       returns only the *extra* forms (the base-class contract
+       says so, so callers can prepend the token once and union
+       across profiles). ``_build_any_expression`` needs the
+       token FIRST in the OR expression for stable BM25 ranking,
+       so this wrapper does the prepending in one place.
 
-    Without the middle form the query could never reach a memory that
-    stores the bare article form ``القهوه``, because FTS5's prefix
-    wildcard only extends the END of a token: ``قهوه*`` does not match
-    ``القهوه``.
+    2. **Graceful degradation.** If the Arabic profile is ever
+       removed from the discovered set (e.g. a minimal
+       deployment that ships only English), this function falls
+       back to ``[token]`` instead of raising. Search still
+       works, just without Arabic prefix expansion.
 
-    The original token is always first, so recall can only grow.
+    Behaviour is byte-for-byte identical to the pre-refactor
+    ``_arabic_variants`` for every input.
     """
-    out: List[str] = [token]
-
-    # 1. Longest multi-character prefix (بال، كال، فال، وال، لل، ال).
-    for prefix in _ARABIC_QUERY_PREFIXES:
-        if token.startswith(prefix) and len(token) > len(prefix):
-            out.append(token[len(prefix):])
-            break
-
-    # 2. Single clitic followed by the article: strip the clitic only.
-    if (
-        len(token) > len(_ARABIC_DEFINITE_ARTICLE) + 1
-        and token[0] in _SINGLE_CLITICS
-        and token[1:3] == _ARABIC_DEFINITE_ARTICLE
-    ):
-        out.append(token[1:])
-
-    # 3. Peel a leading article off every form produced so far.
-    for candidate in list(out):
-        if (
-            candidate.startswith(_ARABIC_DEFINITE_ARTICLE)
-            and len(candidate) > len(_ARABIC_DEFINITE_ARTICLE)
-        ):
-            out.append(candidate[len(_ARABIC_DEFINITE_ARTICLE):])
-
-    deduped: List[str] = []
-    seen: set = set()
-    for form in out:
-        if form and form not in seen:
-            seen.add(form)
-            deduped.append(form)
-    return deduped
+    profile = by_code("ar")
+    if profile is None:
+        return [token]
+    return [token, *profile.query_variants(token)]
 
 
 def _build_any_expression(tokens: list[str]) -> str:
     """Build an ``a* OR b* OR ...`` MATCH expression.
 
     Each token contributes a prefix wildcard (so ``coffee`` also
-    matches ``coffees``, and ``القهو*`` matches ``القهوه``), plus one
-    variant with any Arabic article prefix removed.
+    matches ``coffees``, and Arabic ``al-qahwa*`` matches
+    ``al-qahwa``), plus one variant with any Arabic article prefix
+    removed (via ``_arabic_variants``).
 
     Safety
     ------
@@ -723,9 +474,17 @@ def _build_any_expression(tokens: list[str]) -> str:
     cannot contain quotes, parentheses, ``*``, or uppercase FTS
     keywords. The only operator text emitted here is the ``OR``
     joiner and the per-token ``*``.
+
+    Ordering
+    --------
+    For each content token, the original token comes first followed
+    by its Arabic variants. This ordering is preserved from the
+    pre-refactor version -- BM25's OR-term scoring is order
+    sensitive, and changing it would shift scores on existing
+    content.
     """
-    terms: List[str] = []
-    seen: set = set()
+    terms: list[str] = []
+    seen: set[str] = set()
 
     def _emit(term: str) -> None:
         if len(term) < _MIN_WILDCARD_TOKEN_CHARS:
@@ -738,8 +497,8 @@ def _build_any_expression(tokens: list[str]) -> str:
     # Drop function words, but ONLY when a content word survives.
     # A query made entirely of function words ("thank you") must
     # produce an EMPTY expression -- zero matches -- so nothing is
-    # injected. Falling back to "keep them anyway" would restore the
-    # exact noise this set exists to remove.
+    # injected. Falling back to "keep them anyway" would restore
+    # the exact noise this set exists to remove.
     content_tokens = [
         token for token in tokens if token not in _QUERY_STOPWORDS
     ]
@@ -754,16 +513,14 @@ def _build_any_expression(tokens: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Phase 2 (R2/R3): query intent + candidate-variant engine.
+#
+# Additive pure functions. ``normalize_for_storage`` and
+# ``normalize_query`` above are UNCHANGED, so ``content_hash`` and
+# the existing FTS index are untouched. Arabic literals are written
+# as ``\uXXXX`` escapes to keep this file ASCII.
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# Phase 2 (R2/R3): explicit query intent + Arabic candidate-variant engine.
-# Additive pure functions; normalize_for_storage / normalize_query are
-# UNCHANGED, so content_hash and the existing FTS index are untouched.
-# Arabic literals are written as \uXXXX escapes to keep this file ASCII.
-# ---------------------------------------------------------------------------
 
 class QueryIntent(str, Enum):
     """Explicit retrieval intent, classified once and consumed everywhere."""
@@ -773,14 +530,28 @@ class QueryIntent(str, Enum):
     LOOKUP = "lookup"        # a real retrieval query
 
 
-_SOCIAL_RX: Final[re.Pattern] = re.compile(
-    r"^(?:\u0643\u064a\u0641\s+\u062d\u0627\u0644\u0643|"
-    r"\u0643\u064a\u0641\s+\u0627\u0644\u062d\u0627\u0644|"
-    r"\u0645\u0627\s+\u0627\u0644\u0627\u062e\u0628\u0627\u0631|"
-    r"\u0635\u0628\u0627\u062d\s+\u0627\u0644\u062e\u064a\u0631|"
-    r"\u0645\u0633\u0627\u0621\s+\u0627\u0644\u062e\u064a\u0631|"
-    r"\u0645\u0646\s+\u0641\u0636\u0644\u0643|"
-    r"how\s+are\s+you|good\s+(?:morning|evening))\W*$"
+#: Anchored pattern matching social / conversational phrases.
+#: Assembled from every profile's ``social_patterns()`` hook.
+#:
+#: Why dynamic: the original had hard-coded Arabic + English
+#: fragments. Adding a Japanese ``ohayou`` or a Spanish ``como
+#: estas`` must be a matter of a new profile file, not an edit to
+#: this module.
+#:
+#: Regex construction note: each fragment is joined with ``|``
+#: inside a single non-capturing group, then wrapped with ``^`` and
+#: ``\W*$``. Every fragment is expected to be a valid regex
+#: alternative on its own (no top-level ``|``, no anchors) -- the
+#: profiles uphold that invariant, and a malformed fragment fails
+#: loudly at import time via the ``re.compile`` call below.
+_SOCIAL_RX: Final[re.Pattern[str]] = re.compile(
+    r"^(?:"
+    + "|".join(
+        pattern
+        for profile in PROFILES
+        for pattern in profile.social_patterns()
+    )
+    + r")\W*$"
 )
 
 
@@ -796,60 +567,50 @@ def classify_query(query: str) -> QueryIntent:
 
 
 def fold_for_search(text: str) -> str:
-    """Search-only folding: canonical normalization + taa-marbuta -> ha.
+    """Search-only folding: canonical normalization + per-profile fold.
 
-    Deliberately SEPARATE from normalize_for_storage so content_hash and
-    the stored normalized_content are never altered (audit W2 owns that).
+    Delegates the fold step to each profile's ``search_fold`` hook,
+    applied in ``PROFILES`` order. Arabic's hook is the taa-marbuta
+    -> haa fold; English and Russian inherit the identity default.
+
+    Deliberately SEPARATE from ``normalize_for_storage`` so that
+    ``content_hash`` and the stored ``normalized_content`` are
+    never altered by search-side experiments.
     """
-    return normalize_for_storage(text).replace("\u0629", "\u0647")
+    result = normalize_for_storage(text)
+    for profile in PROFILES:
+        result = profile.search_fold(result)
+    return result
 
 
-_AR_SEARCH_PREFIXES: Final[tuple] = (
-    "\u0648\u0627\u0644", "\u0628\u0627\u0644", "\u0643\u0627\u0644",
-    "\u0641\u0627\u0644", "\u0644\u0644", "\u0627\u0644",
-    "\u0648", "\u0641", "\u0628", "\u0643", "\u0644",
-)
-_AR_SEARCH_SUFFIXES: Final[tuple] = (
-    "\u0627\u062a\u0647\u0627", "\u0627\u062a\u0647\u0645",
-    "\u0627\u062a\u0646\u0627", "\u0647\u0627", "\u0647\u0645",
-    "\u0647\u0646", "\u0643\u0645", "\u0643\u0646", "\u0646\u0627",
-    "\u0627\u062a", "\u0648\u0646", "\u064a\u0646", "\u0627\u0646",
-    "\u064a", "\u0643", "\u0647",
-)
-
-
-def arabic_variants(token: str) -> set:
+def arabic_variants(token: str) -> set[str]:
     """Candidate surface forms: strip one clitic prefix and/or one suffix.
 
-    Keeps >= 3 chars so a one-letter gain never manufactures a match.
-    Restores taa-marbuta after a stripped final ``ta`` so a possessive
-    form folds back to the base noun (see the audit coffee example).
+    Delegates to ``ArabicProfile.search_variants`` -- the algorithm
+    (prefix stripping, suffix stripping, taa-marbuta restoration
+    after a stripped final ``ta``) lives there. This wrapper exists
+    for the same two reasons as ``_arabic_variants``: graceful
+    degradation when the Arabic profile is not discovered, and a
+    stable public name.
+
+    Behaviour is byte-for-byte identical to the pre-refactor
+    ``arabic_variants`` for every input.
     """
-    out = {token}
-    forms = {token}
-    for p in _AR_SEARCH_PREFIXES:
-        if token.startswith(p) and len(token) - len(p) >= 3:
-            forms.add(token[len(p):])
-    for f in list(forms):
-        out.add(f)
-        for s in _AR_SEARCH_SUFFIXES:
-            if f.endswith(s) and len(f) - len(s) >= 3:
-                base = f[:-len(s)]
-                out.add(base)
-                if base.endswith("\u062a"):
-                    out.add(base[:-1] + "\u0647")
-    return {v for v in out if len(v) >= 3}
+    profile = by_code("ar")
+    if profile is None:
+        return {token}
+    return profile.search_variants(token)
 
 
 def build_search_terms(text: str) -> str:
     """Union of candidate variants of every folded word (index side)."""
-    terms: set = set()
-    for w in re.findall(r"\w+", fold_for_search(text)):
-        terms |= arabic_variants(w)
+    terms: set[str] = set()
+    for word in re.findall(r"\w+", fold_for_search(text)):
+        terms |= arabic_variants(word)
     return " ".join(sorted(terms))
 
 
-def _content_words(text: str) -> list:
+def _content_words(text: str) -> list[str]:
     return [
         w for w in re.findall(r"\w+", fold_for_search(text))
         if w not in _QUERY_STOPWORDS and len(w) > 1
@@ -858,31 +619,29 @@ def _content_words(text: str) -> list:
 
 def build_variant_query(text: str) -> str:
     """OR of prefix-wildcarded variants of each content word (query side)."""
-    terms: list = []
-    seen: set = set()
-    for w in _content_words(text):
-        for v in sorted(arabic_variants(w)):
-            if v not in seen:
-                seen.add(v)
-                terms.append(v + "*")
+    terms: list[str] = []
+    seen: set[str] = set()
+    for word in _content_words(text):
+        for variant in sorted(arabic_variants(word)):
+            if variant not in seen:
+                seen.add(variant)
+                terms.append(variant + "*")
     return " OR ".join(terms)
 
 
-_GENERIC_TERMS: Final[frozenset] = frozenset(
-    {
-        "\u0627\u0633\u0645", "\u0627\u062d\u0628", "\u0644\u062f\u064a",
-        "\u0639\u0646\u062f\u064a", "\u0645\u0641\u0636\u0644",
-        "\u0627\u062e\u062a\u0631\u0646", "\u0627\u062e\u062a\u0631",
-        "\u0642\u0631\u0631\u0646",
-        "name", "like", "have", "favorite", "prefer", "pick", "chose",
-    }
+#: Low-information words used by the coverage scorer. Assembled
+#: from every profile's ``generic_terms()`` hook. See
+#: ``languages/arabic.py`` and ``languages/english.py`` for the
+#: per-language rationale.
+_GENERIC_TERMS: Final[frozenset[str]] = frozenset().union(
+    *(profile.generic_terms() for profile in PROFILES)
 )
 
 
 def _is_generic(word: str) -> bool:
-    f = fold_for_search(word)
-    return any(f.startswith(g) for g in _GENERIC_TERMS) or bool(
-        arabic_variants(f) & _GENERIC_TERMS
+    folded = fold_for_search(word)
+    return any(folded.startswith(g) for g in _GENERIC_TERMS) or bool(
+        arabic_variants(folded) & _GENERIC_TERMS
     )
 
 
@@ -893,44 +652,50 @@ def _is_latin(word: str) -> bool:
 def query_term_sets(query: str) -> list:
     """Return [(word, variant_set, weight)] for each content word."""
     return [
-        (w, arabic_variants(w), 0.3 if _is_generic(w) else 1.0)
-        for w in _content_words(query)
+        (word, arabic_variants(word), 0.3 if _is_generic(word) else 1.0)
+        for word in _content_words(query)
     ]
 
 
 def coverage_score(qsets: list, entry_terms: set) -> float:
     """Absolute weighted query-term coverage in [0, 1] (audit R2).
 
-    A content word is covered when one of its variants is present in the
-    entry's search_terms; Latin words also match by prefix (deploy ->
-    deployment), mirroring the FTS wildcard. Generic words weigh 0.3 so a
-    single incidental generic token cannot carry a weak match to 1.0.
+    A content word is covered when one of its variants is present
+    in the entry's search_terms; Latin words also match by prefix
+    (deploy -> deployment), mirroring the FTS wildcard. Generic
+    words weigh 0.3 so a single incidental generic token cannot
+    carry a weak match to 1.0.
     """
     if not qsets:
         return 0.0
     total = 0.0
     hit = 0.0
-    for w, vs, wt in qsets:
-        total += wt
-        covered = bool(vs & entry_terms)
-        if not covered and _is_latin(w):
+    for word, variants, weight in qsets:
+        total += weight
+        covered = bool(variants & entry_terms)
+        if not covered and _is_latin(word):
             covered = any(
-                et.startswith(w) or w.startswith(et) for et in entry_terms
+                et.startswith(word) or word.startswith(et)
+                for et in entry_terms
             )
         if covered:
-            hit += wt
+            hit += weight
     return hit / total if total else 0.0
 
 
 __all__ = [
+    # --- Storage and query normalization ---
     "normalize_for_storage",
     "normalize_query",
+    # --- Query intent classification ---
     "QueryIntent",
     "classify_query",
+    # --- Search-index expansion ---
     "fold_for_search",
     "arabic_variants",
     "build_search_terms",
     "build_variant_query",
+    # --- Coverage scoring ---
     "query_term_sets",
     "coverage_score",
 ]
