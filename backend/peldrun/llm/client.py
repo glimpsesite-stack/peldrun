@@ -108,6 +108,29 @@ def _is_oom_error(exc: BaseException) -> bool:
     return any(p in err_str for p in patterns)
 
 
+def _usage_get(obj: Any, name: str) -> Any:
+    """Read ``name`` from a dict or an attribute-style object (None if absent)."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _first(*vals: Any) -> Any:
+    """First non-None value. Zero is a valid count; only None means absent."""
+    return next((v for v in vals if v is not None), None)
+
+
+def _to_int(v: Any) -> Optional[int]:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class UsageSource(str, Enum):
     """Authoritative origin of invocation token metrics."""
 
@@ -572,62 +595,50 @@ class AsyncLLMClient:
         )
 
     def _normalize_raw_usage(self, raw_usage: Any) -> Optional[TokenUsage]:
-        """Extract canonical TokenUsage from provider response object or dict."""
+        """Extract canonical TokenUsage from provider response object or dict.
+
+        Zero is a valid count: only ``None`` means "absent" (never use ``or``
+        to pick between provider fields). Totals are never invented from a
+        single side: ``total = input + output`` only when both are known.
+        """
         if not raw_usage:
             return None
 
-        if isinstance(raw_usage, dict):
-            inp = raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens")
-            out = raw_usage.get("completion_tokens") or raw_usage.get("output_tokens")
-            tot = raw_usage.get("total_tokens")
-            cached = raw_usage.get("cached_tokens") or raw_usage.get("cached_input_tokens")
-            reasoning = raw_usage.get("reasoning_tokens") or raw_usage.get("reasoning_output_tokens")
+        g = _usage_get
+        inp = _first(_to_int(g(raw_usage, "prompt_tokens")), _to_int(g(raw_usage, "input_tokens")))
+        out = _first(_to_int(g(raw_usage, "completion_tokens")), _to_int(g(raw_usage, "output_tokens")))
+        tot = _to_int(g(raw_usage, "total_tokens"))
 
-            prompt_details = raw_usage.get("prompt_tokens_details")
-            if isinstance(prompt_details, dict) and cached is None:
-                cached = prompt_details.get("cached_tokens")
+        prompt_details = _first(g(raw_usage, "prompt_tokens_details"), g(raw_usage, "input_tokens_details"))
+        comp_details = _first(g(raw_usage, "completion_tokens_details"), g(raw_usage, "output_tokens_details"))
 
-            comp_details = raw_usage.get("completion_tokens_details")
-            if isinstance(comp_details, dict) and reasoning is None:
-                reasoning = comp_details.get("reasoning_tokens")
+        cached = _first(
+            _to_int(g(raw_usage, "cached_tokens")),
+            _to_int(g(raw_usage, "cached_input_tokens")),
+            _to_int(g(prompt_details, "cached_tokens")),
+            _to_int(g(raw_usage, "prompt_cache_hit_tokens")),  # DeepSeek
+        )
+        reasoning = _first(
+            _to_int(g(raw_usage, "reasoning_tokens")),
+            _to_int(g(raw_usage, "reasoning_output_tokens")),
+            _to_int(g(comp_details, "reasoning_tokens")),
+        )
 
-            if inp is not None or out is not None or tot is not None:
-                return TokenUsage(
-                    input_tokens=int(inp) if inp is not None else None,
-                    output_tokens=int(out) if out is not None else None,
-                    total_tokens=int(tot) if tot is not None else (int(inp or 0) + int(out or 0)),
-                    cached_input_tokens=int(cached) if cached is not None else None,
-                    reasoning_output_tokens=int(reasoning) if reasoning is not None else None,
-                    source=UsageSource.PROVIDER,
-                    estimated=False,
-                )
+        if inp is None and out is None and tot is None:
+            return None
 
-        inp = getattr(raw_usage, "prompt_tokens", None)
-        out = getattr(raw_usage, "completion_tokens", None)
-        tot = getattr(raw_usage, "total_tokens", None)
+        if tot is None and inp is not None and out is not None:
+            tot = inp + out
 
-        cached = None
-        prompt_details = getattr(raw_usage, "prompt_tokens_details", None)
-        if prompt_details:
-            cached = getattr(prompt_details, "cached_tokens", None)
-
-        reasoning = None
-        comp_details = getattr(raw_usage, "completion_tokens_details", None)
-        if comp_details:
-            reasoning = getattr(comp_details, "reasoning_tokens", None)
-
-        if inp is not None or out is not None or tot is not None:
-            return TokenUsage(
-                input_tokens=int(inp) if inp is not None else None,
-                output_tokens=int(out) if out is not None else None,
-                total_tokens=int(tot) if tot is not None else (int(inp or 0) + int(out or 0)),
-                cached_input_tokens=int(cached) if cached is not None else None,
-                reasoning_output_tokens=int(reasoning) if reasoning is not None else None,
-                source=UsageSource.PROVIDER,
-                estimated=False,
-            )
-
-        return None
+        return TokenUsage(
+            input_tokens=inp,
+            output_tokens=out,
+            total_tokens=tot,
+            cached_input_tokens=cached,
+            reasoning_output_tokens=reasoning,
+            source=UsageSource.PROVIDER,
+            estimated=False,
+        )
 
     def _fallback_usage_estimation(
         self,
@@ -985,8 +996,10 @@ class AsyncLLMClient:
                     _cancel_check_counter += 1
                     await asyncio.sleep(0)
 
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        captured_usage = self._normalize_raw_usage(chunk.usage)
+                    if getattr(chunk, "usage", None):
+                        _snap = self._normalize_raw_usage(chunk.usage)
+                        if _snap is not None:
+                            captured_usage = _snap  # never replace valid usage with None
 
                     choices = getattr(chunk, "choices", None) or []
                     if not choices:
@@ -1378,11 +1391,18 @@ class AsyncLLMClient:
                 # [FIX-G.2] Explicit cancellable yield point.
                 await asyncio.sleep(0)
 
-                if hasattr(chunk, "usage") and chunk.usage:
-                    captured_usage = self._normalize_raw_usage(chunk.usage)
+                snapshot: Optional[TokenUsage] = None
+                if getattr(chunk, "usage", None):
+                    snapshot = self._normalize_raw_usage(chunk.usage)
+                    if snapshot is not None:
+                        captured_usage = snapshot  # never replace valid usage with None
 
                 choices = chunk.choices or []
                 if not choices:
+                    # Final include_usage chunk (no choices): forward it instead
+                    # of swallowing it, so consumers receive the real usage.
+                    if snapshot is not None:
+                        yield StreamChunk(usage=captured_usage, raw=chunk)
                     continue
 
                 first_choice = choices[0]

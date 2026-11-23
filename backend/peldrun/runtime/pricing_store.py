@@ -200,11 +200,12 @@ class SqlitePricingStore:
                     ON model_pricing(model_pattern);
             """)
 
-            # Seed default catalog if table is empty
-            cursor = conn.execute("SELECT COUNT(*) AS cnt FROM model_pricing")
-            row = cursor.fetchone()
-            if row and row["cnt"] == 0:
-                for rule in DEFAULT_PRICING_CATALOG:
+            # Seed any catalog rule that is missing (by id, active or not), so new
+            # seeds reach existing databases without touching user-edited or
+            # deliberately deactivated rules.
+            existing = {r[0] for r in conn.execute("SELECT pricing_id FROM model_pricing")}
+            for rule in DEFAULT_PRICING_CATALOG:
+                if rule.pricing_id not in existing:
                     self._sync_save_rule(conn, rule)
 
     def _sync_save_rule(self, conn: sqlite3.Connection, rule: PricingRule) -> None:
@@ -302,6 +303,63 @@ class SqlitePricingStore:
                 (now, now, pricing_id),
             )
             return cursor.rowcount > 0
+
+    # ---------------------------------------------------------------- Destructive Reset
+    async def reset_to_defaults(self) -> Dict[str, int]:
+        """DESTRUCTIVE: wipe every pricing rule, then re-seed the default catalog.
+
+        Used exclusively by ``POST /api/telemetry/reset`` (UsageTab
+        "Reset Data" button). Historical pricing rules are normally
+        soft-retired via ``retire_rule`` to preserve auditability; this
+        method exists solely for full environment resets.
+
+        Behavior
+        --------
+        * Every row in ``model_pricing`` is deleted (both user-authored
+          rules and seed rules like ``prc_seed_*``).
+        * ``DEFAULT_PRICING_CATALOG`` is re-inserted verbatim. Any
+          prior edits to seed rule prices (rare but possible via direct
+          ``save_rule`` calls) are discarded — seeds are restored to
+          the values defined in this module.
+        * ``VACUUM`` runs afterward to reclaim file space (best-effort;
+          its failure never rolls back the reset).
+
+        Returns
+        -------
+        dict
+            ``{"deleted": int, "seeded": int}`` — counts for UI feedback.
+        """
+        return await asyncio.to_thread(self._sync_reset_to_defaults)
+
+    def _sync_reset_to_defaults(self) -> Dict[str, int]:
+        conn = self._get_connection()
+        deleted = 0
+        seeded = 0
+        with conn:
+            cursor = conn.execute("DELETE FROM model_pricing")
+            deleted = int(cursor.rowcount or 0)
+            for rule in DEFAULT_PRICING_CATALOG:
+                # Reuse the canonical upsert path so the schema columns
+                # (currency, effective_from, active flag, timestamps)
+                # are populated exactly as in the initial bootstrap.
+                self._sync_save_rule(conn, rule)
+                seeded += 1
+
+        # VACUUM must run outside an explicit transaction; the `with
+        # conn:` block above already committed by the time we reach
+        # this line. Best-effort — a lock held by another process
+        # must not undo the successful reset.
+        try:
+            conn.execute("VACUUM")
+        except Exception as exc:
+            logger.debug("VACUUM after model_pricing reset failed: %s", exc)
+
+        logger.warning(
+            "model_pricing reset: %d rule(s) deleted, %d seed(s) restored.",
+            deleted,
+            seeded,
+        )
+        return {"deleted": deleted, "seeded": seeded}
 
     # ---------------------------------------------------------------- Pricing Resolution
     async def resolve_pricing(

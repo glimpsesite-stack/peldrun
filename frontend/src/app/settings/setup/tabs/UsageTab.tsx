@@ -44,6 +44,7 @@ import {
 } from "recharts";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/ToastNotification";
+import { useConfirmModal } from "@/components/ui/ConfirmModal";
 import {
   formatTokenCount,
   formatCostUsd,
@@ -118,13 +119,14 @@ const PIE_COLORS = [
 const RADIAL_COLORS = ["#10b981", "#3b82f6", "#8b5cf6", "#f59e0b"];
 
 const CHART_TOOLTIP_STYLE = {
-  backgroundColor: "rgba(17, 24, 39, 0.95)",
-  border: "1px solid rgba(55, 65, 81, 0.8)",
+  backgroundColor: "hsl(var(--card))",
+  border: "1px solid hsl(var(--card))",
   fontSize: "11px",
   borderRadius: "10px",
   padding: "8px 12px",
-  boxShadow: "0 10px 30px rgba(0, 0, 0, 0.4)",
+  boxShadow: "0 2px 8px rgba(0, 0, 0, 0.2)",
   backdropFilter: "blur(8px)",
+  color: "hsl(var(--black))",
 } as const;
 
 // ============================================================
@@ -288,6 +290,12 @@ export function UsageTab() {
   const [newCachedPrice, setNewCachedPrice] = useState("0.075");
   const [savingPrice, setSavingPrice] = useState(false);
 
+  // Reset-database flow: promise-based confirmation via the shared
+  // ConfirmModal hook. The destructive action is gated behind an
+  // explicit user confirmation and cannot be triggered by a misclick.
+  const { confirm, ConfirmDialog } = useConfirmModal();
+  const [resetting, setResetting] = useState(false);
+
   const abortRef = useRef<AbortController | null>(null);
 
   // ----------------------------------------------------------
@@ -392,6 +400,50 @@ export function UsageTab() {
 
   const handlePrint = () => {
     window.print();
+  };
+
+  // ----------------------------------------------------------
+  // Reset / Wipe Database
+  // ----------------------------------------------------------
+  // Confirmation is delegated to the shared ConfirmModal hook so the
+  // destructive action cannot be triggered by a single misclick.
+  // The backend endpoint is idempotent: calling it against an empty
+  // database returns success with zero rows removed. Custom pricing
+  // rules are also cleared; seed defaults are re-created server-side.
+  const handleResetDatabase = async () => {
+    const ok = await confirm({
+      title: "Wipe the entire telemetry database?",
+      description:
+        "This will permanently delete ALL telemetry data: LLM call records, " +
+        "token counts, cost history, timeseries, and breakdowns. " +
+        "Custom pricing rules will also be removed; seed defaults will be restored. " +
+        "This action CANNOT be undone.",
+      confirmText: "Yes, Wipe Everything",
+      cancelText: "Cancel",
+      variant: "danger",
+    });
+    if (!ok) return;
+
+    setResetting(true);
+    try {
+      const res = await fetch("/api/telemetry/reset", { method: "POST" });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json().catch(() => ({}));
+      showToast.success(
+        "Database Wiped",
+        data.message ||
+          "All telemetry records and pricing rules have been cleared."
+      );
+      // Reload — everything should come back empty.
+      await fetchTelemetry();
+    } catch (err: any) {
+      showToast.error("Reset Failed", err.message || "Unknown error");
+    } finally {
+      setResetting(false);
+    }
   };
 
   // ----------------------------------------------------------
@@ -505,6 +557,24 @@ export function UsageTab() {
             >
               <Printer size={12} />
               <span className="hidden sm:inline">Print Report</span>
+            </Button>
+
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleResetDatabase}
+              disabled={loading || resetting}
+              className="h-8 text-xs gap-1.5 cursor-pointer hover:scale-105 transition-transform text-rose-500 hover:text-rose-400 border-rose-500/30 hover:border-rose-500/50 hover:bg-rose-500/10 disabled:opacity-50 disabled:hover:scale-100"
+              title="Wipe all telemetry data and pricing rules"
+            >
+              {resetting ? (
+                <Loader2 size={12} className="animate-spin" />
+              ) : (
+                <Trash2 size={12} />
+              )}
+              <span className="hidden sm:inline">
+                {resetting ? "Resetting..." : "Reset Data"}
+              </span>
             </Button>
           </div>
         </div>
@@ -1171,6 +1241,9 @@ export function UsageTab() {
           </div>
         </motion.div>
       </main>
+
+      {/* Destructive-action confirmation for the Reset Data button. */}
+      <ConfirmDialog />
     </div>
   );
 }

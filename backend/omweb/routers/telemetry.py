@@ -274,3 +274,38 @@ async def export_telemetry_report(
         return report_json
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to export report: {exc}")
+
+
+@router.post("/reset")
+async def reset_telemetry_database():
+    """DESTRUCTIVE: wipe all telemetry facts and reset pricing to defaults.
+
+    Operator-only maintenance endpoint, wired to the UsageTab "Reset
+    Data" button (which gates it behind a ConfirmModal). It removes:
+
+      * every row from ``token_ledger`` (all historical LLM invocation
+        accounting facts), and
+      * every row from ``model_pricing``, then re-seeds the default
+        catalog so unit economics remain functional immediately after
+        the reset.
+
+    The endpoint is **not idempotent at the response level** — calling
+    it twice returns different counters (the second call reports
+    ``ledger_rows_deleted=0``) — but the end state is identical.
+
+    Safety
+    ------
+    * The service layer (``TelemetryService.reset_all_data``) is the
+      only writer; the router itself does not touch the database.
+    * On any failure mid-reset, the exception is logged with the
+      partial counters and propagated as HTTP 500 — the operator can
+      then inspect the logs and re-run to converge.
+    """
+    try:
+        result = await telemetry_service.reset_all_data()
+        return {"ok": True, **result}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset telemetry database: {exc}",
+        )

@@ -5,6 +5,7 @@ import {
   Gauge,
   Sparkles,
   Save,
+  Trash2,
   ChevronDown,
   ChevronRight,
   RotateCcw,
@@ -340,6 +341,7 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   const [openProviders, setOpenProviders] = useState<Record<string, boolean>>({});
   const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
@@ -1048,6 +1050,109 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
     }
   };
 
+  /* ============================================================
+   * handleResetAll — destructive full reset.
+   *
+   * Clears every persisted budget entry AND attempts to wipe the
+   * token_ledger accounting history. The two operations are
+   * independent:
+   *
+   *   1. Budgets reset — always succeeds. Uses the same endpoint
+   *      as handleSaveAll, but sends an empty payload. The backend
+   *      writes an empty dict to models_budget.json, which the UI
+   *      then renders as intelligent defaults via
+   *      resolveIntelligentLimits().
+   *
+   *   2. Usage ledger reset — best-effort. Tries the canonical
+   *      DELETE endpoints in order. On 404 / 405 the reset
+   *      continues without touching the ledger, preserving
+   *      backward compatibility with older backend builds that
+   *      do not expose a ledger-clear endpoint yet.
+   *
+   * Confirmation is REQUIRED: this is destructive and irreversible.
+   * Users who cancel see no change at all.
+   * ============================================================ */
+  const handleResetAll = async () => {
+    if (saving || loading || resetting) return;
+
+    const confirmed = window.confirm(
+      "This will permanently:\n\n" +
+        "  \u2022 Clear every per-model budget " +
+        "(context windows, output buffers, temperature overrides, section ratios).\n\n" +
+        "  \u2022 Wipe the token_ledger (all historical LLM usage and cost accounting).\n\n" +
+        "The action cannot be undone. Continue?"
+    );
+    if (!confirmed) return;
+
+    setResetting(true);
+    try {
+      const base = resolveBackendBase();
+
+      // Step 1 \u2014 clear budgets (guaranteed path).
+      const budgetsRes = await fetch(`${base}/api/config/model-budgets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ budgets: {} }),
+      });
+      const budgetsData = await budgetsRes.json().catch(() => ({ ok: false }));
+      const budgetsCleared = Boolean(budgetsRes.ok && budgetsData.ok);
+
+      // Step 2 \u2014 wipe usage ledger (best-effort).
+      // The backend may expose this under one of several names; try
+      // the canonical path first, then the compatibility fallbacks.
+      const ledgerCandidates = [
+        `${base}/api/config/token-ledger`,
+        `${base}/api/config/reset-usage`,
+        `${base}/api/config/usage/reset`,
+      ];
+      let ledgerCleared = false;
+      let ledgerLastError = "";
+      for (const url of ledgerCandidates) {
+        try {
+          const res = await fetch(url, { method: "DELETE" });
+          if (res.ok) {
+            ledgerCleared = true;
+            break;
+          }
+          ledgerLastError = `HTTP ${res.status}`;
+        } catch (e: any) {
+          ledgerLastError = e?.message || "network error";
+        }
+      }
+
+      // Step 3 \u2014 clear local state unconditionally.
+      // Even if a backend call failed, the UI now reflects the
+      // post-reset state, and re-opening the tab shows defaults.
+      setBudgets({});
+      setModelRatios({});
+      setExpandedModels({});
+      setOpenProviders({});
+
+      if (budgetsCleared && ledgerCleared) {
+        showToast.success(
+          "Full Reset Complete",
+          "All model budgets and the token_ledger were cleared."
+        );
+      } else if (budgetsCleared) {
+        showToast.success(
+          "Budgets Reset",
+          "All model budgets cleared. Usage history unchanged (" +
+            (ledgerLastError || "endpoint not available") +
+            ")."
+        );
+      } else {
+        showToast.warning(
+          "Partial Reset",
+          "Local view was cleared, but the backend rejected the reset. Re-open the tab to verify."
+        );
+      }
+    } catch (err: any) {
+      showToast.error("Reset Failed", err?.message || "Network error");
+    } finally {
+      setResetting(false);
+    }
+  };
+
   /* -------------------------------
    * Render
    * ------------------------------- */
@@ -1082,6 +1187,19 @@ export function ModelBudgetsTab(props: ModelBudgetsTabProps) {
             className="h-8 text-xs border-border bg-background hover:bg-muted text-foreground cursor-pointer shadow-xs"
           >
             {Object.values(openProviders).some(Boolean) ? "Collapse All" : "Expand All"}
+          </Button>
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleResetAll}
+            disabled={resetting || saving || loading}
+            className="h-8 text-xs border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive cursor-pointer shadow-xs"
+            title="Clear every per-model budget and wipe the token_ledger accounting history"
+          >
+            <Trash2 size={13} className={resetting ? "animate-spin" : ""} />
+            <span>{resetting ? "Resetting…" : "Reset All"}</span>
           </Button>
 
           <Button

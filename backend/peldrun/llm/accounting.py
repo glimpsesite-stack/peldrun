@@ -130,6 +130,10 @@ class InvocationContext:
 # ---------------------------------------------------------------------------
 
 
+# Rules that carry a zero price only as a placeholder: a match means "no price known".
+_UNPRICED_IDS = frozenset({"prc_unpriced_fallback", "prc_seed_global_wildcard"})
+
+
 def _infer_cost_status(
     pricing_version_id: Optional[str],
     cost_nano_usd: int,
@@ -142,7 +146,7 @@ def _infer_cost_status(
     The rule-ID prefixes are documented in ``pricing_store.py``:
 
         ``local_zero_*``        → free
-        ``prc_unpriced_fallback`` → unknown
+        ``prc_unpriced_fallback`` / ``prc_seed_global_wildcard`` → unknown
         ``prc_*`` (any other)   → known
         (empty)                 → unknown
 
@@ -156,7 +160,7 @@ def _infer_cost_status(
     pid = pricing_version_id
     if pid.startswith("local_zero_"):
         return COST_STATUS_FREE
-    if pid == "prc_unpriced_fallback":
+    if pid in _UNPRICED_IDS:
         return COST_STATUS_UNKNOWN
     if pid.startswith("prc_"):
         return COST_STATUS_KNOWN

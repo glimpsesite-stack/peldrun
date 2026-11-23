@@ -151,6 +151,82 @@ class TelemetryService:
         """Soft-retire a pricing rule without destructive deletion."""
         return await self.pricing_store.retire_rule(pricing_id)
 
+    # ---------------------------------------------------------------- Destructive Reset
+    async def reset_all_data(self) -> Dict[str, Any]:
+        """DESTRUCTIVE: wipe all telemetry facts and reset pricing to defaults.
+
+        Orchestrates a full environment reset for the operator-only
+        ``POST /api/telemetry/reset`` endpoint (UsageTab "Reset Data"
+        button). Existing tests and manual cleanup scripts are the
+        only legitimate callers — production flows must never invoke
+        this implicitly.
+
+        Order of operations
+        -------------------
+        1. Pricing rules are wiped first (fast, few rows).
+        2. Token ledger rows are wiped second (potentially large).
+        3. Default pricing seeds are re-inserted LAST, so that even if
+           step 2 fails partway through, the pricing catalog is
+           restored to a consistent (if over-broad) state. A failure
+           in step 3 would leave the pricing catalog empty — but the
+           ledger is already wiped, so the system is in a known
+           degraded state that the operator can recover by restarting
+           the app (``_init_db`` re-seeds missing rows).
+
+        Idempotency
+        -----------
+        Calling this twice in a row is safe: the second call deletes
+        the freshly-seeded rules, deletes zero ledger rows, and
+        re-seeds the catalog again. Net effect is identical.
+
+        Returns
+        -------
+        dict
+            Diagnostic counters for the UI toast:
+              * ``ledger_rows_deleted``   — invocation facts removed
+              * ``pricing_rules_deleted`` — pricing rules removed
+              * ``pricing_seeds_restored``— default rules re-inserted
+              * ``message``               — human-readable summary
+        """
+        # Snapshot before — the reset is destructive; the caller
+        # may want to record what was wiped in an audit log.
+        ledger_deleted = 0
+        pricing_reset: Dict[str, int] = {"deleted": 0, "seeded": 0}
+
+        try:
+            pricing_reset = await self.pricing_store.reset_to_defaults()
+            ledger_deleted = await self.usage_store.delete_all_invocations()
+        except Exception as exc:
+            logger.exception(
+                "Telemetry reset failed midway: pricing_deleted=%d "
+                "seeded=%d ledger_deleted=%d error=%s",
+                pricing_reset.get("deleted", 0),
+                pricing_reset.get("seeded", 0),
+                ledger_deleted,
+                exc,
+            )
+            raise
+
+        logger.warning(
+            "Telemetry full reset complete: %d ledger row(s) deleted, "
+            "%d pricing rule(s) deleted, %d seed(s) restored.",
+            ledger_deleted,
+            pricing_reset.get("deleted", 0),
+            pricing_reset.get("seeded", 0),
+        )
+
+        return {
+            "ledger_rows_deleted": ledger_deleted,
+            "pricing_rules_deleted": pricing_reset.get("deleted", 0),
+            "pricing_seeds_restored": pricing_reset.get("seeded", 0),
+            "message": (
+                f"Wiped {ledger_deleted} invocation(s) and "
+                f"{pricing_reset.get('deleted', 0)} pricing rule(s); "
+                f"{pricing_reset.get('seeded', 0)} default pricing seed(s) "
+                f"restored."
+            ),
+        }
+
     async def simulate_repricing(
         self,
         chat_id: Optional[str] = None,

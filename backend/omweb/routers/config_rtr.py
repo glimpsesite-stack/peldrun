@@ -3169,3 +3169,153 @@ async def save_model_budgets(payload: SaveModelBudgetsRequest):
     current.update(payload.budgets)
     save_model_budgets_to_disk(current)
     return {"ok": True, "message": "Model budgets saved successfully", "budgets": current}
+
+
+# ============================================================
+# Destructive full reset — token_ledger AND per-model budgets.
+# ============================================================
+#
+# This endpoint exists SOLELY to back the "Reset All" button in
+# Settings → Model Budgets. It is the single, deliberate code path
+# allowed to remove accounting facts from the ledger. Every other
+# endpoint in the system is strictly append-only:
+#
+#   * POST /model-budgets     → MERGES new budgets (never deletes)
+#   * POST /models-metadata   → MERGES metadata (never deletes)
+#   * token_ledger            → INSERT OR IGNORE (never UPDATE/DELETE)
+#
+# The button that calls this endpoint requires explicit user
+# confirmation on the frontend, so a stray request cannot wipe the
+# ledger by accident.
+@router.delete("/token-ledger")
+async def reset_token_ledger_and_budgets():
+    """
+    Destructive full reset of usage accounting and per-model budgets.
+
+    Clears:
+      1. Every row in the ``token_ledger`` fact table (all historical
+         LLM invocations and cost accounting).
+      2. Every entry in ``models_budget.json`` (context windows,
+         output buffers, temperature overrides, section ratios).
+
+    Called by the "Reset All" button in Settings → Model Budgets
+    after the user explicitly confirms. This operation is
+    irreversible — there is no undo, no soft-delete, and no backup
+    created here. The confirmation gate lives entirely in the
+    frontend; this endpoint assumes the caller has already decided.
+
+    Returns a structured summary so the UI can render an accurate
+    result message:
+
+        {
+          "ok": true,
+          "deleted_invocations": 4231,
+          "budgets_cleared": true,
+          "ledger_error": null,
+          "budget_error": null
+        }
+
+    Either half can fail independently:
+      * If the ledger clear fails, budgets are still cleared — the
+        user expects the budgets reset regardless of the ledger's
+        state.
+      * If the budget file write fails, the ledger is still cleared.
+    ``ok`` is true only when BOTH operations succeed.
+
+    Route path note
+    ---------------
+    The frontend "Reset All" handler tries three candidates in
+    order and stops at the first success:
+
+        /api/config/token-ledger    ← THIS endpoint (canonical)
+        /api/config/reset-usage     (legacy compatibility)
+        /api/config/usage/reset     (legacy compatibility)
+
+    Only the canonical path is implemented. The other two exist as
+    fallbacks for older backend builds; on this build they 404 and
+    the frontend transparently moves on.
+    """
+    # Lazy import to preserve this module's startup contract — see
+    # the [FIX-LAZY-PELDRUN-IMPORTS] note at the top of the file.
+    from peldrun.runtime.usage_store import get_usage_store
+
+    deleted_invocations = 0
+    ledger_error: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Step 1 — wipe the token_ledger fact table.
+    #
+    # We reach into the store's connection helper (``_get_connection``)
+    # because the public API deliberately exposes no "clear all"
+    # method: normal accounting operations must never delete rows,
+    # and the absence of a public method enforces that invariant at
+    # the type level. This endpoint is the single, deliberate
+    # exception — it removes facts atomically via a single DELETE.
+    #
+    # Safety notes:
+    #   * WAL mode + thread-local connections mean the DELETE is safe
+    #     from any request handler thread, even while other requests
+    #     write concurrently. SQLite serializes the write internally.
+    #   * The COUNT happens first so the response carries an accurate
+    #     "how much was removed" figure for the UI message.
+    #   * If the table is empty, the DELETE succeeds without error
+    #     and ``deleted_invocations`` stays 0 — idempotent, not a bug.
+    # ------------------------------------------------------------------
+    try:
+        store = get_usage_store()
+        conn = store._get_connection()
+        with conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM token_ledger"
+            ).fetchone()
+            deleted_invocations = int(row[0]) if row else 0
+            conn.execute("DELETE FROM token_ledger")
+        logger.info(
+            "[token-ledger] Cleared %d invocation(s) from token_ledger.",
+            deleted_invocations,
+        )
+    except Exception as exc:
+        ledger_error = str(exc)
+        logger.warning(
+            "[token-ledger] Failed to clear token_ledger: %s",
+            exc,
+            exc_info=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 2 — wipe models_budget.json.
+    #
+    # Unconditional: even when Step 1 failed, the user expects
+    # budgets to be reset. Saving an empty dict REPLACES the file
+    # entirely (``save_model_budgets_to_disk`` writes the whole
+    # content, no merging). The next page open then falls back to
+    # resolver defaults via ``resolveIntelligentLimits()`` on the
+    # frontend, giving the user a clean "factory settings" view.
+    #
+    # We deliberately do NOT call ``save_model_budgets`` (the merge
+    # endpoint): that function does ``current.update(payload.budgets)``,
+    # which is a no-op when ``payload.budgets`` is empty. Going
+    # straight to ``save_model_budgets_to_disk`` is the only way to
+    # actually empty the file.
+    # ------------------------------------------------------------------
+    budgets_cleared = False
+    budget_error: Optional[str] = None
+    try:
+        save_model_budgets_to_disk({})
+        budgets_cleared = True
+        logger.info("[token-ledger] Cleared models_budget.json.")
+    except Exception as exc:
+        budget_error = str(exc)
+        logger.warning(
+            "[token-ledger] Failed to clear model budgets: %s",
+            exc,
+            exc_info=True,
+        )
+
+    return {
+        "ok": ledger_error is None and budgets_cleared,
+        "deleted_invocations": deleted_invocations,
+        "budgets_cleared": budgets_cleared,
+        "ledger_error": ledger_error,
+        "budget_error": budget_error,
+    }

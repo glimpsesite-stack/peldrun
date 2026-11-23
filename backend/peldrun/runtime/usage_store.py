@@ -143,6 +143,7 @@ def is_local_endpoint(provider: str, base_url: Optional[str] = None) -> bool:
         "lmstudio",
         "lm-studio",
         "lm_studio",
+        "lm studio",
         "ollama",
         "local",
         "local_gpu",
@@ -178,6 +179,7 @@ class UsageStore(Protocol):
     async def query_timeseries(self, granularity: str = "day", **filters: Any) -> List[Dict[str, Any]]: ...
     async def query_breakdown(self, group_by: str = "model", **filters: Any) -> List[Dict[str, Any]]: ...
     async def query_invocations(self, limit: int = 50, cursor: Optional[float] = None, **filters: Any) -> Tuple[List[Dict[str, Any]], Optional[float], bool]: ...
+    async def delete_all_invocations(self) -> int: ...
 
 
 class SqliteUsageStore:
@@ -365,6 +367,50 @@ class SqliteUsageStore:
                 ),
             )
             return cursor.rowcount > 0
+
+    # ---------------------------------------------------------------- Destructive Reset
+    async def delete_all_invocations(self) -> int:
+        """Wipe every row from the token_ledger fact table.
+
+        DESTRUCTIVE — used exclusively by the operator-only
+        ``POST /api/telemetry/reset`` endpoint (UsageTab "Reset Data"
+        button). Historical accounting facts are normally immutable
+        by design; this method exists solely so an operator can fully
+        reset an environment (hand-off, post-test cleanup).
+
+        Concurrency
+        -----------
+        SQLite WAL mode serializes writers, so a concurrent runtime
+        writer will block this DELETE for up to the connection timeout
+        (30s) rather than causing corruption. If the timeout is
+        exceeded, ``sqlite3.OperationalError`` propagates to the
+        router and surfaces as HTTP 500.
+
+        Vacuum
+        ------
+        A VACUUM is issued after the delete to reclaim disk space,
+        but it is best-effort: failure never rolls back the wipe
+        (the rows are already gone by then). VACUUM must run outside
+        an explicit transaction, which is why it is issued after the
+        ``with conn:`` block has already committed.
+        """
+        return await asyncio.to_thread(self._sync_delete_all_invocations)
+
+    def _sync_delete_all_invocations(self) -> int:
+        conn = self._get_connection()
+        deleted = 0
+        with conn:
+            cursor = conn.execute("DELETE FROM token_ledger")
+            deleted = int(cursor.rowcount or 0)
+
+        # VACUUM outside the transaction (autocommit). Best-effort.
+        try:
+            conn.execute("VACUUM")
+        except Exception as exc:
+            logger.debug("VACUUM after token_ledger wipe failed: %s", exc)
+
+        logger.warning("token_ledger wiped: %d row(s) deleted.", deleted)
+        return deleted
 
     # ---------------------------------------------------------------- Retrieval
     async def get_invocation(self, invocation_id: str) -> Optional[Dict[str, Any]]:
