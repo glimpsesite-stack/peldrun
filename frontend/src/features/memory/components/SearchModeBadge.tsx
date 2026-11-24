@@ -133,7 +133,7 @@ export function SearchModeBadge({
 }: SearchModeBadgeProps) {
   // Absent field -> render nothing. See the docstring on `mode`.
   if (mode === undefined || mode === null) {
-    return null;
+    return "No Mode";
   }
 
   const config = MODE_CONFIG[mode];
