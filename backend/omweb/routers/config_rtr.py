@@ -18,7 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException
 import httpx
@@ -58,6 +58,12 @@ try:
     import tomllib
 except ImportError:
     import tomli as tomllib  # type: ignore[no-redef]
+
+if TYPE_CHECKING:
+    # Type-only import. Runtime imports of peldrun MUST stay lazy —
+    # see the [FIX-LAZY-PELDRUN-IMPORTS] note above. The reasoning
+    # helpers below import the descriptor inside their bodies.
+    from peldrun.llm.contracts import ReasoningCapabilityDescriptor
 
 logger = logging.getLogger("omweb.routers.config_rtr")
 
@@ -504,6 +510,8 @@ _NATIVE_PROVIDER_MAP: Dict[str, str] = {
     "google": "google_genai",
     "gemini": "google_genai",
     "openai_native": "openai_native",
+    "deepseek": "deepseek_native",
+    "deepseek_native": "deepseek_native",
 }
 
 
@@ -1822,6 +1830,466 @@ async def update_models_metadata(payload: UpdateMetadataRequest):
         )
 
     return {"ok": True, "message": "Metadata persisted successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Dynamic reasoning capabilities — the single query channel for the UI
+# ---------------------------------------------------------------------------
+#
+# Plan principles enforced here:
+#   P1/P2 — no level list lives in the frontend and no per-provider
+#           fallback map lives in this router. Provider knowledge is
+#           each adapter's get_reasoning_options(); discovery facts
+#           live in models_metadata.json.
+#   P6    — the catalog below is UI VOCABULARY only (id -> wording).
+#           It never decides WHICH levels a provider supports.
+#   P5    — when neither the adapter nor metadata can answer, the
+#           response is "unsupported" and the widget hides.
+#   P8    — GET /reasoning-capabilities is the only gate.
+
+#: Canonical display order for level expansion (low -> high effort).
+REASONING_LEVEL_ORDER: Tuple[str, ...] = (
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "adaptive",
+)
+
+#: Single source of truth for UI wording (P6). ``icon`` is an abstract
+#: icon NAME; the frontend maps names to components and never keeps a
+#: per-level or per-provider map of its own.
+REASONING_LEVEL_LABELS: Dict[str, Dict[str, str]] = {
+    "none": {
+        "label": "Direct / No Thinking",
+        "short_label": "Off",
+        "description": "Instant response with zero reasoning tokens. Best for daily chat and quick queries.",
+        "badge_class": "text-zinc-600 dark:text-zinc-300 bg-zinc-500/10 border-zinc-500/20",
+        "icon": "zap",
+    },
+    "minimal": {
+        "label": "Minimal Thinking",
+        "short_label": "Minimal",
+        "description": "Smallest reasoning pass for latency-sensitive tasks. Near-instant answers with a light sanity check.",
+        "badge_class": "text-cyan-600 dark:text-cyan-400 bg-cyan-500/10 border-cyan-500/20",
+        "icon": "gauge",
+    },
+    "low": {
+        "label": "Quick Thinking",
+        "short_label": "Quick",
+        "description": "Light reasoning budget (~1k tokens). Balances speed with sanity checks.",
+        "badge_class": "text-blue-600 dark:text-blue-400 bg-blue-500/10 border-blue-500/20",
+        "icon": "sparkles",
+    },
+    "medium": {
+        "label": "Balanced Reasoning",
+        "short_label": "Balanced",
+        "description": "Standard analytical depth (~2k tokens). Great for coding and workflow steps.",
+        "badge_class": "text-amber-600 dark:text-amber-400 bg-amber-500/10 border-amber-500/20",
+        "icon": "brain",
+    },
+    "high": {
+        "label": "Deep Reasoning",
+        "short_label": "Deep",
+        "description": "Maximum reasoning budget (~4k+ tokens). Deep deduction for complex challenges.",
+        "badge_class": "text-violet-600 dark:text-violet-400 bg-violet-500/10 border-violet-500/20",
+        "icon": "cpu",
+    },
+    "xhigh": {
+        "label": "Extra-High Reasoning",
+        "short_label": "X-High",
+        "description": "Extended reasoning beyond Deep. For long-horizon, multi-step problems.",
+        "badge_class": "text-fuchsia-600 dark:text-fuchsia-400 bg-fuchsia-500/10 border-fuchsia-500/20",
+        "icon": "flame",
+    },
+    # "max" is DeepSeek's top effort tier per the Thinking Mode guide
+    # (api-docs.deepseek.com/guides/thinking_mode). It is a distinct
+    # wire value from "high" — not an alias. Exposed so the UI ladder
+    # for deepseek-v3.2/v4 families can surface it.
+    "max": {
+        "label": "Maximum Reasoning",
+        "short_label": "Max",
+        "description": "Top effort tier. For complex, long-horizon reasoning tasks.",
+        "badge_class": "text-rose-600 dark:text-rose-400 bg-rose-500/10 border-rose-500/20",
+        "icon": "flame",
+    },
+    "adaptive": {
+        "label": "Adaptive Reasoning",
+        "short_label": "Adaptive",
+        "description": "The provider decides how much to think for each request.",
+        "badge_class": "text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20",
+        "icon": "wand",
+    },
+}
+
+
+def _expand_level_ids(level_ids: Tuple[str, ...]) -> List[Dict[str, str]]:
+    """
+    Expand bare level ids into fully-labeled display objects, in
+    canonical order. Ids with no catalog entry are dropped (and
+    logged) — the UI must never render a level it has no vocabulary
+    for. This is display expansion only, not capability inference.
+    """
+    present = {str(lvl) for lvl in (level_ids or ())}
+    unknown = present - set(REASONING_LEVEL_LABELS)
+    if unknown:
+        logger.debug(
+            "[reasoning-capabilities] level ids without catalog "
+            "labels dropped: %s",
+            sorted(unknown),
+        )
+    return [
+        {"id": lid, **REASONING_LEVEL_LABELS[lid]}
+        for lid in REASONING_LEVEL_ORDER
+        if lid in present and lid in REASONING_LEVEL_LABELS
+    ]
+
+
+def _lookup_reasoning_metadata_entry(
+    provider_id: str, model_id: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Read one model's metadata entry, trying the same key variants the
+    capability resolver uses (composite provider::model, bare id,
+    lowercased id, and models/<short> <-> <short> expansion).
+    Returns None on any read/parse failure — never raises.
+    """
+    if not model_id or not METADATA_CACHE.exists():
+        return None
+    try:
+        with open(METADATA_CACHE, "r", encoding="utf-8") as f:
+            vault = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(vault, dict):
+        return None
+
+    variants: List[str] = [model_id]
+    if "/" in model_id:
+        short = model_id.rsplit("/", 1)[-1]
+        if short and short not in variants:
+            variants.append(short)
+    else:
+        variants.append(f"models/{model_id}")
+
+    keys: List[str] = []
+    if provider_id:
+        keys.extend(f"{provider_id}::{m}" for m in variants)
+    keys.extend(variants)
+    lowered = model_id.lower()
+    if lowered != model_id:
+        keys.append(lowered)
+
+    for key in keys:
+        entry = vault.get(key)
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _descriptor_from_metadata(
+    entry: Optional[Dict[str, Any]],
+) -> Optional["ReasoningCapabilityDescriptor"]:
+    """
+    Build a descriptor from provider-declared discovery facts.
+
+    Reads ``capabilities.reasoning`` (flat boolean) plus
+    ``capability_details.reasoning`` (mode / allowed_options /
+    effort_levels / default) exactly as written by Scan Models
+    (``_parse_adapter_model_list`` and the live-capability layer).
+    This is NOT a hardcoded provider map — it only replays what the
+    provider itself declared. Used ONLY when the adapter returned
+    None ("no opinion").
+    """
+    from peldrun.llm.contracts import ReasoningCapabilityDescriptor
+
+    if not isinstance(entry, dict):
+        return None
+    caps = entry.get("capabilities")
+    if not isinstance(caps, dict):
+        return None
+    supported = caps.get("reasoning")
+    if supported is False:
+        return ReasoningCapabilityDescriptor.unsupported()
+    if supported is not True:
+        return None
+
+    details = entry.get("capability_details")
+    reasoning = details.get("reasoning") if isinstance(details, dict) else None
+    if not isinstance(reasoning, dict):
+        reasoning = {}
+
+    declared_mode = reasoning.get("mode")
+    declared_mode = (
+        declared_mode.strip().lower()
+        if isinstance(declared_mode, str)
+        else ""
+    )
+    if reasoning.get("state") == "unsupported" or declared_mode == "none":
+        return ReasoningCapabilityDescriptor.unsupported()
+    if declared_mode == "automatic":
+        return ReasoningCapabilityDescriptor(
+            supported=True,
+            mode="automatic",
+            toggle_available=False,
+            default_level=None,
+            level_ids=(),
+        )
+
+    # Accept both discovery shapes: LM Studio's allowed_options and
+    # the resolver's canonical effort_levels.
+    raw_allowed = reasoning.get("allowed_options")
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        raw_allowed = reasoning.get("effort_levels")
+    norm = [
+        str(a).strip().lower()
+        for a in (raw_allowed if isinstance(raw_allowed, list) else [])
+        if isinstance(a, str) and a.strip()
+    ]
+    granular = tuple(
+        lvl for lvl in REASONING_LEVEL_ORDER
+        if lvl in norm and lvl != "adaptive"
+    )
+    has_off = "off" in norm
+    has_on = "on" in norm
+
+    if not granular:
+        # Supported but no granular ladder declared by discovery.
+        #
+        # Two distinguishable sub-cases:
+        #
+        #   * Always-on (LM Studio reports ["on"] only) — surface the
+        #     "always on" badge; no toggle, no levels.
+        #
+        #   * Toggleable or unspecified (LM Studio ["off","on"], or
+        #     Ollama's flat `thinking` capability) — expose the
+        #     standard four-level ladder. Both providers silently
+        #     downgrade levels to boolean on models without level
+        #     support, so the wire behavior is identical to
+        #     `think: true` / `reasoning_effort: "on"`. Matches the
+        #     pre-redesign UI without fabricating support: metadata
+        #     already confirmed reasoning is available.
+        if has_on and not has_off:
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="automatic",
+                toggle_available=False,
+                default_level=None,
+                level_ids=(),
+            )
+        return ReasoningCapabilityDescriptor(
+            supported=True,
+            mode="effort",
+            toggle_available=True,
+            default_level="medium",
+            level_ids=("none", "low", "medium", "high"),
+        )
+
+    # "off" is the provider's wire word for the canonical "none".
+    if has_off and "none" not in granular:
+        granular = ("none",) + granular
+
+    default_raw = reasoning.get("default") or reasoning.get("default_effort")
+    default_level = "medium" if "medium" in granular else granular[0]
+    if isinstance(default_raw, str):
+        d = default_raw.strip().lower()
+        if d in granular:
+            default_level = d
+        elif d == "off" and "none" in granular:
+            default_level = "none"
+
+    mode = declared_mode if declared_mode in ("effort", "budget") else "effort"
+    return ReasoningCapabilityDescriptor(
+        supported=True,
+        mode=mode,
+        toggle_available=has_off or "none" in granular,
+        default_level=default_level,
+        level_ids=granular,
+    )
+
+
+@router.get("/reasoning-capabilities")
+async def get_reasoning_capabilities(
+    provider_id: str = "",
+    model: str = "",
+) -> Dict[str, Any]:
+    """
+    Resolve the reasoning capability descriptor for (provider, model).
+
+    Resolution order (P4, P5, P8):
+      1. Ask the adapter class for get_reasoning_options(). Legacy
+         ids (openai / lmstudio / ollama) are projected onto their
+         registered native equivalent, mirroring the dispatcher's
+         _resolve_native_adapter, so the displayed capabilities match
+         the adapter that will actually execute.
+      2. If the adapter has no opinion (None), replay the provider's
+         own discovery facts from models_metadata.json.
+      3. If both are silent, return UNSUPPORTED (hide the widget).
+         Never fabricate support.
+
+    No hardcoded fallback map. Ever.
+    """
+    from peldrun.llm.contracts import (
+        ReasoningCapabilityDescriptor,
+        ReasoningMode,
+    )
+
+    pid = (provider_id or "").strip().lower()
+    mid = (model or "").strip()
+
+    metadata_entry = _lookup_reasoning_metadata_entry(pid, mid)
+
+    descriptor: Optional[ReasoningCapabilityDescriptor] = None
+    source = "unsupported"
+
+    # (1) Adapter opinion — lazy imports, never raises.
+    if pid and mid:
+        try:
+            from peldrun.llm.providers import (
+                ensure_external_providers_discovered,
+            )
+            from peldrun.llm.providers.registry import provider_registry
+
+            try:
+                ensure_external_providers_discovered()
+            except Exception:
+                pass
+
+            reg = provider_registry.find(pid)
+            adapter_class = reg.adapter_class if reg is not None else None
+            if adapter_class is not None and getattr(
+                adapter_class, "ADAPTER_STYLE", "legacy"
+            ) != "v1":
+                # Legacy registration: ask the native equivalent.
+                # Try both the canonical id and the raw id so that
+                # "openai" (canonical openai_compat) still reaches
+                # openai_native, and "lm_studio" reaches lmstudio_native.
+                for native_id in (
+                    f"{reg.provider_id}_native",
+                    f"{pid}_native",
+                ):
+                    native_reg = provider_registry.find(native_id)
+                    if (
+                        native_reg is not None
+                        and native_reg.adapter_class is not None
+                    ):
+                        adapter_class = native_reg.adapter_class
+                        break
+
+            method = getattr(adapter_class, "get_reasoning_options", None)
+            if callable(method):
+                descriptor = method(mid, metadata_entry)
+                if descriptor is not None:
+                    source = "adapter"
+        except Exception as exc:
+            logger.debug(
+                "[reasoning-capabilities] adapter lookup failed for "
+                "%r/%r: %s",
+                pid, mid, exc,
+            )
+            descriptor = None
+
+    # (1b) Normalize TOGGLE → EFFORT when metadata confirms reasoning.
+    #
+    # Rationale
+    # ---------
+    # Several adapters and the metadata fallback return TOGGLE mode
+    # for models whose provider DID declare reasoning support but did
+    # NOT publish an explicit level ladder:
+    #
+    #   * OpenAI-compatible custom endpoints — the adapter has no
+    #     opinion, and metadata from Scan Models has
+    #     reasoning=True + allowed_options=["off","on"].
+    #   * LM Studio / Ollama — /api/v1/models and /api/show report
+    #     a flat boolean, not the per-model effort tiers.
+    #
+    # The pre-redesign UI always showed the standard four-level
+    # ladder, and users expect it back. Upgrading here is safe
+    # because:
+    #
+    #   * The wire behavior is IDENTICAL. Every provider that reports
+    #     only a boolean reasoning capability silently downgrades
+    #     `reasoning_effort="high"` to `reasoning=true` (OpenAI-compat
+    #     proxies, llama.cpp, Ollama's think parameter). No error, no
+    #     wasted request.
+    #   * The `toggle_available=True` flag preserves the on/off
+    #     switch alongside the dropdown.
+    #   * The upgrade fires ONLY when metadata.reasoning is True —
+    #     i.e. the provider CONFIRMED support. A provider that
+    #     reported reasoning=False is unaffected (stays unsupported);
+    #     a provider with no metadata stays unsupported (P5).
+    #
+    # If a future adapter returns a genuinely granular ladder
+    # (mode=EFFORT with custom levels), that answer wins — this
+    # normalization only touches TOGGLE results.
+    #
+    # [FIX-NORMALIZE-TOGGLE-V2] The previous version gated this
+    # upgrade on `metadata_entry.capabilities.reasoning is True`,
+    # which failed in two real cases:
+    #
+    #   * A model that was never scanned (no metadata_entry) — the
+    #     adapter's TOGGLE answer was returned verbatim, leaving the
+    #     UI stuck on an on/off switch.
+    #
+    #   * A model whose metadata existed but carried
+    #     `reasoning: None` or no `capabilities` dict — same result.
+    #
+    # Both cases are logically identical to "the adapter said
+    # reasoning is supported but declined to enumerate levels".
+    # The adapter's own `supported=True, mode=TOGGLE` IS the
+    # confirmation of support. Gating on metadata was defensive
+    # against fabricated support — but the adapter cannot fabricate
+    # TOGGLE: it only returns TOGGLE when it has positively
+    # determined reasoning exists and is a boolean.
+    #
+    # Every provider whose wire format silently downgrades
+    # `reasoning_effort="high"` to `reasoning=true` (OpenAI-compat
+    # proxies, llama.cpp, Ollama's think parameter) benefits from
+    # the upgrade; users who want strict toggle semantics can force
+    # it via `allowed_options: ["off", "on"]` in ModelInfoModal,
+    # which bypasses this normalization (the descriptor comes back
+    # from `_descriptor_from_metadata` with `mode="toggle"` because
+    # it is the manual source).
+    #
+    # `metadata_entry` is no longer consulted here. It remains a
+    # sanity input elsewhere in this function.
+    if (
+        descriptor is not None
+        and descriptor.supported
+        and descriptor.mode is ReasoningMode.TOGGLE
+    ):
+        descriptor = ReasoningCapabilityDescriptor(
+            supported=True,
+            mode=ReasoningMode.EFFORT,
+            toggle_available=True,
+            default_level="medium",
+            level_ids=("none", "low", "medium", "high"),
+        )
+        source = (
+            "adapter_normalized"
+            if source == "adapter"
+            else "metadata_normalized"
+        )
+
+    # (2) Metadata opinion — only when neither the adapter nor the
+    # normalization above produced a descriptor.
+    if descriptor is None and metadata_entry is not None:
+        descriptor = _descriptor_from_metadata(metadata_entry)
+        if descriptor is not None:
+            source = "metadata"
+
+    # (3) Safe default (P5).
+    if descriptor is None:
+        descriptor = ReasoningCapabilityDescriptor.unsupported()
+        source = "unsupported"
+
+    return {
+        "ok": True,
+        "provider_id": pid,
+        "model_id": mid,
+        "supported": descriptor.supported,
+        "mode": descriptor.mode.value,
+        "toggle_available": descriptor.toggle_available,
+        "default_level": descriptor.default_level,
+        "options": _expand_level_ids(descriptor.level_ids),
+        "source": source,
+    }
 
 
 class TestLLMRequest(BaseModel):

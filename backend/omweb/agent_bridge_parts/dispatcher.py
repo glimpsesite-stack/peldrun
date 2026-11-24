@@ -159,17 +159,181 @@ def _check_model_metadata_reasoning(model_name: str) -> Optional[bool]:
         for p in candidates:
             if p.exists():
                 data = json.loads(p.read_text(encoding="utf-8"))
-                meta = data.get(model_name)
-                if isinstance(meta, dict):
-                    caps = meta.get("capabilities", {})
-                    if isinstance(caps, dict) and "reasoning" in caps:
-                        return bool(caps["reasoning"])
-                    if "is_reasoning" in meta:
-                        return bool(meta["is_reasoning"])
-                    if "reasoning" in meta:
-                        return bool(meta["reasoning"])
+                # Try both the exact name and the lowercased variant —
+                # metadata is written with mixed casing by different
+                # discovery paths.
+                meta = data.get(model_name) or data.get(model_name.lower())
+                if not isinstance(meta, dict):
+                    continue
+
+                # [FIX-NONE-IS-NOT-FALSE] ``None`` means "unknown" (the
+                # provider did not report a reasoning capability for
+                # this model). It MUST NOT be conflated with ``False``
+                # ("provider explicitly denied reasoning"). Conflating
+                # them caused adapter family knowledge to be blocked
+                # by an auto-scan entry that merely had no data.
+                caps = meta.get("capabilities", {})
+                if isinstance(caps, dict) and "reasoning" in caps:
+                    val = caps["reasoning"]
+                    if val is None:
+                        return None
+                    return bool(val)
+                if "is_reasoning" in meta:
+                    val = meta["is_reasoning"]
+                    if val is None:
+                        return None
+                    return bool(val)
+                if "reasoning" in meta:
+                    val = meta["reasoning"]
+                    if val is None:
+                        return None
+                    return bool(val)
     except Exception as e:
         logger.debug(f"Could not load reasoning metadata for {model_name}: {e}")
+    return None
+
+
+def _check_manual_reasoning_override(
+    model_name: str,
+) -> Optional[bool]:
+    """
+    Return the user's EXPLICIT reasoning override, or ``None``.
+
+    A manual override (``capability_sources.reasoning == "manual"``)
+    is the ONLY signal that outranks the provider adapter's family
+    knowledge. It represents a deliberate user decision in
+    ModelInfoModal, not an automated scan guess.
+
+    Returns
+    -------
+    True | False | None
+        * True/False — the user explicitly chose this value.
+        * None       — no manual override exists; the caller should
+                       continue to the next layer.
+    """
+    try:
+        from peldrun.storage_paths import get_storage_root
+
+        canonical = get_storage_root() / "models_metadata.json"
+        module_dir = Path(__file__).resolve().parent
+        candidates = [
+            canonical,
+            module_dir.parent.parent / "storage" / "models_metadata.json",
+            Path("storage/models_metadata.json").resolve(),
+            Path("backend/storage/models_metadata.json").resolve(),
+        ]
+        for p in candidates:
+            if not p.exists():
+                continue
+            data = json.loads(p.read_text(encoding="utf-8"))
+            entry = data.get(model_name) or data.get(model_name.lower())
+            if not isinstance(entry, dict):
+                continue
+
+            sources = entry.get("capability_sources") or {}
+            if not isinstance(sources, dict):
+                continue
+            if sources.get("reasoning") != "manual":
+                continue
+
+            caps = entry.get("capabilities") or {}
+            if isinstance(caps, dict) and "reasoning" in caps:
+                val = caps["reasoning"]
+                if val is not None:
+                    return bool(val)
+            if "is_reasoning" in entry and entry["is_reasoning"] is not None:
+                return bool(entry["is_reasoning"])
+            if "reasoning" in entry and entry["reasoning"] is not None:
+                return bool(entry["reasoning"])
+    except Exception as exc:
+        logger.debug(
+            "[BRIDGE] Manual reasoning override lookup failed for "
+            "%r: %s",
+            model_name,
+            exc,
+        )
+    return None
+
+
+def _check_adapter_reasoning_opinion(
+    model_name: str,
+    active_llm: Optional[Dict[str, Any]],
+) -> Optional[bool]:
+    """
+    Query the provider adapter for its reasoning family knowledge.
+
+    Returns ``True`` / ``False`` when the adapter recognises the
+    model family, or ``None`` when the adapter has no opinion
+    (unknown model, unregistered provider, or a legacy alias that
+    no native equivalent can resolve).
+
+    Legacy ids (``openai`` / ``lmstudio`` / ``ollama`` / ``deepseek``)
+    are projected onto their native equivalents exactly as
+    ``/api/config/reasoning-capabilities`` does it, so the dispatcher
+    and the UI always agree about which models reason.
+    """
+    if not (active_llm and model_name):
+        return None
+
+    # ``provider`` is the normalized id the frontend writes
+    # (``activeProvider.toLowerCase().replace(/[^a-z0-9]/g, "")``).
+    # Fall back to the display name for legacy configs.
+    _provider_id = str(active_llm.get("provider") or "").strip().lower()
+    if not _provider_id:
+        _provider_name = str(
+            active_llm.get("provider_name") or ""
+        ).strip().lower()
+        if _provider_name:
+            _provider_id = "".join(
+                c for c in _provider_name if c.isalnum()
+            )
+    if not _provider_id:
+        return None
+
+    try:
+        from peldrun.llm.providers.registry import provider_registry
+
+        reg = provider_registry.find(_provider_id)
+        adapter_class = (
+            reg.adapter_class if reg is not None else None
+        )
+
+        # Project legacy registrations onto their native equivalent
+        # (e.g. "lmstudio" -> lmstudio_native, "deepseek" ->
+        # deepseek_native). Mirrors _resolve_native_adapter.
+        if (
+            adapter_class is not None
+            and getattr(adapter_class, "ADAPTER_STYLE", "legacy")
+            != "v1"
+        ):
+            for _native_id in (
+                f"{reg.provider_id}_native",
+                f"{_provider_id}_native",
+            ):
+                _native_reg = provider_registry.find(_native_id)
+                if (
+                    _native_reg is not None
+                    and _native_reg.adapter_class is not None
+                ):
+                    adapter_class = _native_reg.adapter_class
+                    break
+
+        if adapter_class is not None:
+            _method = getattr(
+                adapter_class, "get_reasoning_options", None
+            )
+            if callable(_method):
+                descriptor = _method(model_name, None)
+                if descriptor is not None:
+                    return bool(descriptor.supported)
+    except Exception as exc:
+        logger.debug(
+            "[BRIDGE] Adapter reasoning lookup failed for "
+            "provider=%r model=%r: %s",
+            _provider_id,
+            model_name,
+            exc,
+        )
     return None
 
 
@@ -469,35 +633,84 @@ def _resolve_model_temperature(
 
     return None
 
-
-def _is_reasoning_model(model_name: str, active_llm: Optional[Dict[str, Any]] = None) -> bool:
+def _is_reasoning_model(
+    model_name: str,
+    active_llm: Optional[Dict[str, Any]] = None,
+) -> bool:
     """
-    Deterministically identify whether the target model is a reasoning-centric model.
-    """
-    if active_llm:
-        if "is_reasoning_model" in active_llm and active_llm["is_reasoning_model"] is not None:
-            return bool(active_llm["is_reasoning_model"])
-        if "is_reasoning" in active_llm and active_llm["is_reasoning"] is not None:
-            return bool(active_llm["is_reasoning"])
+    Determine whether the target model supports reasoning.
 
+    Layered resolution (highest -> lowest priority):
+
+      1. **Manual user override** — an explicit
+         ``capability_sources.reasoning == "manual"`` entry in
+         ``models_metadata.json``. The user's deliberate choice,
+         written via ModelInfoModal, outranks everything.
+
+      2. **Provider adapter family knowledge** — the same
+         ``get_reasoning_options()`` query that powers
+         ``/api/config/reasoning-capabilities``. Authoritative for
+         the model's own family (deepseek-v4/flash, gpt-5, o1,
+         claude-4, ...).
+
+      3. **Auto-scan metadata** — ``capabilities.reasoning``
+         written by Scan Models. Only reached when the adapter has
+         no opinion (unknown model). ``None`` here means "unknown"
+         and falls through.
+
+      4. **Client hint** — ``active_llm["is_reasoning_model"]`` from
+         the frontend's name-based heuristic. Weaker than any
+         provider signal; only used for models the backend cannot
+         classify.
+
+      5. **False** — safe default (P5: uncertainty is "no
+         reasoning", never a fabricated "yes").
+
+    Design invariants
+    -----------------
+    * No hardcoded substring lists. Adding a new reasoning family
+      requires ONE of:
+        a) Scan Models writes ``capabilities.reasoning=True``
+           (user-driven, zero code change), OR
+        b) The adapter extends ``get_reasoning_options()``
+           (adapter-driven, one file, no dispatcher change).
+
+    * ``None`` from any layer means "no opinion" and falls through;
+      only ``True`` / ``False`` short-circuits.
+
+    * Every layer is best-effort. A broken metadata file, a
+      missing adapter, or a registry import failure must never
+      abort the run — the next layer runs, and finally ``False``.
+    """
+    # Layer 1 — explicit user override (highest priority).
+    manual = _check_manual_reasoning_override(model_name)
+    if manual is not None:
+        return manual
+
+    # Layer 2 — provider adapter family knowledge.
+    adapter_opinion = _check_adapter_reasoning_opinion(
+        model_name, active_llm
+    )
+    if adapter_opinion is not None:
+        return adapter_opinion
+
+    # Layer 3 — auto-scan metadata (only reached when the adapter
+    # has no opinion, i.e. unknown model family).
     db_flag = _check_model_metadata_reasoning(model_name)
     if db_flag is not None:
         return db_flag
 
-    norm = (model_name or "").lower()
-    return any(
-        sub in norm
-        for sub in (
-            "nemotron",
-            "deepseek-r1",
-            "reasoner",
-            "qwq",
-            "o1-",
-            "o3-",
-            "thought",
-            "thinking",
-        )
-    )
+    # Layer 4 — client-side hint (weakest).
+    if active_llm:
+        if (
+            active_llm.get("is_reasoning_model") is not None
+        ):
+            return bool(active_llm["is_reasoning_model"])
+        if active_llm.get("is_reasoning") is not None:
+            return bool(active_llm["is_reasoning"])
+
+    # Layer 5 — safe default.
+    return False
 
 
 # =========================================================================
@@ -996,8 +1209,13 @@ def _resolve_provider_and_extras(
     # ------------------------------------------------------------------
     native_result = _resolve_native_adapter(active_llm, candidates)
     if native_result is not None:
+        logger.debug(
+            "[BRIDGE] _resolve_provider_and_extras -> %r",
+            native_result[0],
+        )
         return native_result
 
+    logger.debug("[BRIDGE] _resolve_provider_and_extras -> 'openai_compat'")
     return ("openai_compat", {})
 
 
@@ -2242,6 +2460,12 @@ async def run_direct_chat(
     is_reasoner = _is_reasoning_model(model_name, active_llm=active_llm)
     raw_effort = str(active_llm.get("reasoning_effort") or "none").lower().strip() if is_reasoner else "none"
     reasoning_effort = "none" if raw_effort in ("none", "off", "0") else raw_effort
+    logger.debug(
+        "[BRIDGE DIRECT CHAT] is_reasoner=%s raw_effort=%r "
+        "reasoning_effort=%r provider=%r base_url=%r",
+        is_reasoner, raw_effort, reasoning_effort,
+        active_llm.get("provider"), active_llm.get("base_url"),
+    )
 
     if "1234" in base_url or "lmstudio" in provider_name.lower():
         readiness = await check_lmstudio_model_readiness(base_url, model_name, api_key)

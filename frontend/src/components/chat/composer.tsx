@@ -31,6 +31,7 @@ import { AgentSelector } from "./agent-selector";
 import { EngineSelector } from "./engine-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
 import { ReasoningEffortSelector } from "./reasoning-effort-selector";
+import { resolveProviderId } from "@/lib/api/reasoning-capabilities";
 import { useChatStore } from "@/stores/chat-store";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
@@ -1705,11 +1706,25 @@ export function Composer({
               </button>
             </div>
 
-            {isReasoningSupported && (
-              <div className="animate-in fade-in zoom-in-95 duration-200">
-                <ReasoningEffortSelector disabled={disabled || isRunning || isSubmitting} />
-              </div>
-            )}
+            {/* Dynamic Reasoning Effort Selector.
+                Self-hides when the backend reports no reasoning
+                support for this (provider, model) pair — see
+                /api/config/reasoning-capabilities. The previous
+                `isReasoningSupported` gate used client-side
+                heuristics that could disagree with the backend;
+                the payload still derives `is_reasoning_model` from
+                it, but the render gate is now backend-authoritative. */}
+            <div className="animate-in fade-in zoom-in-95 duration-200">
+              <ReasoningEffortSelector
+                providerId={resolveProviderId(
+                  activeProvider,
+                  activeModel,
+                  metadataVault,
+                )}
+                modelId={activeModel}
+                disabled={disabled || isRunning || isSubmitting}
+              />
+            </div>
 
             {execMode === "chat" && (
               <button

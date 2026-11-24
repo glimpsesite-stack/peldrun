@@ -253,6 +253,13 @@ def _bootstrap_builtin_providers() -> None:
         "LMStudioNativeAdapter",
         "LM Studio (Native)",
     )
+    _register_native(
+        "deepseek_native",
+        "peldrun.llm.providers.deepseek_native",
+        "DeepSeekNativeAdapter",
+        "DeepSeek (Native)",
+        aliases=["deepseek"],
+    )
 
     logger.debug(
         "Built-in provider registry bootstrapped: %s",
@@ -434,6 +441,7 @@ _LAZY_ADAPTERS = {
     "GoogleGenAIAdapter": "peldrun.llm.providers.google_genai.GoogleGenAIAdapter",
     "OllamaNativeAdapter": "peldrun.llm.providers.ollama_native.OllamaNativeAdapter",
     "LMStudioNativeAdapter": "peldrun.llm.providers.lmstudio_native.LMStudioNativeAdapter",
+    "DeepSeekNativeAdapter": "peldrun.llm.providers.deepseek_native.DeepSeekNativeAdapter",
 }
 
 
@@ -471,6 +479,7 @@ __all__ = [
     "GoogleGenAIAdapter",
     "OllamaNativeAdapter",
     "LMStudioNativeAdapter",
+    "DeepSeekNativeAdapter",
     # Canonical creation path
     "ProviderFactory",
     "provider_factory",

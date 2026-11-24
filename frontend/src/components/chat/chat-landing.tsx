@@ -32,6 +32,7 @@ import { showToast } from "@/components/ui/ToastNotification";
 import { AgentSelector } from "./agent-selector";
 import { ActiveToolsModal } from "./active-tools-modal";
 import { ReasoningEffortSelector } from "./reasoning-effort-selector";
+import { resolveProviderId } from "@/lib/api/reasoning-capabilities";
 import { useAppStorage } from "@/hooks/use-app-storage";
 import { inferModelCapabilities, fetchServerMetadata } from "@/lib/modelMetadata";
 import { LexicalEditorComponent } from "./composer/lexical-editor";
@@ -1192,12 +1193,25 @@ export function ChatLanding({
               </span>
             )}
 
-            {/* Dynamic Reasoning Effort Selector */}
-            {isReasoningSupported && (
-              <div className="animate-in fade-in zoom-in-95 duration-200">
-                <ReasoningEffortSelector />
-              </div>
-            )}
+            {/* Dynamic Reasoning Effort Selector.
+                The selector self-hides when the (provider, model)
+                pair does not support reasoning — the backend's
+                `/reasoning-capabilities` endpoint is the single
+                source of truth, replacing the client-side
+                `inferModelCapabilities` heuristic that previously
+                gated this block. `isReasoningSupported` remains in
+                use for the run PAYLOAD (`is_reasoning_model`) —
+                only the render gate moved. */}
+            <div className="animate-in fade-in zoom-in-95 duration-200">
+              <ReasoningEffortSelector
+                providerId={resolveProviderId(
+                  activeProvider,
+                  activeModel,
+                  metadataVault,
+                )}
+                modelId={activeModel}
+              />
+            </div>
 
             {/* Web Search Toggle (Chat Mode Only) */}
             {execMode === "chat" && (

@@ -58,9 +58,32 @@ export const storageSchema = {
     defaultValue: "agent",
   },
 
+  // Reasoning effort level chosen by the user.
+  //
+  // This is a FREE STRING, not an enum. Reason:
+  //
+  //   * The set of valid levels is provider- AND model-specific
+  //     (OpenAI o1 rejects "none"; gpt-5 adds "minimal"; Anthropic
+  //     maps levels to a token budget; LM Studio reports its own
+  //     allowed_options per model).
+  //   * The backend exposes the authoritative list via
+  //     GET /api/config/reasoning-capabilities. The selector UI
+  //     fetches that list and validates the stored value against it
+  //     on every model change.
+  //
+  // Pinning the type to a fixed enum here would silently reject any
+  // level a future provider introduces (e.g. "minimal") before it
+  // ever reaches the UI. The schema stays permissive; the selector is
+  // the validator.
+  //
+  // Backward compatibility:
+  //   * Existing stored values ("none", "low", "medium", "high") are
+  //     still valid — nothing is migrated.
+  //   * The "none" default is preserved so a first-time user gets the
+  //     same initial behavior as before.
   reasoning_effort: {
     tier: "local",
-    schema: z.enum(["none", "low", "medium", "high"]),
+    schema: z.string().min(1).max(32),
     defaultValue: "none",
   },
 

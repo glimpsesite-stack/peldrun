@@ -868,12 +868,11 @@ class RequestCompiler:
         # OpenAI Responses.
         # ------------------------------------------------------------------
         if strategy == ReasoningStrategy.OPENAI_RESPONSES:
-            if mode_value == "effort" and effort:
-                return {"effort": effort}
-            if mode_value in ("toggle", "budget"):
-                # Responses API accepts ``effort`` or ``summary`` for
-                # reasoning. Default to "medium" when only a toggle was
-                # requested.
+            if effort and str(effort).strip():
+                return {"effort": str(effort).strip().lower()}
+            if mode_value == "effort":
+                return {"effort": "medium"}
+            if mode_value in ("toggle", "budget", "adaptive"):
                 return {"effort": "medium"}
             return None
 
@@ -884,9 +883,21 @@ class RequestCompiler:
             ReasoningStrategy.OPENAI_CHAT_COMPLETIONS,
             ReasoningStrategy.OPENAI_COMPATIBLE,
         ):
-            if mode_value == "effort" and effort:
-                return {"reasoning_effort": effort}
-            if mode_value in ("toggle", "budget"):
+            # ALWAYS respect the explicit effort value from the request.
+            # The dispatcher sets effort="none" when the user selects "Off",
+            # even if the model capabilities report mode="adaptive" (e.g.
+            # from LiteLLM external registry). Ignoring effort here caused
+            # "Off" to be compiled as "medium", breaking the disable toggle.
+            if effort and str(effort).strip():
+                return {"reasoning_effort": str(effort).strip().lower()}
+
+            if mode_value == "effort":
+                return {"reasoning_effort": "medium"}
+            if mode_value in ("toggle", "budget", "adaptive"):
+                # ``adaptive`` means "let the provider decide" — but
+                # OpenAI-compatible endpoints (DeepSeek, LM Studio,
+                # llama.cpp) do not understand that concept. Send an
+                # explicit ``medium`` so reasoning actually fires.
                 return {"reasoning_effort": "medium"}
             return None
 
@@ -908,18 +919,16 @@ class RequestCompiler:
                 return {"output_config": {"effort": effort}}
             return None
 
+
         # ------------------------------------------------------------------
         # Google GenAI.
         # ------------------------------------------------------------------
         if strategy == ReasoningStrategy.GOOGLE_GENAI:
-            if mode_value == "effort" and effort:
-                # Google uses ``thinking_level`` for models that support
-                # it, and ``thinking_budget`` for token-budget models.
-                # We use ``thinking_budget`` by default; models that
-                # require ``thinking_level`` should be handled by the
-                # adapter's ``_compile_reasoning`` override.
-                return {"thinking_level": effort}
-            if mode_value in ("toggle", "budget"):
+            if effort and str(effort).strip():
+                return {"thinking_level": str(effort).strip().lower()}
+            if mode_value == "effort":
+                return {"thinking_level": "medium"}
+            if mode_value in ("toggle", "budget", "adaptive"):
                 return {"thinking_budget": budget if budget else 4000}
             return None
 
@@ -927,26 +936,33 @@ class RequestCompiler:
         # Ollama native.
         # ------------------------------------------------------------------
         if strategy == ReasoningStrategy.OLLAMA_NATIVE:
+            if effort and str(effort).strip():
+                eff_lower = str(effort).strip().lower()
+                if eff_lower in ("none", "off", "0", "false"):
+                    return {"think": False}
+                return {"think": eff_lower}
             if mode_value == "toggle":
                 return {"think": True}
-            if mode_value == "effort" and effort:
-                return {"think": effort}
-            if mode_value == "budget" and budget:
-                return {"think": True}  # Ollama does not accept token budgets
+            if mode_value == "effort":
+                return {"think": True}
+            if mode_value in ("budget", "adaptive"):
+                # Ollama does not accept token budgets; ``think: true``
+                # is the only way to enable reasoning.
+                return {"think": True}
             return None
+
 
         # ------------------------------------------------------------------
         # LM Studio native.
         # ------------------------------------------------------------------
         if strategy == ReasoningStrategy.LMSTUDIO_NATIVE:
-            if mode_value == "effort" and effort:
-                return {"reasoning_effort": effort}
-            if mode_value in ("toggle", "budget"):
+            if effort and str(effort).strip():
+                return {"reasoning_effort": str(effort).strip().lower()}
+            if mode_value == "effort":
+                return {"reasoning_effort": "medium"}
+            if mode_value in ("toggle", "budget", "adaptive"):
                 return {"reasoning_effort": "medium"}
             return None
-
-        return None
-
     # ------------------------------------------------------------------
     # Helpers — tools
     # ------------------------------------------------------------------

@@ -57,6 +57,7 @@ See also
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -66,6 +67,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     runtime_checkable,
 )
 
@@ -394,6 +396,145 @@ class ModelCapabilities(BaseModel):
     streaming: StreamingCapability = Field(default_factory=StreamingCapability)
     structured_output: StructuredOutputCapability = Field(default_factory=StructuredOutputCapability)
     modalities: ModalitiesCapability = Field(default_factory=ModalitiesCapability)
+
+
+# ---------------------------------------------------------------------------
+# Reasoning capability descriptor (UI control surface)
+# ---------------------------------------------------------------------------
+
+#: Modes a ReasoningCapabilityDescriptor may expose to the UI.
+#: ``ReasoningMode.ADAPTIVE`` is deliberately EXCLUDED: it is resolver
+#: vocabulary ("provider decides, PELDRUN sends no parameter"), not a
+#: control surface. Adapters must project that situation onto
+#: ``AUTOMATIC`` (always-on badge) when describing it for the frontend.
+_DESCRIPTOR_MODES = frozenset(
+    {
+        ReasoningMode.NONE,
+        ReasoningMode.AUTOMATIC,
+        ReasoningMode.EFFORT,
+        ReasoningMode.BUDGET,
+        ReasoningMode.TOGGLE,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ReasoningCapabilityDescriptor:
+    """
+    Complete reasoning capability description for one (provider, model)
+    pair, as consumed by GET /api/config/reasoning-capabilities.
+
+    This is the ONLY shape adapters and the config router exchange for
+    the reasoning UI. The frontend never constructs it — it always
+    receives the expanded form (ids + labels) from the backend.
+
+    Contract (Dynamic Reasoning Capabilities plan):
+      * Adapters return a descriptor from ``get_reasoning_options()``
+        or ``None`` ("no opinion" — the router then consults discovery
+        metadata). A fabricated ``supported=True`` is forbidden: when
+        uncertain, return ``None`` (plan principle P5).
+      * ``level_ids`` carries canonical level IDs only ("none",
+        "minimal", "low", "medium", "high", ...). Display labels,
+        descriptions and badge styling are expanded by the router from
+        its single canonical catalog — never stored here (P6).
+      * ``mode`` describes the provider's API surface, not a widget:
+        ``budget`` means the dispatcher translates levels into a token
+        budget downstream; the UI renders ``effort`` and ``budget``
+        identically.
+
+    Render semantics per mode:
+      * ``none``      → widget hidden (model has no reasoning).
+      * ``toggle``    → on/off switch only, no level list.
+      * ``automatic`` → "always on" badge, no user control.
+      * ``effort``    → level list (+ toggle when toggle_available).
+      * ``budget``    → same as effort; translation happens downstream.
+
+    Instances are immutable and validate their own consistency at
+    construction time. An adapter bug therefore surfaces as a
+    ValueError at the call site — the endpoint catches it and falls
+    back to metadata → unsupported — instead of rendering a broken
+    widget or offering levels the provider cannot honor.
+    """
+
+    supported: bool
+    mode: ReasoningMode
+    toggle_available: bool
+    default_level: Optional[str]
+    level_ids: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        # -- Coerce mode into the shared enum vocabulary ----------------
+        # Accepts both a plain string ("effort") and a ReasoningMode
+        # member, so adapter call sites stay ergonomic while the stored
+        # value is always canonical.
+        try:
+            mode = ReasoningMode(self.mode)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Invalid reasoning mode: {self.mode!r}"
+            ) from exc
+        if mode not in _DESCRIPTOR_MODES:
+            raise ValueError(
+                f"ReasoningMode.{mode.name} is not a UI control surface; "
+                "adapters must project it onto 'automatic'."
+            )
+        object.__setattr__(self, "mode", mode)
+
+        # -- Normalize level_ids into an immutable tuple of clean IDs ---
+        raw_ids = self.level_ids
+        if isinstance(raw_ids, str):
+            raise ValueError("level_ids must be a sequence of IDs, not a str")
+        try:
+            ids = tuple(raw_ids)
+        except TypeError as exc:
+            raise ValueError(
+                "level_ids must be an iterable of strings"
+            ) from exc
+        for lid in ids:
+            if not isinstance(lid, str) or not lid.strip():
+                raise ValueError(f"Invalid level id: {lid!r}")
+        object.__setattr__(self, "level_ids", ids)
+
+        # -- Cross-field consistency (illegal states are rejected) ------
+        if self.supported and mode is ReasoningMode.NONE:
+            raise ValueError("mode='none' requires supported=False")
+        if not self.supported:
+            if mode is not ReasoningMode.NONE:
+                raise ValueError("supported=False requires mode='none'")
+            if ids or self.toggle_available or self.default_level is not None:
+                raise ValueError(
+                    "unsupported descriptor must have no levels, no toggle "
+                    "and no default_level"
+                )
+        if mode in (ReasoningMode.EFFORT, ReasoningMode.BUDGET) and not ids:
+            raise ValueError(
+                f"mode='{mode.value}' requires at least one level id"
+            )
+        if mode in (ReasoningMode.TOGGLE, ReasoningMode.AUTOMATIC) and ids:
+            raise ValueError(f"mode='{mode.value}' must not carry level ids")
+        if mode is ReasoningMode.TOGGLE and not self.toggle_available:
+            raise ValueError("mode='toggle' requires toggle_available=True")
+        if mode is ReasoningMode.AUTOMATIC and self.toggle_available:
+            raise ValueError("mode='automatic' cannot offer a toggle")
+        if self.default_level is not None and self.default_level not in ids:
+            raise ValueError(
+                f"default_level {self.default_level!r} is not in level_ids"
+            )
+
+    @classmethod
+    def unsupported(cls) -> "ReasoningCapabilityDescriptor":
+        """
+        Safe default when neither the adapter nor discovery metadata
+        can determine reasoning support (plan principle P5: uncertainty
+        means hidden — never a fabricated generic level list).
+        """
+        return cls(
+            supported=False,
+            mode=ReasoningMode.NONE,
+            toggle_available=False,
+            default_level=None,
+            level_ids=(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +930,8 @@ __all__ = [
     "StructuredOutputCapability",
     "ModalitiesCapability",
     "ModelCapabilities",
+    # Reasoning UI descriptor (adapter -> config router -> frontend)
+    "ReasoningCapabilityDescriptor",
     # Adapter profile + connection
     "AdapterFeatures",
     "AdapterProfile",

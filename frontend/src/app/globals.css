@@ -273,3 +273,10 @@ span[aria-hidden="true"] > svg {
 /* ============================================================
    End PELDRUN SMART LINK CHIPS & FAVICONS (ChatGPT-style)
    ============================================================ */
+.prism-code {
+  background-color: rgb(251 251 251) !important;
+}
+
+.dark .prism-code {
+  background-color: hsl(var(--darkest)) !important;
+}

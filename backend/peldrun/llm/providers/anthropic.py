@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -77,6 +78,7 @@ from peldrun.llm.contracts import (
     AdapterProfile,
     ConnectionContext,
     LLMStreamEvent,
+    ReasoningCapabilityDescriptor,
     ReasoningStrategy,
     StreamEventType,
     ToolCallStyle,
@@ -138,6 +140,26 @@ _DEFAULT_THINKING_BUDGET = 4000
 #: produce the exact silent-empty-response failure this constant
 #: exists to prevent.
 _MIN_OUTPUT_RESERVE = 1024
+
+#: Extracts the generation (and optional single-digit minor) from every
+#: published Claude model-id spelling. Both official orderings work:
+#:
+#:   claude-3-7-sonnet-20250219   -> gen=3 minor=7
+#:   claude-3-opus-20240229       -> gen=3 minor=None
+#:   claude-sonnet-4-5-20250929   -> gen=4 minor=5
+#:   claude-opus-4-1              -> gen=4 minor=1
+#:   claude-sonnet-4-20250514     -> gen=4 minor=None
+#:   claude-4-sonnet (proxy)      -> gen=4 minor=None
+#:
+#: The ``(?!\d)`` guard is what stops an 8-digit date suffix from being
+#: mistaken for a minor version — without it, "claude-sonnet-4-20250514"
+#: would parse as revision 4.20250514 and trigger revision-gated logic.
+#: Callers MUST lowercase the id and replace "." with "-" first, so
+#: Bedrock ("anthropic.claude-3.7...") and dotted spellings normalize in.
+_CLAUDE_GENERATION_RE = re.compile(
+    r"claude-(?:(?:opus|sonnet|haiku)-)?"
+    r"(?P<gen>\d+)(?:-(?P<minor>\d)(?!\d))?"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -640,12 +662,92 @@ class AnthropicAdapter:
             response = await self._client.models.retrieve(model_id)
         except Exception:
             return None
-
         return {
             "id": getattr(response, "id", model_id),
             "display_name": getattr(response, "display_name", None),
             "type": getattr(response, "type", "model"),
         }
+
+    # ------------------------------------------------------------------
+    # Reasoning capability query (Dynamic Reasoning Capabilities plan)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_reasoning_options(
+        cls,
+        model_id: str,
+        metadata_entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ReasoningCapabilityDescriptor]:
+        """
+        Return the reasoning control surface for a Claude model.
+
+        Adapter-owned family knowledge (plan principles P3/P7). The
+        config router calls this from
+        GET /api/config/reasoning-capabilities; the frontend never
+        guesses levels locally.
+
+        Family rule:
+          * Claude 3.7 is the FIRST generation with extended thinking.
+          * Every generation from 4 onward (Opus / Sonnet / Haiku,
+            including the 4.1 and 4.5 revisions) ships with it.
+          * Claude 3.5 and older (3 Opus / Haiku / Sonnet, 2.x) have
+            no thinking surface at all.
+          * Anything that is not a recognizable Claude id -> None
+            ("no opinion"): the router consults discovery metadata,
+            then hides the widget (P5).
+
+        Why mode="budget" for every thinking-capable model:
+          ``thinking.budget_tokens`` is the common denominator accepted
+          across the whole 3.7 -> 4.x range, and this adapter already
+          translates it safely (minimum budget + output reserve, see
+          ``_build_reasoning_kwargs``). Newer models additionally accept
+          the ``output_config.effort`` surface, but advertising "effort"
+          would be a per-revision claim with no UI benefit: the frontend
+          renders "budget" and "effort" identically, and the translation
+          stays inside this adapter where it belongs.
+
+        Why "none" is a real level here:
+          Unlike OpenAI's o-series, Claude thinking is opt-in per
+          request — omitting the thinking block disables it. The off
+          toggle therefore maps to a wire behavior the API honors,
+          rather than to a value the provider would reject.
+
+        ``metadata_entry`` is accepted for contract symmetry; Claude
+        family knowledge is authoritative here, so it is not read.
+        """
+        norm = (model_id or "").strip().lower().replace(".", "-")
+        if not norm:
+            return None
+
+        match = _CLAUDE_GENERATION_RE.search(norm)
+        if match is None:
+            # Not a recognizable Claude id (custom proxy naming,
+            # "claude-instant-*", ...). No opinion — let metadata speak.
+            return None
+
+        generation = int(match.group("gen"))
+        minor_raw = match.group("minor")
+        minor = int(minor_raw) if minor_raw else 0
+
+        # Gateway shorthand: some proxies spell 3.5 / 3.7 as "35" / "37".
+        # Without this, "claude-35-haiku" parses as generation 35 and
+        # would be advertised as thinking-capable (it is not).
+        if generation in (35, 37):
+            generation, minor = 3, generation % 10
+
+        thinking_capable = (
+            (generation == 3 and minor == 7) or generation >= 4
+        )
+        if not thinking_capable:
+            return ReasoningCapabilityDescriptor.unsupported()
+
+        return ReasoningCapabilityDescriptor(
+            supported=True,
+            mode="budget",
+            toggle_available=True,
+            default_level="medium",
+            level_ids=("none", "low", "medium", "high"),
+        )
 
     # ------------------------------------------------------------------
     # ProviderAdapter: close

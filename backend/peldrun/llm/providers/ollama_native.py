@@ -112,6 +112,8 @@ from peldrun.llm.contracts import (
     AdapterProfile,
     ConnectionContext,
     LLMStreamEvent,
+    ReasoningCapabilityDescriptor,
+    ReasoningMode,
     ReasoningStrategy,
     StreamEventType,
     ToolCallStyle,
@@ -233,6 +235,202 @@ class OllamaNativeAdapter:
     API_CONTRACT = "peldrun.llm.provider.v1"
     PROFILE = _PROFILE
     provider_id = "ollama_native"
+
+    # ------------------------------------------------------------------
+    # Reasoning capability declaration
+    # ------------------------------------------------------------------
+    #
+    # Called by ``GET /api/config/reasoning-capabilities`` (see
+    # ``omweb.routers.config_rtr.get_reasoning_capabilities``).
+    #
+    # Ollama-specific design note
+    # ---------------------------
+    # Unlike OpenAI (o1 vs gpt-5) or Anthropic (claude-4 vs claude-3),
+    # Ollama's API surface is UNIFORM across all models:
+    #
+    #   * ``/api/show`` returns ``capabilities: ["completion", ...,
+    #     "thinking"]`` — a flat boolean, no per-model effort ladder.
+    #   * The ``think`` parameter accepts ``true|false`` universally
+    #     for any thinking-capable model, and ``"low"|"medium"|"high"``
+    #     only for SOME newer models (undocumented per-model).
+    #
+    # Therefore this adapter cannot infer effort levels from the model
+    # name or from ``/api/show`` alone. The SAFE answer for a fresh
+    # Ollama scan is ``mode="toggle"`` (on/off via ``think: true/false``),
+    # which is exactly what ``config_rtr._parse_adapter_model_list``
+    # writes into metadata for the list-form capabilities payload.
+    #
+    # Users who know their model supports explicit levels can set them
+    # in ModelInfoModal; the persisted ``allowed_options`` then flows
+    # back through this method, and we UPGRADE the descriptor to
+    # ``mode="effort"``. This is the only path by which Ollama models
+    # gain effort levels — no hardcoding, no name heuristics.
+
+    @classmethod
+    def get_reasoning_options(
+        cls,
+        model_id: str,
+        metadata_entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ReasoningCapabilityDescriptor]:
+        """
+        Return the reasoning control surface for an Ollama model.
+
+        Parameters
+        ----------
+        model_id : str
+            The model identifier as stored in ``models_metadata.json``.
+            Accepted but unused — Ollama does not differentiate
+            reasoning behavior by model name from the adapter's
+            perspective; the metadata is the sole source.
+
+        metadata_entry : dict, optional
+            The metadata entry persisted during Scan Models. Only
+            ``capabilities.reasoning`` (bool) and
+            ``capability_details.reasoning`` (dict) are consulted.
+
+        Returns
+        -------
+        ReasoningCapabilityDescriptor | None
+            * ``None``      — metadata missing / silent. Router falls
+                               through (and, for Ollama, since metadata
+                               is the only source, resolves to
+                               "unsupported").
+            * ``unsupported`` — ``reasoning=False`` explicitly.
+            * ``effort``    — ``allowed_options`` present (manual
+                               override or future /api/show extension).
+            * ``toggle``    — thinking supported with no granular
+                               levels. Widget shows on/off switch.
+            * ``automatic`` — declared mode says always-on.
+        """
+        if not isinstance(metadata_entry, dict):
+            return None
+
+        caps = metadata_entry.get("capabilities")
+        if not isinstance(caps, dict):
+            return None
+
+        supported = caps.get("reasoning")
+        if supported is False:
+            # Explicit denial from discovery. Surface it so the router
+            # records source="adapter" (helps debugging) rather than
+            # falling through to the same answer via metadata.
+            return ReasoningCapabilityDescriptor.unsupported()
+        if supported is not True:
+            # Unknown — defer to router's other resolution layers.
+            return None
+
+        details = metadata_entry.get("capability_details")
+        reasoning = (
+            details.get("reasoning")
+            if isinstance(details, dict)
+            else None
+        )
+        if not isinstance(reasoning, dict):
+            reasoning = {}
+
+        declared_mode = reasoning.get("mode")
+        declared_mode = (
+            declared_mode.strip().lower()
+            if isinstance(declared_mode, str)
+            else ""
+        )
+
+        # ----------------------------------------------------------------
+        # Granular levels: honour user override or future /api/show
+        # extension. Accept both LM Studio's shape (``allowed_options``)
+        # and the resolver's canonical shape (``effort_levels``).
+        # ----------------------------------------------------------------
+        raw_allowed = reasoning.get("allowed_options")
+        if not isinstance(raw_allowed, list) or not raw_allowed:
+            raw_allowed = reasoning.get("effort_levels")
+
+        norm = [
+            str(a).strip().lower()
+            for a in (raw_allowed if isinstance(raw_allowed, list) else [])
+            if isinstance(a, str) and a.strip()
+        ]
+        has_off = "off" in norm
+        granular = tuple(
+            lvl
+            for lvl in ("none", "minimal", "low", "medium", "high", "xhigh")
+            if lvl in norm
+        )
+
+        if granular:
+            # "off" is Ollama's wire word for the canonical "none".
+            if has_off and "none" not in granular:
+                granular = ("none",) + granular
+
+            raw_default = (
+                reasoning.get("default")
+                or reasoning.get("default_effort")
+            )
+            default_level = "medium" if "medium" in granular else granular[0]
+            if isinstance(raw_default, str):
+                d = raw_default.strip().lower()
+                if d in granular:
+                    default_level = d
+                elif d == "off" and "none" in granular:
+                    default_level = "none"
+
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode=ReasoningMode.EFFORT,
+                toggle_available=has_off or "none" in granular,
+                default_level=default_level,
+                level_ids=granular,
+            )
+
+        # ----------------------------------------------------------------
+        # Always-on: discovery declared this explicitly. Rare for
+        # Ollama (all thinking models accept ``think: false``), but
+        # honoured if a future /api/show or user override says so.
+        # ----------------------------------------------------------------
+        if declared_mode == "automatic":
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode=ReasoningMode.AUTOMATIC,
+                toggle_available=False,
+                default_level=None,
+                level_ids=(),
+            )
+
+        # ----------------------------------------------------------------
+        # Default: reasoning is supported but the specific levels are
+        # not declared by /api/show (the common case — Ollama's
+        # ``thinking`` capability is a flat boolean).
+        #
+        # Expose the standard four-level ladder so the UI matches the
+        # pre-redesign behavior. Why this is safe on Ollama:
+        #
+        #   * Ollama >= 0.5 accepts ``think: "low"|"medium"|"high"``
+        #     on any model with the ``thinking`` capability. On models
+        #     whose manifest does not declare level support, the level
+        #     is silently downgraded to ``think: true`` (boolean). No
+        #     error, no warning.
+        #   * Models whose manifest DOES declare level support (e.g.
+        #     gpt-oss, newer Qwen) receive the actual level and reason
+        #     at that depth.
+        #   * Either way, the user's stored `reasoning_effort` maps to
+        #     a real wire behavior, not a no-op.
+        #
+        # When Ollama's /api/show later exposes granular levels
+        # (future versions), the `granular` branch above takes
+        # precedence — this fallback only fires when `granular` is
+        # empty.
+        #
+        # If a user wants strict "toggle only" semantics for a
+        # specific model, they can set `allowed_options: ["off","on"]`
+        # via ModelInfoModal; the descriptor stays in TOGGLE mode and
+        # the UI shows only the on/off switch.
+        # ----------------------------------------------------------------
+        return ReasoningCapabilityDescriptor(
+            supported=True,
+            mode=ReasoningMode.EFFORT,
+            toggle_available=True,
+            default_level="medium",
+            level_ids=("none", "low", "medium", "high"),
+        )
 
     # ------------------------------------------------------------------
     # Construction

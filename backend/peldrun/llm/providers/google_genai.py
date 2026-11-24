@@ -94,6 +94,7 @@ from peldrun.llm.contracts import (
     AdapterProfile,
     ConnectionContext,
     LLMStreamEvent,
+    ReasoningCapabilityDescriptor,
     ReasoningStrategy,
     StreamEventType,
     ToolCallStyle,
@@ -696,22 +697,41 @@ class GoogleGenAIAdapter:
                 # [FIX-CLOUD-BADGES] Google's /models endpoint does not
                 # return capability flags. We infer them from the model name
                 # so the frontend can display Tool/Vision/Reasoning badges.
-                model_name_lower = short.lower()
-                is_gemini = "gemini" in model_name_lower
-                is_vision = is_gemini or "vision" in model_name_lower
-                is_tools = is_gemini
-                is_reasoning = "2.5" in model_name_lower or "3." in model_name_lower or "thinking" in model_name_lower
-
-                caps_dict = {
-                    "vision": is_vision,
-                    "trained_for_tool_use": is_tools,
-                    "reasoning": is_reasoning,
-                }
-                caps_sources = {
-                    "vision": "provider_catalog",
-                    "trained_for_tool_use": "provider_catalog",
-                    "reasoning": "provider_catalog",
-                }
+            model_name_lower = short.lower()
+            is_gemini = "gemini" in model_name_lower
+            is_vision = is_gemini or "vision" in model_name_lower
+            is_tools = is_gemini
+            caps_dict = {
+                "vision": is_vision,
+                "trained_for_tool_use": is_tools,
+            }
+            caps_sources = {
+                "vision": "provider_catalog",
+                "trained_for_tool_use": "provider_catalog",
+            }
+            # [FIX-REASONING-BADGE] Derive the reasoning badge from the
+            # adapter's own family knowledge instead of a second,
+            # divergent name test.
+            #
+            # The previous inline test ("2.5" / "3." / "thinking") had
+            # two defects:
+            #   1. "gemini-3-pro-preview" contains "3-", NOT "3.", so
+            #      the newest thinking model was published as
+            #      reasoning=False — and the dispatcher then stripped
+            #      its reasoning parameters.
+            #   2. It asserted reasoning=True for any id containing
+            #      "thinking" without declaring a control surface, so
+            #      the metadata fallback could offer an off switch the
+            #      API does not honor.
+            #
+            # When the adapter has no opinion (None), the key is
+            # OMITTED rather than set to False: "unknown" must not
+            # collapse into "unsupported", and a fabricated True must
+            # never reach the UI (plan principle P5).
+            reasoning_desc = self.get_reasoning_options(short)
+            if reasoning_desc is not None:
+                caps_dict["reasoning"] = bool(reasoning_desc.supported)
+                caps_sources["reasoning"] = "provider_catalog"
 
                 results.append(
                     {
@@ -801,6 +821,132 @@ class GoogleGenAIAdapter:
                 getattr(model, "supported_generation_methods", None) or []
             ),
         }
+
+    # ------------------------------------------------------------------
+    # Reasoning capability query (Dynamic Reasoning Capabilities plan)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_reasoning_options(
+        cls,
+        model_id: str,
+        metadata_entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ReasoningCapabilityDescriptor]:
+        """
+        Return the reasoning control surface for a Gemini model.
+
+        Adapter-owned family knowledge (plan principles P3/P7). The
+        config router calls this from
+        GET /api/config/reasoning-capabilities, and ``discover_models``
+        derives its reasoning badge from the SAME method, so the
+        catalog and the query channel can never disagree.
+
+        Two distinct wire surfaces exist and they are NOT
+        interchangeable (see ``_build_thinking_config``):
+
+          * ``thinking_budget`` (tokens) — Gemini 2.5 family.
+          * ``thinking_level``  (string) — Gemini 3 family.
+
+        Sending a budget to a level-only model (or the reverse) is
+        rejected, so ``mode`` records which surface the family
+        actually accepts. The UI renders both identically; only the
+        downstream translation differs.
+
+        Family rules:
+          * gemini-2.5-pro   — thinking is ALWAYS ON. The budget floor
+            is 128 tokens and 0 is rejected, so no off toggle exists.
+          * gemini-2.5-flash — budget 0 disables thinking, so the off
+            toggle maps to a value the API honors.
+          * gemini-2.5-flash-lite — same surface, but thinking is OFF
+            by default, so the UI reset target is "none".
+          * gemini-3-pro     — thinking_level low/high, always on;
+            "high" is the provider's own default.
+          * *-thinking-*     — the 2.0 thinking experiments expose no
+            control surface at all -> mode="automatic".
+          * gemini-2.0 / 1.5 / 1.0 / gemini-pro / embeddings — no
+            thinking surface.
+          * anything else (aliases such as *-latest, unverified 3.x
+            variants, non-Gemini ids) -> None ("no opinion"). The
+            router consults discovery metadata, then hides the
+            widget (P5).
+
+        ``metadata_entry`` is accepted for contract symmetry; Gemini
+        family knowledge is authoritative here, so it is not read.
+        """
+        norm = (model_id or "").strip().lower()
+        if not norm:
+            return None
+        # Accept "models/gemini-...", "google/gemini-...", or bare ids.
+        if "/" in norm:
+            norm = norm.rsplit("/", 1)[-1]
+        if not norm.startswith("gemini"):
+            # Gemma / LearnLM / other ids served by the same endpoint:
+            # this adapter has no opinion about them.
+            return None
+
+        # ---- Gemini 3 family: thinking_level, not a token budget ----
+        if norm.startswith("gemini-3"):
+            if "pro" in norm:
+                return ReasoningCapabilityDescriptor(
+                    supported=True,
+                    mode="effort",
+                    toggle_available=False,
+                    default_level="high",
+                    level_ids=("low", "high"),
+                )
+            # Other 3.x variants are not verified yet. Returning None
+            # keeps the widget hidden rather than advertising a ladder
+            # the API may reject.
+            return None
+
+        # ---- Gemini 2.5 family: thinking_budget in tokens ----
+        if norm.startswith("gemini-2.5"):
+            if "pro" in norm:
+                # Always-on: minimum budget is 128, zero is rejected.
+                return ReasoningCapabilityDescriptor(
+                    supported=True,
+                    mode="budget",
+                    toggle_available=False,
+                    default_level="medium",
+                    level_ids=("low", "medium", "high"),
+                )
+            # Flash and Flash-Lite accept budget=0 (thinking off).
+            # Flash-Lite ships with thinking disabled by default.
+            is_lite = "lite" in norm
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="budget",
+                toggle_available=True,
+                default_level="none" if is_lite else "medium",
+                level_ids=("none", "low", "medium", "high"),
+            )
+
+        # ---- Thinking experiments (2.0 Flash Thinking): always on ----
+        if "thinking" in norm:
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="automatic",
+                toggle_available=False,
+                default_level=None,
+                level_ids=(),
+            )
+
+        # ---- Generations with no thinking surface ----
+        if norm.startswith(
+            (
+                "gemini-2.0",
+                "gemini-2-",
+                "gemini-1.5",
+                "gemini-1.0",
+                "gemini-pro",
+                "gemini-ultra",
+                "gemini-embedding",
+            )
+        ):
+            return ReasoningCapabilityDescriptor.unsupported()
+
+        # ---- Unknown / alias (e.g. gemini-flash-latest): no opinion ----
+        return None
 
     # ------------------------------------------------------------------
     # ProviderAdapter: close

@@ -79,6 +79,8 @@ from peldrun.llm.contracts import (
     AdapterProfile,
     ConnectionContext,
     LLMStreamEvent,
+    ReasoningCapabilityDescriptor,
+    ReasoningMode,
     ReasoningStrategy,
     StreamEventType,
     ToolCallStyle,
@@ -238,6 +240,208 @@ class LMStudioNativeAdapter:
     API_CONTRACT = "peldrun.llm.provider.v1"
     PROFILE = _PROFILE
     provider_id = "lmstudio_native"
+
+    # ------------------------------------------------------------------
+    # Reasoning capability declaration
+    # ------------------------------------------------------------------
+    #
+    # Called by ``GET /api/config/reasoning-capabilities`` (see
+    # ``omweb.routers.config_rtr.get_reasoning_capabilities``).
+    #
+    # LM Studio is the authoritative source for its own models'
+    # reasoning controls: its ``/api/v1/models`` response declares
+    # ``capabilities.reasoning.allowed_options`` per model, and the
+    # discovery pipeline (``config_rtr._parse_adapter_model_list``)
+    # has already persisted that block under
+    # ``models_metadata.json -> capability_details.reasoning``.
+    #
+    # This method therefore only REPLAYS those facts. It does NOT
+    # infer anything from the model name, provider name, or any other
+    # heuristic — the plan's P5 invariant ("uncertainty must be
+    # resolved as unsupported, never as fabricated support") is
+    # enforced by returning None when the metadata is silent.
+
+    @classmethod
+    def get_reasoning_options(
+        cls,
+        model_id: str,
+        metadata_entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ReasoningCapabilityDescriptor]:
+        """
+        Return the reasoning control surface for a LM Studio model.
+
+        Parameters
+        ----------
+        model_id : str
+            The model identifier as stored in ``models_metadata.json``.
+            Accepted but currently unused — LM Studio's reasoning facts
+            live entirely in ``metadata_entry``; we never key on the
+            model name.
+
+        metadata_entry : dict, optional
+            The metadata entry persisted during Scan Models. Its
+            ``capabilities.reasoning`` (bool) and
+            ``capability_details.reasoning`` (dict) blocks are the
+            only inputs considered.
+
+        Returns
+        -------
+        ReasoningCapabilityDescriptor | None
+            * ``None``      — no opinion (metadata missing or silent).
+                               The router will consult other sources
+                               (which, for LM Studio, is the same
+                               metadata, so the result is "unsupported").
+            * ``toggle``    — LM Studio reported ``["off", "on"]`` with
+                               no granular levels. Widget shows on/off.
+            * ``effort``    — LM Studio reported granular levels
+                               (e.g. ``["off","on","low","medium","high"]``).
+                               Widget shows a level list + optional toggle.
+            * ``automatic`` — LM Studio reported reasoning=True with no
+                               options. Widget shows an "always on" badge.
+            * ``unsupported`` — LM Studio explicitly reported
+                               reasoning=False.
+        """
+        # No metadata → no opinion. The router will fall through.
+        if not isinstance(metadata_entry, dict):
+            return None
+
+        caps = metadata_entry.get("capabilities")
+        if not isinstance(caps, dict):
+            return None
+
+        supported = caps.get("reasoning")
+        # Only ``True`` triggers this adapter to speak. ``False`` and
+        # ``None`` both fall through to the router's other resolution
+        # layers (though for LM Studio, those layers read the same
+        # metadata, so the effective answer is "unsupported" either way).
+        if supported is not True:
+            return None
+
+        details = metadata_entry.get("capability_details")
+        reasoning = details.get("reasoning") if isinstance(details, dict) else None
+        if not isinstance(reasoning, dict):
+            reasoning = {}
+
+        declared_mode = reasoning.get("mode")
+        declared_mode = (
+            declared_mode.strip().lower()
+            if isinstance(declared_mode, str)
+            else ""
+        )
+
+        # Provider explicitly says "no control surface" → hide.
+        if reasoning.get("state") == "unsupported" or declared_mode == "none":
+            return ReasoningCapabilityDescriptor.unsupported()
+
+        # Provider declares always-on reasoning → no user control.
+        if declared_mode == "automatic":
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode=ReasoningMode.AUTOMATIC,
+                toggle_available=False,
+                default_level=None,
+                level_ids=(),
+            )
+
+        # ----------------------------------------------------------------
+        # Replay LM Studio's ``allowed_options`` list verbatim.
+        #
+        # Real-world shapes observed in LM Studio 0.3.x:
+        #   ["off", "on"]                          → pure toggle
+        #   ["off", "on", "low", "medium", "high"] → granular ladder
+        #   ["on"]                                 → always-on
+        # ----------------------------------------------------------------
+        raw_allowed = reasoning.get("allowed_options")
+        norm = [
+            str(a).strip().lower()
+            for a in (raw_allowed if isinstance(raw_allowed, list) else [])
+            if isinstance(a, str) and a.strip()
+        ]
+        has_off = "off" in norm
+        has_on = "on" in norm
+
+        # Canonical levels present in the provider's vocabulary, in
+        # the descriptor's canonical order (see contracts._DESCRIPTOR_MODES).
+        canonical_levels = ("none", "minimal", "low", "medium", "high", "xhigh")
+        granular = tuple(l for l in canonical_levels if l in norm)
+
+        # ------------------------------------------------------------------
+        # No granular levels from LM Studio.
+        #
+        # LM Studio reports one of three shapes for models whose
+        # reasoning is a simple on/off switch:
+        #   * ["off", "on"]   — toggleable (most common)
+        #   * ["on"]          — always-on (rare)
+        #   * missing/empty   — unspecified
+        #
+        # The pre-redesign UI always showed the standard four-level
+        # ladder, and users expect it back. We therefore expose the
+        # four-level ladder for BOTH toggle and unspecified cases, and
+        # reserve the "automatic" badge strictly for the explicit
+        # always-on shape.
+        #
+        # Why this is safe:
+        #   * LM Studio + llama.cpp silently downgrade
+        #     reasoning_effort="low"/"medium"/"high" to boolean
+        #     reasoning on models that only support on/off. No error,
+        #     no warning — the request succeeds and the model reasons
+        #     as if `reasoning_effort: "on"` was sent.
+        #   * The user's stored `reasoning_effort` still maps to a real
+        #     wire behavior (boolean reasoning), not a no-op.
+        #   * The provider's own `allowed_options` (when it later
+        #     declares granular levels) takes precedence — this fallback
+        #     is only reached when `granular` is empty.
+        #
+        # If the user wants strict "toggle only" semantics, they can
+        # set `allowed_options: ["off", "on"]` manually via
+        # ModelInfoModal; the descriptor would then stay in TOGGLE mode.
+        # ------------------------------------------------------------------
+
+        # Explicit always-on: LM Studio says ["on"] only.
+        if not granular and has_on and not has_off:
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode=ReasoningMode.AUTOMATIC,
+                toggle_available=False,
+                default_level=None,
+                level_ids=(),
+            )
+
+        # Toggleable or unspecified → EFFORT with standard ladder.
+        # This covers both ["off", "on"] and empty/missing
+        # allowed_options.
+        return ReasoningCapabilityDescriptor(
+            supported=True,
+            mode=ReasoningMode.EFFORT,
+            toggle_available=True,
+            default_level="medium",
+            level_ids=("none", "low", "medium", "high"),
+        )
+
+        # Granular ladder: "off" is LM Studio's wire word for the
+        # canonical "none"; normalize it so the UI vocabulary stays
+        # consistent across providers.
+        if has_off and "none" not in granular:
+            granular = ("none",) + granular
+
+        # Default selection priority: explicit ``default`` from
+        # discovery > "medium" when present > lowest available level.
+        raw_default = reasoning.get("default")
+        default_level = "medium" if "medium" in granular else granular[0]
+        if isinstance(raw_default, str):
+            d = raw_default.strip().lower()
+            if d in granular:
+                default_level = d
+            elif d == "off" and "none" in granular:
+                default_level = "none"
+
+        return ReasoningCapabilityDescriptor(
+            supported=True,
+            mode=ReasoningMode.EFFORT,
+            toggle_available=has_off or "none" in granular,
+            default_level=default_level,
+            level_ids=granular,
+        )
 
     # ------------------------------------------------------------------
     # Construction

@@ -85,6 +85,7 @@ from peldrun.llm.contracts import (
     AdapterProfile,
     ConnectionContext,
     LLMStreamEvent,
+    ReasoningCapabilityDescriptor,
     ReasoningStrategy,
     StreamEventType,
     ToolCallStyle,
@@ -375,10 +376,150 @@ class OpenAINativeAdapter:
     ) -> Optional[Dict[str, Any]]:
         """
         OpenAI exposes no per-model metadata endpoint.
-
         Returns ``None``. The model catalog layer (LiteLLM) provides
         capability and pricing data for OpenAI models.
         """
+        return None
+
+    # ------------------------------------------------------------------
+    # Reasoning capability query (Dynamic Reasoning Capabilities plan)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_reasoning_options(
+        cls,
+        model_id: str,
+        metadata_entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ReasoningCapabilityDescriptor]:
+        """
+        Return the reasoning control surface for an OpenAI model.
+
+        Adapter-owned family knowledge (plan principles P3/P7). The
+        config router calls this from GET /api/config/reasoning-capabilities;
+        the frontend never guesses levels locally.
+
+        Family rules (verified against the OpenAI API, 2026-11):
+          * o1-preview / o1-mini — reasoning always on, NO effort
+            parameter (the API rejects it) -> mode="automatic".
+          * o1 / o1-<date>       — mandatory reasoning; effort ladder
+            low/medium/high; "none" is rejected.
+          * o3* / o4*            — same ladder; cannot be disabled,
+            so no off toggle is offered.
+          * gpt-5-chat-latest    — NON-reasoning ChatGPT snapshot.
+          * gpt-5-pro            — accepts "high" only.
+          * gpt-5 (5.0 gen)      — minimal/low/medium/high; "none"
+            returns 400, so no off toggle.
+          * gpt-5.1 / 5.1-codex  — none/low/medium/high; "minimal"
+            was REMOVED in 5.1 (returns 400).
+          * gpt-5.1-codex-max,
+            gpt-5.2*             — add "xhigh" to the 5.1 ladder.
+          * gpt-4* / gpt-3*      — no reasoning surface.
+          * anything else        — None ("no opinion"): the router
+            consults discovery metadata, then hides the widget (P5).
+            Includes gpt-6+ for now: published docs conflict on
+            "none" support and the new "max" level has no entry in
+            the router's display catalog yet.
+
+        ``metadata_entry`` is accepted for contract symmetry; OpenAI
+        family knowledge is authoritative here, so it is not read.
+        """
+        norm = (model_id or "").strip().lower()
+        if not norm:
+            return None
+
+        # ---- Non-reasoning chat snapshots (BEFORE the gpt-5 prefix) ----
+        # gpt-5-chat-latest is the ChatGPT-tuned non-reasoning variant;
+        # sending reasoning_effort to it fails with "Invalid
+        # 'reasoning_effort' for non-reasoning model".
+        if norm.startswith("gpt-5-chat") or norm.startswith("chatgpt-4o"):
+            return ReasoningCapabilityDescriptor.unsupported()
+
+        # ---- o1-preview / o1-mini: always-on, no effort parameter ----
+        # These predate the reasoning_effort parameter; only the full
+        # o1 release accepts it. Automatic = "Always on" badge.
+        if norm.startswith(("o1-preview", "o1-mini")):
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="automatic",
+                toggle_available=False,
+                default_level=None,
+                level_ids=(),
+            )
+
+        # ---- o1 (full): mandatory reasoning, effort ladder ----
+        if norm == "o1" or norm.startswith(("o1-", "o1:")):
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="effort",
+                toggle_available=False,
+                default_level="medium",
+                level_ids=("low", "medium", "high"),
+            )
+
+        # ---- o3 / o4 series: effort ladder, cannot disable ----
+        # reasoning_effort accepts low/medium/high only; there is no
+        # wire value that turns reasoning off, hence toggle=False.
+        if norm in ("o3", "o4") or norm.startswith(
+            ("o3-", "o3:", "o4-", "o4:")
+        ):
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="effort",
+                toggle_available=False,
+                default_level="medium",
+                level_ids=("low", "medium", "high"),
+            )
+
+        # ---- gpt-5 family ----
+        if norm.startswith("gpt-5"):
+            # gpt-5-pro runs at fixed maximum effort: "high" only.
+            if norm.startswith("gpt-5-pro"):
+                return ReasoningCapabilityDescriptor(
+                    supported=True,
+                    mode="effort",
+                    toggle_available=False,
+                    default_level="high",
+                    level_ids=("high",),
+                )
+
+            # Later chat-latest snapshots are unverified -> no opinion.
+            if "chat-latest" in norm:
+                return None
+
+            if norm.startswith("gpt-5."):
+                # 5.1+ generation: "none" REPLACED "minimal".
+                # xhigh: gpt-5.1-codex-max and gpt-5.2+ only.
+                # default_level is the UI reset target (plan default:
+                # medium), NOT the provider's own API default.
+                has_xhigh = (
+                    "codex-max" in norm or norm.startswith("gpt-5.2")
+                )
+                levels = ("none", "low", "medium", "high")
+                if has_xhigh:
+                    levels = levels + ("xhigh",)
+                return ReasoningCapabilityDescriptor(
+                    supported=True,
+                    mode="effort",
+                    toggle_available=True,
+                    default_level="medium",
+                    level_ids=levels,
+                )
+
+            # 5.0 generation: "minimal" is the floor; "none" is
+            # rejected with HTTP 400, so no off toggle is offered.
+            return ReasoningCapabilityDescriptor(
+                supported=True,
+                mode="effort",
+                toggle_available=False,
+                default_level="medium",
+                level_ids=("minimal", "low", "medium", "high"),
+            )
+
+        # ---- Non-reasoning legacy families ----
+        if norm.startswith(("gpt-4", "gpt-3.5", "gpt-3")):
+            return ReasoningCapabilityDescriptor.unsupported()
+
+        # ---- Unknown model: no opinion (P5) ----
         return None
 
     # ------------------------------------------------------------------

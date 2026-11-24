@@ -408,10 +408,27 @@ def _resolve_reasoning_state(
     ``state`` is not ``UNKNOWN``; falls back to the flat
     ``reasoning`` boolean for backward compatibility with the existing
     frontend metadata shape.
+
+    Mode normalization
+    ------------------
+    A ``SUPPORTED`` state with ``mode == NONE`` is contradictory: the
+    model can reason but the mode says "no reasoning surface". This
+    happens when the UI flips the flat ``reasoning`` boolean without
+    populating ``reasoning_details.mode``. We normalize such a state
+    to ``ADAPTIVE`` so the compiler emits a usable parameter instead
+    of silently dropping reasoning.
     """
     detail = caps.reasoning_details
     if detail.state != CapabilityState.UNKNOWN:
-        return detail.state, detail.source, detail.mode
+        mode = detail.mode
+        if (
+            detail.state == CapabilityState.SUPPORTED
+            and mode == ReasoningMode.NONE
+        ):
+            # Contradictory pair: supported but no mode. Treat as
+            # adaptive so the compiler emits a default effort.
+            mode = ReasoningMode.ADAPTIVE
+        return detail.state, detail.source, mode
 
     if caps.reasoning is True:
         return (
@@ -542,7 +559,14 @@ def compute_resolved_capabilities(
     if reasoning_state == CapabilityState.SUPPORTED or reasoning_state == CapabilityState.UNVERIFIED:
         if adapter_can_reason:
             effective_reasoning = EffectiveState.ENABLED
-            effective_reasoning_mode = reasoning_mode
+            # Guard against a contradictory pair: ENABLED with mode
+            # NONE would make the compiler emit nothing. Normalize to
+            # ADAPTIVE so a default effort is sent.
+            effective_reasoning_mode = (
+                reasoning_mode
+                if reasoning_mode != ReasoningMode.NONE
+                else ReasoningMode.ADAPTIVE
+            )
             conflict = None
             reason = None
         else:
