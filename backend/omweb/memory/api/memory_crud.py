@@ -115,6 +115,13 @@ class _SearchBody(BaseModel):
     project_id: Optional[str] = None
     user_id: Optional[str] = None
     limit: int = Field(default=10, ge=1, le=50)
+    # Preview/search semantics. Defaults MATCH what the chat injects
+    # (MemoryService.retrieve with always_retrieve=True): OR matching and
+    # NO "recent memories" fallback, so a preview shows what the model
+    # will actually receive. A caller that really wants "what exists"
+    # (a browse UI) must opt in explicitly.
+    match_any: bool = True
+    allow_recency_fallback: bool = False
 
 
 def _error_response(exc: BaseException, *, operation: str) -> JSONResponse:
@@ -505,18 +512,15 @@ async def search_endpoint(body: _SearchBody) -> JSONResponse:
             route=route,
             provider=service.provider,
             settings=effective_settings,
-            # The HTTP search endpoint exists PRIMARILY for UI
-            # previews ("what do I have related to this message?").
-            # When FTS returns no keyword matches, showing recent
-            # memories is far more useful than an empty list --
-            # the caller wants to know what memories EXIST, not
-            # just what shares keywords with the query.
-            #
-            # The agent-facing MemorySearchTool deliberately does
-            # NOT set this flag -- strict keyword matching is the
-            # right semantic for the agent's "find what I asked
-            # for" contract.
-            allow_recency_fallback=True,
+            # Defaults mirror the chat injection path so the UI preview
+            # shows what the model will actually receive: OR matching,
+            # and NO recency fallback. With the fallback on, any
+            # multi-word draft (AND semantics) and every greeting listed
+            # the three newest memories as "similar". Callers that want
+            # the old "list what exists" behaviour pass
+            # ``allow_recency_fallback=true`` explicitly.
+            allow_recency_fallback=body.allow_recency_fallback,
+            match_any=body.match_any,
         )
     except HTTPException:
         raise

@@ -1624,6 +1624,7 @@ export function Composer({
                 <SimilarMemoriesPanel
                   query={text}
                   chat_id={activeSessionId}
+                  project_id={projectId ?? undefined}
                   user_id="default"
                   limit={3}
                 />
