@@ -920,12 +920,37 @@ class RequestCompiler:
             return None
 
 
+
         # ------------------------------------------------------------------
         # Google GenAI.
         # ------------------------------------------------------------------
         if strategy == ReasoningStrategy.GOOGLE_GENAI:
             if effort and str(effort).strip():
-                return {"thinking_level": str(effort).strip().lower()}
+                eff_lower = str(effort).strip().lower()
+
+                # Google GenAI does NOT accept "none" as a thinking_level.
+                # Valid values are: MINIMAL, LOW, MEDIUM, HIGH.
+                #
+                # When the user selects "Off", we have two options:
+                # 1. For budget-based models (Gemini 2.5): send budget=0
+                # 2. For level-based models (Gemini 3): send MINIMAL
+                #    (the lowest possible value, since Google does not
+                #     support disabling thinking entirely)
+                #
+                # We prefer budget=0 when available because it actually
+                # disables thinking. Otherwise we fall back to MINIMAL
+                # and record a diagnostic explaining the limitation.
+                if eff_lower in ("none", "off", "0", "false"):
+                    # Try to use budget=0 to disable thinking entirely.
+                    # This works for Gemini 2.5 models that accept
+                    # thinking_budget. For Gemini 3 models that only
+                    # accept thinking_level, the adapter will convert
+                    # this to MINIMAL and log a warning.
+                    return {"thinking_budget": 0}
+
+                # Map "minimal" to "minimal" (Google accepts it)
+                return {"thinking_level": eff_lower}
+
             if mode_value == "effort":
                 return {"thinking_level": "medium"}
             if mode_value in ("toggle", "budget", "adaptive"):

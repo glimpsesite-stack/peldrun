@@ -1442,6 +1442,12 @@ class GoogleGenAIAdapter:
 
         Google's ``ThinkingConfig`` accepts both. Only one is sent
         based on which key the compiler provided.
+
+        Special case: ``thinking_budget=0`` disables thinking entirely
+        for Gemini 2.5 models. For Gemini 3 models that only accept
+        ``thinking_level``, we fall back to ``MINIMAL`` (the lowest
+        possible value) and log a warning, because Google does not
+        support disabling thinking on those models.
         """
         if not isinstance(reasoning, dict):
             return None
@@ -1450,6 +1456,7 @@ class GoogleGenAIAdapter:
         level = reasoning.get("thinking_level")
 
         try:
+            # budget=0 is valid and disables thinking for Gemini 2.5
             if isinstance(budget, int) and budget >= 0:
                 return google_types.ThinkingConfig(
                     thinking_budget=budget
@@ -1459,9 +1466,31 @@ class GoogleGenAIAdapter:
                     thinking_level=level.upper()
                 )
         except Exception as exc:
-            logger.debug(
-                "Failed to build ThinkingConfig: %s", exc
+            # If ThinkingConfig construction fails (e.g., the model
+            # does not accept the field we sent), log it and try the
+            # other field as a fallback.
+            logger.warning(
+                "GoogleGenAIAdapter: Failed to build ThinkingConfig "
+                "with budget=%r level=%r: %s. Trying fallback.",
+                budget, level, exc
             )
+
+            # Fallback: if budget failed, try level=MINIMAL
+            if isinstance(budget, int):
+                try:
+                    logger.info(
+                        "GoogleGenAIAdapter: Model does not accept "
+                        "thinking_budget. Falling back to "
+                        "thinking_level=MINIMAL. Note: Google Gemini "
+                        "does not support disabling thinking entirely "
+                        "on this model family."
+                    )
+                    return google_types.ThinkingConfig(
+                        thinking_level="MINIMAL"
+                    )
+                except Exception:
+                    pass
+
         return None
 
     # ------------------------------------------------------------------
