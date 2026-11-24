@@ -101,6 +101,8 @@ const config: Config = {
         light: "hsl(var(--light))",
         lightest: "hsl(var(--lightest))",
 
+       inlineCode: "var(--markdown-inline-code)",
+
 
 
 

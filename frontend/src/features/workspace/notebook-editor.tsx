@@ -11,6 +11,7 @@
  * - Code syntax highlighting
  * - Math equations (KaTeX)
  * - Mermaid diagrams
+ * - Recharts, Images, Tables
  * - OCC (Optimistic Concurrency Control) integration
  */
 'use client';
@@ -87,6 +88,13 @@ import {
   PASTE_COMMAND,
   COMMAND_PRIORITY_HIGH,
   COMMAND_PRIORITY_CRITICAL,
+  DecoratorNode,
+  DOMConversionMap,
+  DOMExportOutput,
+  EditorConfig,
+  NodeKey,
+  SerializedLexicalNode,
+  Spread,
 } from 'lexical';
 
 import {
@@ -97,9 +105,17 @@ import { mergeRegister } from '@lexical/utils';
 import {
   Bold,
   Italic,
+  Sigma,
+  Network,
+  BarChart3,
+  PanelRightOpen,
+  PanelRightClose,
   Underline,
   Strikethrough,
   Code,
+  Image as ImageIcon,
+  Images,
+  Upload,
   Heading1,
   Heading2,
   Heading3,
@@ -118,9 +134,16 @@ import {
 import { FloatingToolbarPlugin } from '@/components/chat/composer/plugins/floating-toolbar-plugin';
 import { workspaceApi } from './workspace-api';
 import { OCCConflictError } from './types';
+import { MarkdownRenderer } from '@/components/chat/markdown-renderer';
+import { Button } from '@/components/ui/button';
 
+// ============================================================================
+// Global State
+// ============================================================================
 
-
+// Track the active editor instance so transformers can access it for
+// HTML-to-Nodes conversion during import.
+let activeEditor: LexicalEditor | null = null;
 
 // ============================================================================
 // Custom Transformers for Notebook
@@ -143,6 +166,14 @@ const INTERNAL_LINK_TRANSFORMER = {
 };
 
 const MARKDOWN_TABLE_ROW_REGEX = /^\s*\|.*\|\s*$/;
+
+// Fixes text that was accidentally escaped by Lexical's exporter
+function unescapeMarkdownText(text: string): string {
+  return text
+    .replace(/\\\*/g, '*')
+    .replace(/\\_/g, '_')
+    .replace(/\\`/g, '`');
+}
 
 const MARKDOWN_TABLE_DIVIDER_REGEX =
   /^\s*\|\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|\s*$/;
@@ -192,10 +223,6 @@ const MARKDOWN_TABLE_TRANSFORMER: MultilineElementTransformer = {
       dividerIndex >= lines.length ||
       !MARKDOWN_TABLE_DIVIDER_REGEX.test(lines[dividerIndex])
     ) {
-      // The start line matches the table row regex, but no valid divider
-      // follows. Signal an explicit non-match instead of returning null,
-      // because Lexical would otherwise fall into its fallback multiline
-      // path and consume every remaining line in the document.
       return [false, startLineIndex];
     }
 
@@ -249,10 +276,28 @@ const MARKDOWN_TABLE_TRANSFORMER: MultilineElementTransformer = {
 
         cellNode.clear();
 
+        const rawCellMarkdown = rows[rowIndex]?.[columnIndex] ?? '';
+        const cellMarkdown = unescapeMarkdownText(rawCellMarkdown);
+
+        if (activeEditor && cellMarkdown.trim()) {
+          try {
+            const cellHtml = markdownToHtml(cellMarkdown);
+            if (cellHtml) {
+              const parser = new DOMParser();
+              const dom = parser.parseFromString(cellHtml, 'text/html');
+              const nodes = $generateNodesFromDOM(activeEditor, dom);
+              if (nodes.length > 0) {
+                cellNode.append(...nodes);
+                return;
+              }
+            }
+          } catch (err) {
+            console.error('[NotebookTable] Failed to parse cell markdown:', err);
+          }
+        }
+
         cellNode.append(
-          $createParagraphNode().append(
-            $createTextNode(rows[rowIndex]?.[columnIndex] ?? ''),
-          ),
+          $createParagraphNode().append($createTextNode(cellMarkdown))
         );
       });
     });
@@ -321,14 +366,112 @@ const MARKDOWN_TABLE_TRANSFORMER: MultilineElementTransformer = {
 
   type: 'multiline-element',
 };
+
+// ============================================================================
+// Custom Image Node
+// ============================================================================
+
+export type SerializedImageNode = Spread<
+  { src: string; altText: string },
+  SerializedLexicalNode
+>;
+
+export class ImageNode extends DecoratorNode<React.JSX.Element> {
+  __src: string;
+  __altText: string;
+
+  static getType(): string {
+    return 'image';
+  }
+
+  static clone(node: ImageNode): ImageNode {
+    return new ImageNode(node.__src, node.__altText, node.__key);
+  }
+
+  constructor(src: string = '', altText: string = '', key?: NodeKey) {
+    super(key);
+    this.__src = src;
+    this.__altText = altText;
+  }
+
+  createDOM(config: EditorConfig): HTMLElement {
+    const span = document.createElement('span');
+    span.className = 'inline-block max-w-full my-2';
+    return span;
+  }
+
+  updateDOM(): boolean {
+    return false;
+  }
+
+  exportDOM(): DOMExportOutput {
+    const img = document.createElement('img');
+    img.setAttribute('src', this.__src);
+    img.setAttribute('alt', this.__altText);
+    return { element: img };
+  }
+
+  static importDOM(): DOMConversionMap | null {
+    return {
+      img: () => ({
+        conversion: (domNode: HTMLElement) => {
+          const img = domNode as HTMLImageElement;
+          if (!img.src) return null;
+          return { node: new ImageNode(img.src, img.alt) };
+        },
+        priority: 0,
+      }),
+    };
+  }
+
+  exportJSON(): SerializedImageNode {
+    return {
+      src: this.__src,
+      altText: this.__altText,
+      type: 'image',
+      version: 1,
+    };
+  }
+
+  static importJSON(serializedNode: SerializedImageNode): ImageNode {
+    return new ImageNode(serializedNode.src, serializedNode.altText);
+  }
+
+  decorate(): React.JSX.Element {
+    return (
+      <img
+        src={this.__src}
+        alt={this.__altText}
+        className="rounded-md max-w-full h-auto shadow-sm"
+      />
+    );
+  }
+}
+
+const IMAGE_TRANSFORMER = {
+  dependencies: [ImageNode],
+  export: (node: LexicalNode) => {
+    if (!(node instanceof ImageNode)) return null;
+    return `![${node.__altText}](${node.__src})`;
+  },
+  regExp: /!\[([^\]]*)\]\(([^)]+)\)/,
+  replace: (textNode: any, match: RegExpMatchArray) => {
+    const [, altText, src] = match;
+    const imageNode = new ImageNode(src, altText);
+    textNode.replace(imageNode);
+  },
+  type: 'text-match' as const,
+};
+
 const NOTEBOOK_TRANSFORMERS = [
   ...TRANSFORMERS,
   MARKDOWN_TABLE_TRANSFORMER,
   INTERNAL_LINK_TRANSFORMER,
+  IMAGE_TRANSFORMER,
 ];
 
 // ============================================================================
-// Editor Theme
+// Editor Theme & Nodes
 // ============================================================================
 
 const editorTheme = {
@@ -395,10 +538,6 @@ const editorTheme = {
   },
 };
 
-// ============================================================================
-// Editor Nodes
-// ============================================================================
-
 const editorNodes = [
   HeadingNode,
   QuoteNode,
@@ -411,74 +550,54 @@ const editorNodes = [
   TableNode,
   TableRowNode,
   TableCellNode,
+  ImageNode,
 ];
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 function isNodeInsideTable(node: LexicalNode): boolean {
   let current: LexicalNode | null = node;
-
   while (current) {
-    if ($isTableNode(current)) {
-      return true;
-    }
-
+    if ($isTableNode(current)) return true;
     current = current.getParent();
   }
-
   return false;
 }
-
-// ============================================================================
-// Markdown Clipboard Plugin
-// ============================================================================
 
 function createClipboardEditor(): LexicalEditor {
   return createEditor({
     namespace: 'NotebookClipboard',
     nodes: editorNodes,
-    onError: (error) => {
-      console.error('[NotebookClipboard Error]:', error);
-    },
+    onError: (error) => console.error('[NotebookClipboard Error]:', error),
   });
 }
 
-/**
- * Convert Markdown into HTML using an isolated Lexical editor.
- */
 function markdownToHtml(markdown: string): string {
   const clipboardEditor = createClipboardEditor();
-
   clipboardEditor.update(
     () => {
-      $convertFromMarkdownString(
-        markdown,
-        NOTEBOOK_TRANSFORMERS
-      );
+      $convertFromMarkdownString(markdown, NOTEBOOK_TRANSFORMERS);
     },
     { discrete: true }
   );
 
   let html = '';
-
   clipboardEditor.getEditorState().read(() => {
     html = $generateHtmlFromNodes(clipboardEditor, null);
   });
-
   return html;
 }
 
-/**
- * Convert HTML into Markdown using an isolated Lexical editor.
- */
 function htmlToMarkdown(html: string): string {
   const clipboardEditor = createClipboardEditor();
   const parser = new DOMParser();
-
   clipboardEditor.update(
     () => {
       const root = $getRoot();
       const dom = parser.parseFromString(html, 'text/html');
       const nodes = $generateNodesFromDOM(clipboardEditor, dom);
-
       root.clear();
       root.append(...nodes);
     },
@@ -486,19 +605,12 @@ function htmlToMarkdown(html: string): string {
   );
 
   let markdown = '';
-
   clipboardEditor.getEditorState().read(() => {
-    markdown = $convertToMarkdownString(
-      NOTEBOOK_TRANSFORMERS
-    );
+    markdown = $convertToMarkdownString(NOTEBOOK_TRANSFORMERS);
   });
-
   return markdown;
 }
 
-/**
- * Detect Markdown syntax without treating ordinary text as Markdown.
- */
 function isMarkdownContent(text: string): boolean {
   const patterns = [
     /^#{1,6}\s+.+/m,
@@ -516,20 +628,12 @@ function isMarkdownContent(text: string): boolean {
     /\[[^\]]+\]\([^)]+\)/,
     /^\|.+\|$/m,
   ];
-
   return patterns.some((pattern) => pattern.test(text));
 }
 
 function isMarkdownTableContent(content: string): boolean {
-  const lines = content
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length < 2) {
-    return false;
-  }
-
+  const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length < 2) return false;
   for (let index = 0; index < lines.length - 1; index += 1) {
     if (
       MARKDOWN_TABLE_ROW_REGEX.test(lines[index]) &&
@@ -538,14 +642,104 @@ function isMarkdownTableContent(content: string): boolean {
       return true;
     }
   }
-
   return false;
 }
 
+function compressImage(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 1200;
+        const MAX_HEIGHT = 1200;
+        let width = img.width;
+        let height = img.height;
 
-/**
- * Handle Markdown and HTML clipboard operations.
- */
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', 0.8));
+      };
+      img.onerror = reject;
+    };
+    reader.onerror = reject;
+  });
+}
+
+// ============================================================================
+// Custom UI Components
+// ============================================================================
+
+interface ImageUrlModalProps {
+  onClose: () => void;
+  onInsert: (url: string) => void;
+}
+
+function ImageUrlModal({ onClose, onInsert }: ImageUrlModalProps) {
+  const [url, setUrl] = useState('');
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!url.trim()) return;
+    onInsert(url.trim());
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100] p-4">
+      <div className="bg-card border border-border rounded-xl p-5 max-w-md w-full shadow-xl">
+        <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <ImageIcon size={18} />
+          Insert Image from URL
+        </h3>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Image URL</label>
+            <input
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              className="w-full px-3 py-2 bg-background border border-border rounded-md
+                         focus:outline-none focus:ring-2 focus:ring-primary/50"
+              placeholder="https://example.com/image.jpg"
+              autoFocus
+              required
+            />
+          </div>
+          <div className="flex gap-2 pt-2">
+            <Button type="submit" className="flex-1" variant="save">
+              Insert
+            </Button>
+            <Button type="button" variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Plugins
+// ============================================================================
+
 function MarkdownClipboardPlugin() {
   const [editor] = useLexicalComposerContext();
 
@@ -554,187 +748,84 @@ function MarkdownClipboardPlugin() {
       editor.registerCommand(
         COPY_COMMAND,
         (event) => {
-          if (
-            !event ||
-            !('clipboardData' in event) ||
-            !event.clipboardData
-          ) {
-            return false;
-          }
-
+          if (!event || !('clipboardData' in event) || !event.clipboardData) return false;
           const selection = $getSelection();
+          if (!selection || selection.isCollapsed() || !$isRangeSelection(selection)) return false;
 
-          if (
-            !selection ||
-            selection.isCollapsed() ||
-            !$isRangeSelection(selection)
-          ) {
-            return false;
-          }
-
-          // For selections that touch a table, defer to the native
-          // Lexical copy handler. It exports a full table HTML plus an
-          // `application/x-lexical-editor` payload that preserves rich
-          // cell structure for in-editor pasting and produces proper
-          // `<table>` HTML for Word, Excel and browsers.
-          const selectionContainsTable = selection
-            .getNodes()
-            .some(isNodeInsideTable);
-
-          if (selectionContainsTable) {
-            return false;
-          }
+          const selectionContainsTable = selection.getNodes().some(isNodeInsideTable);
+          if (selectionContainsTable) return false;
 
           const clipboardData = event.clipboardData;
           const html = $generateHtmlFromNodes(editor, selection);
-
-          const markdown = html
-            ? htmlToMarkdown(html)
-            : selection.getTextContent();
+          const markdown = html ? htmlToMarkdown(html) : selection.getTextContent();
 
           clipboardData.setData('text/plain', markdown);
-          if (html) {
-            clipboardData.setData('text/html', html);
-          }
-
+          if (html) clipboardData.setData('text/html', html);
           event.preventDefault();
-
           return true;
         },
-        COMMAND_PRIORITY_HIGH,
+        COMMAND_PRIORITY_HIGH
       ),
-
       editor.registerCommand(
         PASTE_COMMAND,
         (event) => {
-          if (
-            !event ||
-            !('clipboardData' in event) ||
-            !event.clipboardData
-          ) {
-            return false;
-          }
-
+          if (!event || !('clipboardData' in event) || !event.clipboardData) return false;
           const clipboardData = event.clipboardData;
           const selection = $getSelection();
-
-          if (!selection || !$isRangeSelection(selection)) {
-            return false;
-          }
+          if (!selection || !$isRangeSelection(selection)) return false;
 
           const html = clipboardData.getData('text/html');
           const plainText = clipboardData.getData('text/plain');
-          const lexicalPayload = clipboardData.getData(
-            'application/x-lexical-editor',
-          );
+          const lexicalPayload = clipboardData.getData('application/x-lexical-editor');
 
-          if (!html && !plainText && !lexicalPayload) {
-            return false;
-          }
+          if (!html && !plainText && !lexicalPayload) return false;
+          if (lexicalPayload && lexicalPayload.trim().length > 0) return false;
+          if (selection.getNodes().some(isNodeInsideTable)) return false;
 
-          // Prefer the native Lexical handler whenever an
-          // `application/x-lexical-editor` payload is present. This is
-          // the highest-fidelity path for in-editor copy/paste and it
-          // already knows how to restore tables, cells and ranges.
-          if (lexicalPayload && lexicalPayload.trim().length > 0) {
-            return false;
-          }
-
-          // Nested tables inside an existing table cell are not
-          // supported by Lexical's table model, so let the native
-          // handler deal with pastes inside a table cell.
-          const selectionContainsTable = selection
-            .getNodes()
-            .some(isNodeInsideTable);
-
-          if (selectionContainsTable) {
-            return false;
-          }
-
-          const plainTextIsMarkdownTable =
-            isMarkdownTableContent(plainText);
+          const plainTextIsMarkdownTable = isMarkdownTableContent(plainText);
           const plainTextIsMarkdown = isMarkdownContent(plainText);
           const htmlHasTable = /<table\b/i.test(html);
 
-          // If there is no HTML and no Markdown-like payload, fall back
-          // to the native plain-text handler.
-          if (
-            !html.trim() &&
-            !plainTextIsMarkdownTable &&
-            !plainTextIsMarkdown
-          ) {
-            return false;
-          }
+          if (!html.trim() && !plainTextIsMarkdownTable && !plainTextIsMarkdown) return false;
 
           event.preventDefault();
-
           let nodes: LexicalNode[] = [];
 
           try {
-            // Priority 1: A Markdown table copied as plain text from a
-            // Markdown editor. When the source also provides HTML
-            // without a real `<table>` (for example a fenced code
-            // block), the plain-text Markdown is more authoritative.
             if (plainTextIsMarkdownTable && !htmlHasTable) {
               const convertedHtml = markdownToHtml(plainText);
               if (convertedHtml) {
-                const parser = new DOMParser();
-                const dom = parser.parseFromString(
-                  convertedHtml,
-                  'text/html',
-                );
+                const dom = new DOMParser().parseFromString(convertedHtml, 'text/html');
                 nodes = $generateNodesFromDOM(editor, dom);
               }
-            }
-            // Priority 2: HTML from Word, Excel, browsers or any
-            // rendered Markdown viewer. `$generateNodesFromDOM` uses
-            // TableNode's DOM importer so the table stays editable.
-            else if (html.trim()) {
-              const parser = new DOMParser();
-              const dom = parser.parseFromString(html, 'text/html');
+            } else if (html.trim()) {
+              const dom = new DOMParser().parseFromString(html, 'text/html');
               nodes = $generateNodesFromDOM(editor, dom);
-            }
-            // Priority 3: Markdown content available only as plain
-            // text without any accompanying HTML.
-            else if (plainTextIsMarkdown) {
+            } else if (plainTextIsMarkdown) {
               const convertedHtml = markdownToHtml(plainText);
               if (convertedHtml) {
-                const parser = new DOMParser();
-                const dom = parser.parseFromString(
-                  convertedHtml,
-                  'text/html',
-                );
+                const dom = new DOMParser().parseFromString(convertedHtml, 'text/html');
                 nodes = $generateNodesFromDOM(editor, dom);
               }
             }
           } catch (err) {
-            console.error(
-              '[NotebookPaste] failed to parse clipboard content:',
-              err,
-            );
+            console.error('[NotebookPaste] failed to parse clipboard content:', err);
           }
 
           if (nodes.length === 0) {
             selection.insertText(plainText);
             return true;
           }
-
           $insertNodes(nodes);
-
           return true;
         },
-        COMMAND_PRIORITY_HIGH,
-      ),
+        COMMAND_PRIORITY_HIGH
+      )
     );
   }, [editor]);
 
   return null;
 }
-
-
-// ============================================================================
-// Fixed Formatting Toolbar Plugin
-// ============================================================================
 
 function NotebookToolbarPlugin() {
   const [editor] = useLexicalComposerContext();
@@ -750,6 +841,7 @@ function NotebookToolbarPlugin() {
   const [tableRows, setTableRows] = useState('3');
   const [tableColumns, setTableColumns] = useState('3');
   const [includeHeaderRow, setIncludeHeaderRow] = useState(true);
+  const [showImageModal, setShowImageModal] = useState(false);
   const tableSelectionRef = React.useRef<ReturnType<typeof $getSelection>>(null);
 
   const updateToolbar = useCallback(() => {
@@ -763,9 +855,7 @@ function NotebookToolbarPlugin() {
 
       const anchorNode = selection.anchor.getNode();
       const element =
-        anchorNode.getKey() === 'root'
-          ? anchorNode
-          : anchorNode.getTopLevelElementOrThrow();
+        anchorNode.getKey() === 'root' ? anchorNode : anchorNode.getTopLevelElementOrThrow();
       if ($isHeadingNode(element)) {
         setBlockType(element.getTag());
       } else {
@@ -777,35 +867,17 @@ function NotebookToolbarPlugin() {
   useEffect(() => {
     return mergeRegister(
       editor.registerUpdateListener(({ editorState }) => {
-        editorState.read(() => {
-          updateToolbar();
-        });
+        editorState.read(() => updateToolbar());
       }),
-      editor.registerCommand(
-        CAN_UNDO_COMMAND,
-        (payload) => {
-          setCanUndo(payload);
-          return false;
-        },
-        COMMAND_PRIORITY_CRITICAL
-      ),
-      editor.registerCommand(
-        CAN_REDO_COMMAND,
-        (payload) => {
-          setCanRedo(payload);
-          return false;
-        },
-        COMMAND_PRIORITY_CRITICAL
-      )
+      editor.registerCommand(CAN_UNDO_COMMAND, (payload) => { setCanUndo(payload); return false; }, COMMAND_PRIORITY_CRITICAL),
+      editor.registerCommand(CAN_REDO_COMMAND, (payload) => { setCanRedo(payload); return false; }, COMMAND_PRIORITY_CRITICAL)
     );
   }, [editor, updateToolbar]);
 
   const formatParagraph = () => {
     editor.update(() => {
       const selection = $getSelection();
-      if ($isRangeSelection(selection)) {
-        $setBlocksType(selection, () => $createParagraphNode());
-      }
+      if ($isRangeSelection(selection)) $setBlocksType(selection, () => $createParagraphNode());
     });
   };
 
@@ -813,9 +885,7 @@ function NotebookToolbarPlugin() {
     if (blockType !== headingSize) {
       editor.update(() => {
         const selection = $getSelection();
-        if ($isRangeSelection(selection)) {
-          $setBlocksType(selection, () => $createHeadingNode(headingSize));
-        }
+        if ($isRangeSelection(selection)) $setBlocksType(selection, () => $createHeadingNode(headingSize));
       });
     } else {
       formatParagraph();
@@ -826,9 +896,7 @@ function NotebookToolbarPlugin() {
     if (blockType !== 'quote') {
       editor.update(() => {
         const selection = $getSelection();
-        if ($isRangeSelection(selection)) {
-          $setBlocksType(selection, () => $createQuoteNode());
-        }
+        if ($isRangeSelection(selection)) $setBlocksType(selection, () => $createQuoteNode());
       });
     } else {
       formatParagraph();
@@ -839,9 +907,7 @@ function NotebookToolbarPlugin() {
     if (blockType !== 'code') {
       editor.update(() => {
         const selection = $getSelection();
-        if ($isRangeSelection(selection)) {
-          $setBlocksType(selection, () => $createCodeNode());
-        }
+        if ($isRangeSelection(selection)) $setBlocksType(selection, () => $createCodeNode());
       });
     } else {
       formatParagraph();
@@ -854,12 +920,97 @@ function NotebookToolbarPlugin() {
     editor.dispatchCommand(TOGGLE_LINK_COMMAND, url === '' ? null : url);
   };
 
+  const insertMath = () => {
+    editor.update(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) {
+        const p = $createParagraphNode();
+        p.append($createTextNode('$$ E = mc^2 $$'));
+        selection.insertNodes([p]);
+      }
+    });
+  };
+
+  const insertMermaid = () => {
+    editor.update(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) {
+        const codeNode = $createCodeNode('mermaid');
+        codeNode.append($createTextNode('graph TD;\n    A-->B;'));
+        const emptyParagraph = $createParagraphNode();
+        selection.insertNodes([codeNode, emptyParagraph]);
+        emptyParagraph.select();
+      }
+    });
+  };
+
+  const insertChart = () => {
+    editor.update(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) {
+        const codeNode = $createCodeNode('chart');
+        const template = `{\n  "type": "bar",\n  "data": [\n    { "label": "A", "value": 10 },\n    { "label": "B", "value": 20 }\n  ]\n}`;
+        codeNode.append($createTextNode(template));
+        const emptyParagraph = $createParagraphNode();
+        selection.insertNodes([codeNode, emptyParagraph]);
+        emptyParagraph.select();
+      }
+    });
+  };
+
+  const handleInsertImageUrl = (url: string) => {
+    editor.update(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) {
+        const node = new ImageNode(url, 'Image');
+        const emptyParagraph = $createParagraphNode();
+        selection.insertNodes([node, emptyParagraph]);
+        emptyParagraph.select();
+      }
+    });
+    setShowImageModal(false);
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const compressedBase64 = await compressImage(file);
+      editor.update(() => {
+        const selection = $getSelection();
+        if ($isRangeSelection(selection)) {
+          const node = new ImageNode(compressedBase64, file.name);
+          const emptyParagraph = $createParagraphNode();
+          selection.insertNodes([node, emptyParagraph]);
+          emptyParagraph.select();
+        }
+      });
+    } catch (err) {
+      console.error('Failed to process image:', err);
+      alert('Failed to process image. Please try a different file.');
+    }
+    e.target.value = '';
+  };
+
+  const insertGallery = () => {
+    editor.update(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) {
+        const codeNode = $createCodeNode('image_gallery');
+        const template = `{\n  "images": [\n    { "url": "https://example.com/img1.jpg", "caption": "Image 1" },\n    { "url": "https://example.com/img2.jpg", "caption": "Image 2" }\n  ]\n}`;
+        codeNode.append($createTextNode(template));
+        const emptyParagraph = $createParagraphNode();
+        selection.insertNodes([codeNode, emptyParagraph]);
+        emptyParagraph.select();
+      }
+    });
+  };
+
   const openTableMenu = () => {
     editor.getEditorState().read(() => {
-      const selection = $getSelection();
-      tableSelectionRef.current = selection?.clone() ?? null;
+      tableSelectionRef.current = $getSelection()?.clone() ?? null;
     });
-
     setShowTableMenu(true);
   };
 
@@ -867,24 +1018,13 @@ function NotebookToolbarPlugin() {
     const rows = Number(tableRows);
     const columns = Number(tableColumns);
 
-    if (
-      !Number.isInteger(rows) ||
-      !Number.isInteger(columns) ||
-      rows < 1 ||
-      rows > 50 ||
-      columns < 1 ||
-      columns > 50
-    ) {
+    if (!Number.isInteger(rows) || !Number.isInteger(columns) || rows < 1 || rows > 50 || columns < 1 || columns > 50) {
       window.alert('Rows and columns must be between 1 and 50.');
       return;
     }
 
-    const savedSelection = tableSelectionRef.current;
-
-    if (savedSelection) {
-      editor.update(() => {
-        $setSelection(savedSelection.clone());
-      });
+    if (tableSelectionRef.current) {
+      editor.update(() => $setSelection(tableSelectionRef.current!.clone()));
     }
 
     editor.dispatchCommand(INSERT_TABLE_COMMAND, {
@@ -916,9 +1056,7 @@ function NotebookToolbarPlugin() {
       onClick={onClick}
       title={title}
       className={`p-1.5 rounded-md transition-colors flex items-center justify-center ${
-        active
-          ? 'bg-primary/15 text-primary font-semibold'
-          : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+        active ? 'bg-primary/15 text-primary font-semibold' : 'text-muted-foreground hover:text-foreground hover:bg-muted'
       } disabled:opacity-40 disabled:pointer-events-none`}
     >
       {children}
@@ -927,125 +1065,82 @@ function NotebookToolbarPlugin() {
 
   return (
     <div className="flex flex-wrap items-center gap-1 px-3 py-2 border-b border-muted bg-gigbg sticky top-0 z-10 backdrop-blur-sm">
-      <ToolbarButton
-        disabled={!canUndo}
-        onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}
-        title="Undo"
-      >
+      <ToolbarButton disabled={!canUndo} onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)} title="Undo">
         <Undo size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        disabled={!canRedo}
-        onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}
-        title="Redo"
-      >
+      <ToolbarButton disabled={!canRedo} onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)} title="Redo">
         <Redo size={15} />
       </ToolbarButton>
       <div className="w-[1px] h-5 bg-border mx-1" />
-      <ToolbarButton
-        active={blockType === 'paragraph'}
-        onClick={formatParagraph}
-        title="Paragraph"
-      >
+      <ToolbarButton active={blockType === 'paragraph'} onClick={formatParagraph} title="Paragraph">
         <Pilcrow size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={blockType === 'h1'}
-        onClick={() => formatHeading('h1')}
-        title="Heading 1"
-      >
+      <ToolbarButton active={blockType === 'h1'} onClick={() => formatHeading('h1')} title="Heading 1">
         <Heading1 size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={blockType === 'h2'}
-        onClick={() => formatHeading('h2')}
-        title="Heading 2"
-      >
+      <ToolbarButton active={blockType === 'h2'} onClick={() => formatHeading('h2')} title="Heading 2">
         <Heading2 size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={blockType === 'h3'}
-        onClick={() => formatHeading('h3')}
-        title="Heading 3"
-      >
+      <ToolbarButton active={blockType === 'h3'} onClick={() => formatHeading('h3')} title="Heading 3">
         <Heading3 size={15} />
       </ToolbarButton>
       <div className="w-[1px] h-5 bg-border mx-1" />
-      <ToolbarButton
-        active={isBold}
-        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')}
-        title="Bold"
-      >
+      <ToolbarButton active={isBold} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')} title="Bold">
         <Bold size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={isItalic}
-        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')}
-        title="Italic"
-      >
+      <ToolbarButton active={isItalic} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')} title="Italic">
         <Italic size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={isUnderline}
-        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')}
-        title="Underline"
-      >
+      <ToolbarButton active={isUnderline} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')} title="Underline">
         <Underline size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={isStrikethrough}
-        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')}
-        title="Strikethrough"
-      >
+      <ToolbarButton active={isStrikethrough} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')} title="Strikethrough">
         <Strikethrough size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={isCode}
-        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'code')}
-        title="Inline Code"
-      >
+      <ToolbarButton active={isCode} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'code')} title="Inline Code">
         <Code size={15} />
       </ToolbarButton>
       <div className="w-[1px] h-5 bg-border mx-1" />
-      <ToolbarButton
-        active={blockType === 'ul'}
-        onClick={() => editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined)}
-        title="Bullet List"
-      >
+      <ToolbarButton active={blockType === 'ul'} onClick={() => editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined)} title="Bullet List">
         <List size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={blockType === 'ol'}
-        onClick={() => editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined)}
-        title="Numbered List"
-      >
+      <ToolbarButton active={blockType === 'ol'} onClick={() => editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined)} title="Numbered List">
         <ListOrdered size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={blockType === 'quote'}
-        onClick={formatQuote}
-        title="Quote"
-      >
+      <ToolbarButton active={blockType === 'quote'} onClick={formatQuote} title="Quote">
         <Quote size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        active={blockType === 'code'}
-        onClick={formatCodeBlock}
-        title="Code Block"
-      >
+      <ToolbarButton active={blockType === 'code'} onClick={formatCodeBlock} title="Code Block">
         <FileCode size={15} />
       </ToolbarButton>
-      <ToolbarButton
-        onClick={insertLink}
-        title="Insert Link"
-      >
+      <ToolbarButton onClick={insertLink} title="Insert Link">
         <Link2 size={15} />
       </ToolbarButton>
+      <ToolbarButton onClick={insertMath} title="Math Equation">
+        <Sigma size={15} />
+      </ToolbarButton>
+      <ToolbarButton onClick={insertMermaid} title="Mermaid Diagram">
+        <Network size={15} />
+      </ToolbarButton>
+      <ToolbarButton onClick={insertChart} title="Recharts Chart">
+        <BarChart3 size={15} />
+      </ToolbarButton>
+      <div className="w-[1px] h-5 bg-border mx-1" />
+      <ToolbarButton onClick={() => setShowImageModal(true)} title="Insert Image from URL">
+        <ImageIcon size={15} />
+      </ToolbarButton>
+      <label
+        className="p-1.5 rounded-md transition-colors flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted cursor-pointer"
+        title="Upload Image from Device"
+      >
+        <Upload size={15} />
+        <input type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
+      </label>
+      <ToolbarButton onClick={insertGallery} title="Insert Image Gallery">
+        <Images size={15} />
+      </ToolbarButton>
       <div className="relative">
-        <ToolbarButton
-          onClick={openTableMenu}
-          title="Insert Table"
-        >
+        <ToolbarButton onClick={openTableMenu} title="Insert Table">
           <Table2 size={15} />
           <span className="text-xs font-semibold">Table</span>
         </ToolbarButton>
@@ -1065,7 +1160,6 @@ function NotebookToolbarPlugin() {
                   className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground"
                 />
               </label>
-
               <label className="text-xs font-medium text-muted-foreground">
                 Columns
                 <input
@@ -1079,7 +1173,6 @@ function NotebookToolbarPlugin() {
                 />
               </label>
             </div>
-
             <label className="mt-3 flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -1089,7 +1182,6 @@ function NotebookToolbarPlugin() {
               />
               Include header row
             </label>
-
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
@@ -1098,7 +1190,6 @@ function NotebookToolbarPlugin() {
               >
                 Cancel
               </button>
-
               <button
                 type="button"
                 onClick={insertTable}
@@ -1110,13 +1201,14 @@ function NotebookToolbarPlugin() {
           </div>
         )}
       </div>
+
+      {/* Image Modal placed inside ToolbarPlugin to access its state */}
+      {showImageModal && (
+        <ImageUrlModal onClose={() => setShowImageModal(false)} onInsert={handleInsertImageUrl} />
+      )}
     </div>
   );
 }
-
-// ============================================================================
-// Slash Commands Plugin
-// ============================================================================
 
 function SlashCommandsPlugin() {
   const [editor] = useLexicalComposerContext();
@@ -1226,10 +1318,6 @@ function SlashCommandsPlugin() {
   );
 }
 
-// ============================================================================
-// Code Highlight Plugin
-// ============================================================================
-
 function CodeHighlightPluginWrapper() {
   const [editor] = useLexicalComposerContext();
   useEffect(() => {
@@ -1237,10 +1325,6 @@ function CodeHighlightPluginWrapper() {
   }, [editor]);
   return null;
 }
-
-// ============================================================================
-// Load File Plugin (Replaces external useEffect to prevent race conditions)
-// ============================================================================
 
 interface LoadFilePluginProps {
   projectId: string;
@@ -1261,16 +1345,13 @@ function LoadFilePlugin({
   const [hasLoaded, setHasLoaded] = useState(false);
 
   useEffect(() => {
-    // Guarantee editor instance is captured immediately upon mount
     onEditorReady(editor);
-
     if (hasLoaded) return;
 
     const loadFile = async () => {
       try {
         const response = await workspaceApi.readFile(projectId, filePath);
         onVersionLoaded(response.version);
-
         const contentToLoad = response.content || initialContent || '';
 
         editor.update(() => {
@@ -1285,7 +1366,6 @@ function LoadFilePlugin({
         setHasLoaded(true);
       } catch (err) {
         console.error('Failed to load file:', err);
-        // Fallback to initialContent if fetch fails (e.g., slight delay in file creation propagation)
         if (initialContent) {
           editor.update(() => {
             const root = $getRoot();
@@ -1296,7 +1376,6 @@ function LoadFilePlugin({
         }
       }
     };
-
     loadFile();
   }, [editor, projectId, filePath, initialContent, hasLoaded, onVersionLoaded, onEditorReady]);
 
@@ -1326,26 +1405,31 @@ export function NotebookEditor({
   const [currentVersion, setCurrentVersion] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
   const [lastSaved, setLastSaved] = useState<Date | null>(null);
+  const [showLivePreview, setShowLivePreview] = useState(false);
+  const [liveMarkdown, setLiveMarkdown] = useState(initialContent);
 
   const initialConfig = useMemo(
     () => ({
       namespace: 'NotebookEditor',
       nodes: editorNodes,
       theme: editorTheme,
-      onError: (error: Error) => {
-        console.error('[NotebookEditor Error]:', error);
-      },
+      onError: (error: Error) => console.error('[NotebookEditor Error]:', error),
       editable: !readOnly,
     }),
     [readOnly]
   );
 
-  const handleChange = useCallback(
-    (editorState: EditorState, editor: LexicalEditor) => {
-      // Auto-save hook point
-    },
-    []
-  );
+  const previewTimerRef = React.useRef<NodeJS.Timeout | null>(null);
+
+  const handleChange = useCallback((editorState: EditorState) => {
+    if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = setTimeout(() => {
+      editorState.read(() => {
+        const markdown = $convertToMarkdownString(NOTEBOOK_TRANSFORMERS);
+        setLiveMarkdown(markdown);
+      });
+    }, 300);
+  }, []);
 
   const handleSave = useCallback(async () => {
     setIsSaving(true);
@@ -1365,9 +1449,7 @@ export function NotebookEditor({
       });
       setCurrentVersion(response.version);
       setLastSaved(new Date());
-      if (onSave) {
-        onSave(markdownContent);
-      }
+      if (onSave) onSave(markdownContent);
     } catch (err) {
       if (err instanceof OCCConflictError) {
         alert('This note has been modified by another user. Please reload and merge your changes.');
@@ -1382,13 +1464,13 @@ export function NotebookEditor({
 
   const handleEditorReady = useCallback((editor: LexicalEditor) => {
     editorRef.current = editor;
+    activeEditor = editor;
   }, []);
 
   return (
     <div className="flex flex-col h-full p-1 bg-rb/5">
       <div className="flex-1 flex flex-col max-w-7xl w-full mx-auto bg-card border border-border rounded-sm shadow-sm overflow-scroll focus-within:ring-1
-       [&::-webkit-scrollbar]:w-0
-       focus-within:ring-card focus-within:border-card   transition-all">
+       [&::-webkit-scrollbar]:w-0 focus-within:ring-card focus-within:border-card transition-all">
         <LexicalComposer initialConfig={initialConfig}>
           <LoadFilePlugin
             projectId={projectId}
@@ -1399,27 +1481,30 @@ export function NotebookEditor({
           />
           {!readOnly && <NotebookToolbarPlugin />}
           {!readOnly && <FloatingToolbarPlugin />}
-          <div className="relative flex-1 overflow-y-auto min-h-0 scrollbar-thin scrollbar-thumb-slate-500 scrollbar-track-slate-100
-           [&::-webkit-scrollbar]:w-1
-            [&::-webkit-scrollbar-track]:bg-card
-            [&::-webkit-scrollbar-thumb]:bg-muted
-            [&::-webkit-scrollbar-thumb]:rounded-full
+          <div className="flex-1 flex overflow-hidden min-h-0">
+            <div className="relative flex-1 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-500 scrollbar-track-slate-100
+             [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-track]:bg-card [&::-webkit-scrollbar-thumb]:bg-muted [&::-webkit-scrollbar-thumb]:rounded-full">
+              <RichTextPlugin
+                contentEditable={
+                  <ContentEditable
+                    className="outline-none min-h-full px-8 py-6 prose prose-sm max-w-none"
+                    aria-placeholder="Start writing..."
+                    placeholder={
+                      <div className="absolute top-6 left-8 text-muted-foreground pointer-events-none select-none">
+                        Start writing...
+                      </div>
+                    }
+                  />
+                }
+                ErrorBoundary={LexicalErrorBoundary}
+              />
+            </div>
 
-          ">
-            <RichTextPlugin
-              contentEditable={
-                <ContentEditable
-                  className="outline-none min-h-full px-8 py-6 prose prose-sm max-w-none"
-                  aria-placeholder="Start writing..."
-                  placeholder={
-                    <div className="absolute top-6 left-8 text-muted-foreground pointer-events-none select-none">
-                      Start writing...
-                    </div>
-                  }
-                />
-              }
-              ErrorBoundary={LexicalErrorBoundary}
-            />
+            {showLivePreview && (
+              <div className="w-1/2 border-l border-border overflow-y-auto p-8 bg-card">
+                <MarkdownRenderer content={liveMarkdown} />
+              </div>
+            )}
           </div>
           <HistoryPlugin />
           <OnChangePlugin onChange={handleChange} />
@@ -1435,15 +1520,25 @@ export function NotebookEditor({
         </LexicalComposer>
         {!readOnly && (
           <div className="border-t border-border px-4 py-2.5 flex items-center justify-between bg-muted/20">
-            <div className="text-xs text-muted-foreground flex items-center gap-1.5">
-              {lastSaved ? (
-                <>
-                  <Check size={13} className="text-green-600" />
-                  <span>Last saved: {lastSaved.toLocaleTimeString()}</span>
-                </>
-              ) : (
-                <span>Supports Markdown &amp; [[internal-links]]</span>
-              )}
+            <div className="flex items-center gap-4">
+              <button
+                onClick={() => setShowLivePreview(!showLivePreview)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-muted border border-border rounded-md hover:bg-muted/80 transition-colors"
+                title="Toggle Live Preview"
+              >
+                {showLivePreview ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
+                {showLivePreview ? 'Hide Preview' : 'Live Preview'}
+              </button>
+              <div className="text-xs text-muted-foreground flex items-center gap-1.5">
+                {lastSaved ? (
+                  <>
+                    <Check size={13} className="text-green-600" />
+                    <span>Last saved: {lastSaved.toLocaleTimeString()}</span>
+                  </>
+                ) : (
+                  <span>Supports Markdown &amp; [[internal-links]]</span>
+                )}
+              </div>
             </div>
             <button
               onClick={handleSave}

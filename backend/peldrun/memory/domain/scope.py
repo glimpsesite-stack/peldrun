@@ -117,10 +117,21 @@ pass an explicit ``user_id`` and never hit the fallback.
 """
 
 _SCOPE_SEPARATOR: Final[str] = ":"
-"""The single character separating ``scope_type`` from ``scope_id``.
-
-Any occurrence of this character inside ``scope_id`` is rejected at
+"""The single character separating `scope_type` from `scope_id`.
+Any occurrence of this character inside `scope_id` is rejected at
 construction time -- see the module docstring's safety rationale.
+"""
+
+DEFAULT_PROJECT_ID: Final[str] = "default_project"
+"""Sentinel project id that represents "no real project".
+The UI layer uses this as a placeholder when no project is
+selected. It MUST NOT be treated as a real project scope:
+* ``has_active_project("default_project")`` is ``False``.
+* ``resolve_scope_refs(project_id="default_project")`` does
+  NOT include ``project:default_project`` in the refs.
+* ``resolve_scope(project_id="default_project")`` falls
+  through to chat scope (or raises), exactly as if
+  ``project_id`` were ``None``.
 """
 
 
@@ -314,11 +325,43 @@ def parse_scope_ref(text: str) -> MemoryScopeRef:
     return MemoryScopeRef.from_string(text)
 
 
-# ---------------------------------------------------------------------------
+#---------------------------------------------------------------------------
+# Project id normalization (G3)
+#---------------------------------------------------------------------------
+def normalize_project_id(project_id: Optional[str]) -> Optional[str]:
+    """Normalize a project id, collapsing the sentinel to None.
+
+    Returns ``None`` when the input is ``None``, empty/whitespace,
+    or equals ``DEFAULT_PROJECT_ID``. Otherwise returns the
+    stripped project id.
+
+    This is the SINGLE normalization point for the "default_project"
+    sentinel. Every caller that accepts a project_id from external
+    input (HTTP query params, dispatcher context, tool arguments)
+    MUST pass it through this function before using it to build
+    scope refs, gate extraction, or classify routes.
+
+    Parameters
+    ----------
+    project_id
+        Raw project id from the caller. May be None, empty,
+        whitespace-only, or the sentinel "default_project".
+
+    Returns
+    -------
+    Optional[str]
+        The cleaned project id, or None when no real project
+        applies.
+    """
+    pid = (project_id or "").strip()
+    if not pid or pid == DEFAULT_PROJECT_ID:
+        return None
+    return pid
+
+
+#---------------------------------------------------------------------------
 # Resolution -- from runtime context to canonical refs
-# ---------------------------------------------------------------------------
-
-
+#---------------------------------------------------------------------------
 def resolve_scope_refs(
     *,
     chat_id: Optional[str] = None,
@@ -326,6 +369,7 @@ def resolve_scope_refs(
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     default_user_id: str = _DEFAULT_USER_ID,
+    include_user: bool = True,
 ) -> List[str]:
     """Materialize the complete set of applicable scope refs.
 
@@ -383,41 +427,51 @@ def resolve_scope_refs(
     """
     refs: List[MemoryScopeRef] = []
 
-    # --- User scope (always included; defaults to "user:default") -----
-    effective_user = (
-        user_id.strip()
-        if isinstance(user_id, str) and user_id.strip()
-        else default_user_id.strip()
-        if isinstance(default_user_id, str)
-        else ""
-    )
-    if not effective_user:
-        # A default_user_id of "" is a genuine misconfiguration. We
-        # fail fast rather than silently skipping user scope, which
-        # would make user preferences invisible across the whole
-        # deployment -- a very hard bug to notice until it matters.
-        raise ValueError(
-            "resolve_scope_refs: default_user_id resolved to an "
-            "empty string; set a concrete user id or fix the "
-            "caller's default_user_id argument"
+    # --- User scope (included unless isolated) -------------------------
+    # [G2] ``include_user=False`` implements the ``isolated`` project
+    # mode: the project sees ONLY its own memories, and user-scope
+    # entries are excluded from retrieval. When ``include_user`` is
+    # True (the default and the ``inherit`` mode), behavior is
+    # identical to before this change.
+    if include_user:
+        effective_user = (
+            user_id.strip()
+            if isinstance(user_id, str) and user_id.strip()
+            else default_user_id.strip()
+            if isinstance(default_user_id, str)
+            else ""
         )
-    refs.append(
-        MemoryScopeRef(
-            scope_type=MemoryScope.USER,
-            scope_id=effective_user,
+        if not effective_user:
+            # A default_user_id of "" is a genuine misconfiguration.
+            # We fail fast rather than silently skipping user scope,
+            # which would make user preferences invisible across the
+            # whole deployment -- a very hard bug to notice until it
+            # matters.
+            raise ValueError(
+                "resolve_scope_refs: default_user_id resolved to an "
+                "empty string; set a concrete user id or fix the "
+                "caller's default_user_id argument"
+            )
+        refs.append(
+            MemoryScopeRef(
+                scope_type=MemoryScope.USER,
+                scope_id=effective_user,
+            )
         )
-    )
 
     # --- Project scope (optional) -------------------------------------
-    if project_id is not None:
-        pid = project_id.strip()
-        if pid:
-            refs.append(
-                MemoryScopeRef(
-                    scope_type=MemoryScope.PROJECT,
-                    scope_id=pid,
-                )
+    # [G3] Normalize: "default_project" and empty strings are treated
+    # as "no project scope". This prevents the sentinel from creating
+    # a phantom project scope that retrieval would search but extraction
+    # would never populate correctly.
+    pid = normalize_project_id(project_id)
+    if pid is not None:
+        refs.append(
+            MemoryScopeRef(
+                scope_type=MemoryScope.PROJECT,
+                scope_id=pid,
             )
+        )
 
     # --- Chat scope (optional) ----------------------------------------
     if chat_id is not None:
@@ -485,13 +539,13 @@ def resolve_scope(
         avoided -- it would mask bugs where the caller forgot to
         pass a required context.
     """
-    if project_id is not None:
-        pid = project_id.strip()
-        if pid:
-            return MemoryScopeRef(
-                scope_type=MemoryScope.PROJECT,
-                scope_id=pid,
-            )
+    # [G3] Normalize: "default_project" is not a real project.
+    pid = normalize_project_id(project_id)
+    if pid is not None:
+        return MemoryScopeRef(
+            scope_type=MemoryScope.PROJECT,
+            scope_id=pid,
+        )
 
     if chat_id is not None:
         cid = chat_id.strip()
@@ -514,7 +568,9 @@ def resolve_scope(
 
 
 __all__ = [
+    "DEFAULT_PROJECT_ID",
     "MemoryScopeRef",
+    "normalize_project_id",
     "parse_scope_ref",
     "resolve_scope",
     "resolve_scope_refs",

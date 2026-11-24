@@ -1380,8 +1380,23 @@ class MemorySettings(BaseModel):
         ),
     )
 
+    # ------------------------- project isolation (G2) -----------------------
+    user_scope_in_projects: Literal["inherit", "isolated"] = Field(
+        default="inherit",
+        description=(
+            "Controls whether user-scope memories are included when "
+            "retrieving inside a project context. "
+            "'inherit' (default): user-scope memories are always included "
+            "alongside project-scope memories (the standard behavior). "
+            "'isolated': user-scope memories are EXCLUDED from project "
+            "retrieval -- the project sees only its own memories. Use "
+            "this for sensitive projects where user preferences or "
+            "cross-project facts must not leak into the project context. "
+            "This setting is consulted by MemoryService.retrieve() and "
+            "can be overridden per-project via project_overrides."
+        ),
+    )
     # ------------------------- per-project overrides ------------------------
-
     project_overrides: Dict[str, "MemorySettings"] = Field(
         default_factory=dict,
         description=(

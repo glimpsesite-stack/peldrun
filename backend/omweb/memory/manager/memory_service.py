@@ -78,7 +78,11 @@ from peldrun.memory.domain import (
     default_settings,
 )
 from peldrun.memory.domain.enums import ExtractionTrigger
-from peldrun.memory.domain.scope import resolve_scope_refs
+from peldrun.memory.domain.scope import (
+    DEFAULT_PROJECT_ID,
+    normalize_project_id,
+    resolve_scope_refs,
+)
 from peldrun.memory.services import (
     Route,
     RouteDecision,
@@ -950,11 +954,25 @@ class MemoryService:
         # path avoids the pipeline overhead and produces a cleaner
         # diagnostic (router_decision="no_need" is honest about why
         # nothing was retrieved).
-        settings = self._lifecycle.settings
+        # [G1] Resolve the PROJECT's effective settings, not the global
+        # ones. A project whose override sets mode=disabled must not
+        # inject memories even when the global mode permits reads --
+        # that is the whole point of a per-project override.
+        # ``effective_for_project`` returns ``self`` unchanged when the
+        # project has no override, so the common path allocates nothing.
+        global_settings = self._lifecycle.settings
+        pid = normalize_project_id(project_id)
+        settings = (
+            global_settings.effective_for_project(pid)
+            if pid is not None
+            else global_settings
+        )
         if not settings.mode.can_read:
             logger.debug(
-                "MemoryService.retrieve: DISABLED mode, returning "
-                "empty context (query=%r).",
+                "MemoryService.retrieve: mode=%s disallows reads, "
+                "returning empty context (project=%r, query=%r).",
+                settings.mode.value,
+                pid,
                 query[:60],
             )
             empty = build_empty_context(
@@ -975,10 +993,18 @@ class MemoryService:
         # Resolve scopes
         # ------------------------------------------------------------------
         try:
+            # [G2] An ``isolated`` project must not see user-scope
+            # memories. The narrowing applies ONLY when a real project
+            # is active -- a chat without a project always keeps the
+            # user scope, otherwise there would be nothing to read.
             scope_refs = resolve_scope_refs(
                 chat_id=chat_id,
                 project_id=project_id,
                 user_id=user_id,
+                include_user=not (
+                    pid is not None
+                    and settings.user_scope_in_projects == "isolated"
+                ),
             )
         except Exception as exc:
             # ``resolve_scope_refs`` raises only on invalid inputs
@@ -1041,9 +1067,12 @@ class MemoryService:
                 reason="always_retrieve_setting",
             )
         else:
+            # [G3] ``pid`` was normalized at the top of this method:
+            # "default_project" is NOT a real project and must not
+            # activate the project route.
             route = classify_route(
                 query,
-                has_active_project=bool(project_id),
+                has_active_project=pid is not None,
             )
 
         # ------------------------------------------------------------------
@@ -1244,11 +1273,26 @@ class MemoryService:
                 started=started,
             )
 
+        # [G1/G2] Mirror ``retrieve``: honor the project's effective
+        # settings and exclude the user scope for ``isolated`` projects.
+        # Skipping this here would open a bypass -- an isolated project
+        # could read user-scope memories through the agentic endpoint.
+        agentic_pid = normalize_project_id(project_id)
+        agentic_settings = (
+            self._lifecycle.settings.effective_for_project(agentic_pid)
+            if agentic_pid is not None
+            else self._lifecycle.settings
+        )
         try:
             scope_refs = resolve_scope_refs(
                 chat_id=chat_id,
                 project_id=project_id,
                 user_id=user_id,
+                include_user=not (
+                    agentic_pid is not None
+                    and agentic_settings.user_scope_in_projects
+                    == "isolated"
+                ),
             )
         except Exception as exc:
             logger.warning(
@@ -1257,7 +1301,7 @@ class MemoryService:
                 chat_id,
                 project_id,
                 exc,
-            )
+         )
             return await self._agentic_fallback(
                 query=query,
                 chat_id=chat_id,
@@ -1268,7 +1312,10 @@ class MemoryService:
                 started=started,
             )
 
-        settings = self._lifecycle.settings
+        # [G1] Read the agentic tuning fields from the PROJECT's
+        # effective settings so a project-level override of the
+        # timeout / hop budget / confidence threshold is honored.
+        settings = agentic_settings
         timeout_seconds = float(
             getattr(
                 settings.retrieval, "agentic_timeout_seconds", 30.0
@@ -1842,7 +1889,7 @@ class MemoryService:
     # ------------------------------------------------------------------
     # Extraction queue (Phase 1-C)
     # ------------------------------------------------------------------
-
+    # backend/omweb/memory/manager/memory_service.py
     async def enqueue_extraction(
         self,
         *,
@@ -1854,22 +1901,26 @@ class MemoryService:
     ) -> Optional["MemoryJob"]:
         """Enqueue an extraction job with an EXPLICIT turn range.
 
-        Used by callers that already know exactly which turns
-        need processing -- typically the dispatcher's After-Turn
-        hook (per-turn range) or the operator's "extract these
-        turns" UI action.
+        Used by callers that already know exactly which turns need
+        processing -- typically the operator's "extract these turns"
+        UI action.
 
         Returns the created ``MemoryJob``, or ``None`` when:
-
-          * extraction is not initialized (disabled in settings,
+        * extraction is not initialized (disabled in settings,
             non-SQLite provider, or init failed),
-          * the range is empty / invalid,
-          * the session file cannot be read,
-          * the idempotency key matches an existing job
-            (duplicate suppression).
+        * the project's effective mode forbids writes (G1),
+        * the range is empty / invalid,
+        * the session file cannot be read,
+        * the idempotency key matches an existing job.
 
-        Never raises for expected failure modes. A redundant
-        call is a safe no-op.
+        Never raises for expected failure modes. A redundant call is
+        a safe no-op.
+
+        Note: this path deliberately does NOT consult
+        ``get_extraction_trigger()``. The trigger mode governs the
+        AUTOMATIC hooks only; an explicit range is an operator
+        request and must not be silently dropped because the
+        deployment prefers ``after_session``.
         """
         if self._trigger_router is None:
             logger.debug(
@@ -1878,10 +1929,27 @@ class MemoryService:
                 chat_id, trigger_type.value,
             )
             return None
-
+        # [G3] The "default_project" sentinel is not a real project.
+        pid = normalize_project_id(project_id)
+        # [G1] Stop a doomed job BEFORE it exists. The extraction
+        # LLM call runs before WritePipeline can reject the write,
+        # so enqueueing here would burn real tokens and consume the
+        # daily cost ceiling on a job that can never succeed.
+        if pid is not None:
+            effective = self._lifecycle.settings.effective_for_project(
+                pid
+            )
+            if not effective.mode.can_write:
+                logger.info(
+                    "enqueue_extraction: skipping for project %r "
+                    "(effective mode=%r forbids writes).",
+                    pid,
+                    effective.mode.value,
+                )
+                return None
         jobs = await self._trigger_router.route_explicit(
             chat_id=chat_id,
-            project_id=project_id,
+            project_id=pid,
             trigger_type=trigger_type,
             start_turn_index=start_turn_index,
             end_turn_index=end_turn_index,
@@ -1899,15 +1967,15 @@ class MemoryService:
         session's current state.
 
         Range derivation depends on the trigger type:
-
-          * ``AFTER_SESSION``: pending tail (cursor+1 .. total-1).
+        * ``AFTER_SESSION``: pending tail (cursor+1 .. total-1).
             Skipped if already extracted (cursor is caught up).
-          * ``MANUAL``:          whole session (0 .. total-1).
-            Used by the "Extract from this chat" button, which
-            intentionally re-processes the whole chat.
+        * ``MANUAL``: whole session (0 .. total-1). Used by the
+            "Extract from this chat" button, which intentionally
+            re-processes the whole chat.
 
         Returns the created ``MemoryJob`` or ``None``. Same
-        non-raising contract as ``enqueue_extraction``.
+        non-raising contract as ``enqueue_extraction``, including
+        the G1 write-mode gate.
         """
         if self._trigger_router is None:
             logger.debug(
@@ -1916,16 +1984,33 @@ class MemoryService:
                 chat_id, trigger_type.value,
             )
             return None
-
+        # [G3] Normalize before routing.
+        pid = normalize_project_id(project_id)
+        # [G1] Same cost-saving guard as ``enqueue_extraction``:
+        # extraction spends an LLM call before WritePipeline can
+        # reject the write, so a non-writable project must be
+        # stopped before the job row is created.
+        if pid is not None:
+            effective = self._lifecycle.settings.effective_for_project(
+                pid
+            )
+            if not effective.mode.can_write:
+                logger.info(
+                    "enqueue_extraction_from_session: skipping for "
+                    "project %r (effective mode=%r forbids writes).",
+                    pid,
+                    effective.mode.value,
+                )
+                return None
         if trigger_type == ExtractionTrigger.MANUAL:
             jobs = await self._trigger_router.route_on_demand(
                 chat_id=chat_id,
-                project_id=project_id,
+                project_id=pid,
             )
         else:
             jobs = await self._trigger_router.route_after_session(
                 chat_id=chat_id,
-                project_id=project_id,
+                project_id=pid,
             )
         return jobs[0] if jobs else None
 
@@ -1936,26 +2021,48 @@ class MemoryService:
         project_id: Optional[str],
         current_turn_index: int,
     ) -> None:
-        """Fire the After-Turn extraction hook. Called by the
-        dispatcher after each successful turn.
+        """Fire the After-Turn extraction hook.
 
+        Called by the dispatcher after each successful turn.
         Respects the ``extraction_trigger`` setting:
-          * ``after_turn`` / ``both``  -> fire the route,
-          * ``after_session``          -> no-op.
+        * ``after_turn`` / ``both`` -> fire the route,
+        * ``after_session``         -> no-op.
 
         Never raises -- the caller has just completed a user turn
         and cannot afford a memory-subsystem failure to abort it.
+        For that reason the settings resolution below lives INSIDE
+        the try block: a closed lifecycle must degrade to a warning,
+        not an exception.
         """
         if self._trigger_router is None:
             return
         trigger = self.get_extraction_trigger()
         if trigger not in ("after_turn", "both"):
             return
-
         try:
+            # [G3] Prevent jobs from being scheduled against the
+            # "default_project" sentinel.
+            pid = normalize_project_id(project_id)
+            # [G1] A project whose effective mode forbids writes
+            # must not schedule extraction: every candidate would
+            # fail at WritePipeline's ``_enforce_can_write`` gate
+            # after the LLM cost was already spent.
+            if pid is not None:
+                effective = (
+                    self._lifecycle.settings.effective_for_project(pid)
+                )
+                if not effective.mode.can_write:
+                    logger.info(
+                        "notify_turn_completed: skipping extraction "
+                        "for project %r (effective mode=%r forbids "
+                        "writes).",
+                        pid,
+                        effective.mode.value,
+                    )
+                    return
             jobs = await self._trigger_router.route_after_turn(
                 chat_id=chat_id,
-                project_id=project_id,
+                project_id=pid,
                 current_turn_index=current_turn_index,
             )
             if jobs:
@@ -1988,9 +2095,11 @@ class MemoryService:
         if self._status_watcher is None:
             return
         try:
+            # [G3] Normalize project_id before forwarding.
+            normalized_pid = normalize_project_id(project_id)
             await self._status_watcher.notify_session_updated(
                 chat_id=chat_id,
-                project_id=project_id,
+                project_id=normalized_pid,
             )
         except Exception as exc:
             logger.warning(

@@ -209,7 +209,7 @@ function MarkdownRendererInner({
             if (!isBlock) {
               return (
                 <code
-                  className="px-1.5 py-0.5 rounded-md bg-muted text-black font-mono text-[11px] border border-border/40 font-normal"
+                  className="px-1.5 py-0.5 rounded-md bg-inlineCode text-black font-mono text-[11px] border border-border/40 font-normal"
                   {...props}
                 >
                   {children}
@@ -281,10 +281,29 @@ function MarkdownRendererInner({
             return <>{children}</>;
           },
 
+          img({ src, alt, title, ...props }: any) {
+            // Markdown images emitted with an empty or missing URL
+            // (e.g. `![alt]()` or an unresolved reference-style
+            // image) would render as `<img src="">`, which browsers
+            // treat as a request for the current page and React
+            // flags in development. Skip such nodes entirely.
+            if (!src) return null;
+            return (
+              <img
+                src={src}
+                alt={alt ?? ""}
+                title={title}
+                loading="lazy"
+                className="rounded-md my-2 max-w-full h-auto"
+                {...props}
+              />
+            );
+          },
+
           table({ children }: any) {
             return (
               <div className="my-3 overflow-x-auto rounded-sm border border-border bg-card/60 shadow-peldrun-xs">
-                <table className="w-full border-collapse text-xs text-left">
+                <table className="w-full border-collapse border border-border text-xs text-left">
                   {children}
                 </table>
               </div>
@@ -324,7 +343,7 @@ function MarkdownRendererInner({
             // style when the renderer shape changes between versions.
             return (
               <th
-                className="px-3.5 py-2 text-sm font-semibold align-top"
+                className="px-3.5 py-2 text-sm font-semibold align-top border border-border"
                 style={{ textAlign: align ?? style?.textAlign }}
               >
                 {children}
@@ -335,7 +354,7 @@ function MarkdownRendererInner({
           td({ children, align, style }: any) {
             return (
               <td
-                className="px-3.5 py-2 border-t border-border/50 text-black/90 text-sm align-top"
+                className="px-3.5 py-2 border border-border text-black/90 text-sm align-top"
                 style={{ textAlign: align ?? style?.textAlign }}
               >
                 {children}
@@ -443,17 +462,19 @@ function MarkdownRendererInner({
                 title={href}
                 {...props}
               >
-                <img
-                  src={faviconUrl}
-                  alt=""
-                  width={13}
-                  height={13}
-                  referrerPolicy="no-referrer"
-                  className="w-3.5 h-3.5 shrink-0 rounded-xs inline-block"
-                  onError={(e) => {
-                    (e.currentTarget as HTMLElement).style.display = "none";
-                  }}
-                />
+                {hostname ? (
+                  <img
+                    src={faviconUrl}
+                    alt=""
+                    width={13}
+                    height={13}
+                    referrerPolicy="no-referrer"
+                    className="w-3.5 h-3.5 shrink-0 rounded-xs inline-block"
+                    onError={(e) => {
+                      (e.currentTarget as HTMLElement).style.display = "none";
+                    }}
+                  />
+                ) : null}
                 <span className="truncate max-w-[280px]">{displayLabel}</span>
               </a>
             );

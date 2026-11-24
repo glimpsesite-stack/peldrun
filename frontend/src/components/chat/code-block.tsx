@@ -278,7 +278,7 @@ export function CodeBlock({
   return (
     <div
       dir="ltr"
-      className={`my-3 overflow-hidden rounded-sm border border-card bg-card text-slate-100 shadow-peldrun-sm font-mono ${className}`}
+      className={`my-3 w-full min-w-0 max-w-full overflow-hidden rounded-sm border border-card bg-card text-slate-100 shadow-peldrun-sm font-mono ${className}`}
     >
       {/* Header */}
       <div className="flex items-center justify-between px-3.5 py-2 border-b border-border/60 bg-custom">
@@ -345,9 +345,9 @@ export function CodeBlock({
 
       {/* Body */}
       <div
-        className={`relative transition-all ${
+        className={`relative w-full max-w-full transition-all ${
           isLong && !isExpanded
-            ? "max-h-[380px] overflow-y-auto"
+            ? "max-h-[380px] overflow-y-auto overflow-x-auto"
             : "overflow-x-auto"
         }`}
       >
@@ -364,7 +364,7 @@ export function CodeBlock({
             getTokenProps,
           }: any) => (
             <pre
-              className={`${highlightClass} p-3.5 text-xs font-mono leading-relaxed bg-transparent m-0 min-w-full`}
+              className={`${highlightClass} p-3.5 text-xs font-mono leading-relaxed bg-transparent m-0 w-max min-w-full`}
               style={style}
             >
               {tokens.map((line: any, i: number) => (
